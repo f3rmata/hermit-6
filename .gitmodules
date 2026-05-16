@@ -1,3 +1,4 @@
 [submodule "linux-stable"]
 	path = linux-stable
-	url = ./linux-stable
+	url = git@github.com:f3rmata/linux-stable.git
+	branch = hermit

@@ -97,6 +97,7 @@ QEMU_ACCEL=tcg QEMU_CPU=max
 
 #+begin_src bash
 cd hermit-6.6
+
 #+end_src
 
 构建内核、=brd.ko=、DRAM backend 模块和用户态 helper：

@@ -1,6 +1,6 @@
 * 迁移 Hermit 到 Linux 6.6
 
-当前新版目录为 =hermit-6.6=：
+当前新版目录为 =hermit-6=：
 
 - 内核目录：=linux-stable=
 - remoteswap 目录：=remoteswap=
