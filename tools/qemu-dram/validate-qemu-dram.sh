@@ -12,13 +12,13 @@ SERIAL_LOG="$WORK_DIR/guest-serial.log"
 QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
 QEMU_ACCEL=${QEMU_ACCEL:-kvm}
 QEMU_CPU=${QEMU_CPU:-host}
-TIMEOUT_SEC=${TIMEOUT_SEC:-240}
+TIMEOUT_SEC=${TIMEOUT_SEC:-60}
 SMP=${SMP:-4}
 GUEST_RAM_MB=${GUEST_RAM_MB:-4096}
 RSWAP_MEM_GB=${RSWAP_MEM_GB:-1}
 SWAP_MB=${SWAP_MB:-1024}
-MEMHOG_MB=${MEMHOG_MB:-1800}
-TMPFS_FILL_MB=${TMPFS_FILL_MB:-768}
+MEMHOG_MB=${MEMHOG_MB:-1600}
+TMPFS_FILL_MB=${TMPFS_FILL_MB:-435}
 SKIP_BUILD=${SKIP_BUILD:-0}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
 LAZY_POLL=${LAZY_POLL:-N}
@@ -174,6 +174,33 @@ dump_swap_vmstat() {
     echo "SWAP_VMSTAT: label=\$label pswpin=\$pswpin pswpout=\$pswpout"
 }
 
+emit_validation_check() {
+    name=\$1
+    lhs=\$2
+    op=\$3
+    rhs=\$4
+    result=fail
+
+    case "\$op" in
+        gt)
+            if [ "\$lhs" -gt "\$rhs" ]; then
+                result=pass
+            fi
+            ;;
+        eq)
+            if [ "\$lhs" -eq "\$rhs" ]; then
+                result=pass
+            fi
+            ;;
+        *)
+            result=fail
+            ;;
+    esac
+
+    echo "VALIDATION_CHECK: name=\$name lhs=\$lhs op=\$op rhs=\$rhs result=\$result"
+    [ "\$result" = "pass" ]
+}
+
 wait_for_memhog_ready() {
     memhog_pid=\$1
     ready_file=\$2
@@ -281,15 +308,19 @@ log_timing tmpfs_fill "\$dd_start" "\$dd_end" "count_mb=$TMPFS_FILL_MB"
 run_step drop_tmpfs_fill rm -f /mnt/fill
 run_step settle_after_pressure sleep 2
 
+RSWAP_STORES_BEFORE=\$(read_rswap_dram_counter stores)
+RSWAP_LOADS_BEFORE=\$(read_rswap_dram_counter loads)
+RSWAP_ERRORS_BEFORE=\$(read_rswap_dram_counter errors)
+PSWPIN_BEFORE=\$(read_vmstat_counter pswpin)
+PSWPOUT_BEFORE=\$(read_vmstat_counter pswpout)
+echo "VALIDATION_SNAPSHOT: label=before_reload stores=\$RSWAP_STORES_BEFORE loads=\$RSWAP_LOADS_BEFORE errors=\$RSWAP_ERRORS_BEFORE pswpin=\$PSWPIN_BEFORE pswpout=\$PSWPOUT_BEFORE"
+
 capture_dmesg /tmp/dmesg.before.before_reload
 dump_rswap_dram_stats before_reload
 dump_swap_vmstat before_reload
 /bin/hermit_swap_stats stats before_reload
 capture_dmesg /tmp/dmesg.after.before_reload
 emit_new_hermit_dmesg before_reload /tmp/dmesg.before.before_reload /tmp/dmesg.after.before_reload
-
-RSWAP_STORES_BEFORE=\$(read_rswap_dram_counter stores)
-RSWAP_LOADS_BEFORE=\$(read_rswap_dram_counter loads)
 
 run_step reset_hermit_stats_reload /bin/hermit_swap_stats reset after_pressure
 
@@ -318,16 +349,32 @@ RSWAP_LOADS_AFTER=\$(read_rswap_dram_counter loads)
 RSWAP_ERRORS_AFTER=\$(read_rswap_dram_counter errors)
 PSWPIN_AFTER=\$(read_vmstat_counter pswpin)
 PSWPOUT_AFTER=\$(read_vmstat_counter pswpout)
+echo "VALIDATION_SNAPSHOT: label=after_reload stores=\$RSWAP_STORES_BEFORE loads=\$RSWAP_LOADS_AFTER errors=\$RSWAP_ERRORS_AFTER pswpin=\$PSWPIN_AFTER pswpout=\$PSWPOUT_AFTER memhog_rc=\$MEMHOG_RC"
 
 boot_end_ms=\$(now_ms)
-log_timing end_to_end_guest "\$boot_start_ms" "\$boot_end_ms" "stores=\$RSWAP_STORES_BEFORE loads_after=\$RSWAP_LOADS_AFTER errors=\$RSWAP_ERRORS_AFTER pswpin_delta=\$((PSWPIN_AFTER - PSWPIN_BOOT)) pswpout_delta=\$((PSWPOUT_AFTER - PSWPOUT_BOOT))"
+log_timing end_to_end_guest "\$boot_start_ms" "\$boot_end_ms" "stores_before=\$RSWAP_STORES_BEFORE loads_before=\$RSWAP_LOADS_BEFORE loads_after=\$RSWAP_LOADS_AFTER errors_after=\$RSWAP_ERRORS_AFTER pswpin_boot=\$PSWPIN_BOOT pswpout_boot=\$PSWPOUT_BOOT pswpin_after=\$PSWPIN_AFTER pswpout_after=\$PSWPOUT_AFTER pswpin_delta=\$((PSWPIN_AFTER - PSWPIN_BOOT)) pswpout_delta=\$((PSWPOUT_AFTER - PSWPOUT_BOOT)) memhog_rc=\$MEMHOG_RC"
 
-if [ "\$RSWAP_STORES_BEFORE" -gt 0 ] &&
-   [ "\$RSWAP_LOADS_AFTER" -gt "\$RSWAP_LOADS_BEFORE" ] &&
-   [ "\$RSWAP_ERRORS_AFTER" -eq 0 ] &&
-   [ "\$PSWPIN_AFTER" -gt "\$PSWPIN_BOOT" ] &&
-   [ "\$PSWPOUT_AFTER" -gt "\$PSWPOUT_BOOT" ] &&
-   [ "\$MEMHOG_RC" -eq 0 ]; then
+VALIDATION_PASS=1
+if ! emit_validation_check stores_before_gt_0 "\$RSWAP_STORES_BEFORE" gt 0; then
+    VALIDATION_PASS=0
+fi
+if ! emit_validation_check loads_after_gt_loads_before "\$RSWAP_LOADS_AFTER" gt "\$RSWAP_LOADS_BEFORE"; then
+    VALIDATION_PASS=0
+fi
+if ! emit_validation_check errors_after_eq_0 "\$RSWAP_ERRORS_AFTER" eq 0; then
+    VALIDATION_PASS=0
+fi
+if ! emit_validation_check pswpin_after_gt_boot "\$PSWPIN_AFTER" gt "\$PSWPIN_BOOT"; then
+    VALIDATION_PASS=0
+fi
+if ! emit_validation_check pswpout_after_gt_boot "\$PSWPOUT_AFTER" gt "\$PSWPOUT_BOOT"; then
+    VALIDATION_PASS=0
+fi
+if ! emit_validation_check memhog_rc_eq_0 "\$MEMHOG_RC" eq 0; then
+    VALIDATION_PASS=0
+fi
+
+if [ "\$VALIDATION_PASS" -eq 1 ]; then
     echo "VALIDATION: PASS"
     poweroff -f
 fi

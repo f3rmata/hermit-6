@@ -96,26 +96,30 @@ QEMU_ACCEL=tcg QEMU_CPU=max
 进入目录：
 
 #+begin_src bash
+git clone https://github.com/f3rmata/hermit-6.git
 cd hermit-6.6
-
+git submodule update --init --depth=10 -- linux-stable
 #+end_src
 
 构建内核、=brd.ko=、DRAM backend 模块和用户态 helper：
 
 #+begin_src bash
-./tools/qemu-dram/build-qemu-dram.sh
+./tools/qemu-dram/validate-qemu-dram.sh
 #+end_src
 
 默认验证：
 
+可能需要调整 MEMHOG_MB，TMPFS_FILL_MB 参数，
+使内核触发swap交换，并且 bench 不会被 oom kill 掉
+
 #+begin_src bash
-./tools/qemu-dram/run-qemu-dram.sh
+./tools/qemu-dram/validate-qemu-dram.sh
 #+end_src
 
 无 KVM 环境：
 
 #+begin_src bash
-QEMU_ACCEL=tcg QEMU_CPU=max ./tools/qemu-dram/run-qemu-dram.sh
+QEMU_ACCEL=tcg QEMU_CPU=max ./tools/qemu-dram/validate-qemu-dram.sh
 #+end_src
 
 验证成功时会看到：
