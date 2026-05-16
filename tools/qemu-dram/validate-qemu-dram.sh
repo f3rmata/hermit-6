@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(realpath "$(dirname "$0")")
 HERMIT_DIR=$(realpath "$SCRIPT_DIR/../..")
 KERNEL_TREE=$(realpath "$HERMIT_DIR/linux-stable")
-REMOTESWAP_CLIENT_DIR=$(realpath "$HERMIT_DIR/remoteswap-6.6/client")
+REMOTESWAP_CLIENT_DIR=$(realpath "$HERMIT_DIR/remoteswap/client")
 WORK_DIR=${WORK_DIR:-"$SCRIPT_DIR/_work"}
 INITRAMFS_DIR="$WORK_DIR/initramfs"
 LOG_FILE="$WORK_DIR/qemu.log"

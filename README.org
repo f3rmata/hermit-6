@@ -1,0 +1,351 @@
+#+title: Hermit 6.6
+#+startup: overview
+
+* 简介
+
+=hermit-6.6= 是 Hermit 从 Linux 5.14 迁移到 Linux 6.6 的工作目录。
+
+当前内核位于 =linux-stable=，基线是 Linux =v6.6.138=，Hermit 修改在该内核
+子仓库的 =hermit= 分支上。当前可运行目标是 DRAM 模式：swapout 写入本地 DRAM
+mock backend，swapin 再从同一个 backend 读回，用 QEMU 验证数据正确性和
+profiling 输出。
+
+当前重点：
+
+- 用 =hermit_backend_ops= 替代 5.14 依赖的 frontswap。
+- 跑通 DRAM backend 的 swapout/store 和 swapin/load。
+- 恢复 5.14 Hermit profiling 的主要观测点。
+- 提供 QEMU DRAM 自动验证脚本。
+
+当前不包含完整 RDMA backend 迁移。RDMA 相关代码仍保留在 =remoteswap= 中，但
+6.6 下第一轮验证请使用 ~BACKEND=DRAM~。
+
+* 目录结构
+
+#+begin_src text
+hermit-6.6/
+  linux-stable/              Linux 6.6.138 + Hermit kernel patch
+  remoteswap/                rswap client/server 代码
+  remoteswap/client/         DRAM backend module: rswap-client.ko
+  tools/qemu-dram/           QEMU DRAM 构建和验证工具
+  tools/qemu-dram/src/       memhog 与 hermit_swap_stats helper
+  docs/plan/                 分阶段迁移记录
+  patch-6-6.org              本次 6.6 补丁说明
+#+end_src
+
+* 当前功能状态
+
+已完成：
+
+- =CONFIG_HERMIT=、Hermit MM 文件和统计系统调用接入 Linux 6.6。
+- x86-64 系统调用：
+
+  #+begin_src text
+  471 reset_swap_stats
+  472 get_swap_stats
+  #+end_src
+
+- =do_swap_page()= 支持 =bypass_swapcache= direct swapin。
+- =swap_readpage()= 和 =swap_writepage()= 支持 Hermit backend load/store。
+- =remoteswap/client= 的 DRAM backend 已注册到 =hermit_backend_ops=。
+- DRAM backend 提供 debugfs counter：
+
+  #+begin_src text
+  /sys/kernel/debug/rswap_dram/stores
+  /sys/kernel/debug/rswap_dram/loads
+  /sys/kernel/debug/rswap_dram/load_misses
+  /sys/kernel/debug/rswap_dram/errors
+  #+end_src
+
+- QEMU 验证会检查 checksum、=pswpin=、=pswpout=、backend store/load 计数和
+  Hermit profiling dmesg。
+
+未完成或限制：
+
+- RDMA backend 尚未迁移到 =hermit_backend_ops=。
+- Hermit vaddr/vpage directed reclaim 尚未完整恢复到 6.6 folio/rmap 路径。
+- =ADC_POLL_STORE= 在 DRAM 同步 store 模式下预期为 0。
+- 大 folio、THP、复杂 MGLRU 路径优先保留 Linux 6.6 原生行为。
+- 第一轮不建议在仍有 active swap entry 时 =rmmod rswap-client.ko=；测试中直接
+  QEMU poweroff。
+
+* 依赖
+
+常用依赖：
+
+#+begin_src text
+gcc / make / bc / flex / bison / openssl headers
+qemu-system-x86_64
+busybox
+cpio / gzip
+util-linux: mkswap, swapon
+#+end_src
+
+脚本默认使用 =/usr/bin/busybox= 构造 initramfs。没有 KVM 时可以使用 TCG：
+
+#+begin_src bash
+QEMU_ACCEL=tcg QEMU_CPU=max
+#+end_src
+
+如果系统默认 GCC 版本过新，=tools/qemu-dram/build-qemu-dram.sh= 会优先选择
+=gcc-14=、=gcc-13= 等较稳定版本；检测到 GCC 15 时会自动添加 =-std=gnu11=
+兼容参数。
+
+* 快速开始
+
+进入目录：
+
+#+begin_src bash
+cd hermit-6.6
+#+end_src
+
+构建内核、=brd.ko=、DRAM backend 模块和用户态 helper：
+
+#+begin_src bash
+./tools/qemu-dram/build-qemu-dram.sh
+#+end_src
+
+默认验证：
+
+#+begin_src bash
+./tools/qemu-dram/run-qemu-dram.sh
+#+end_src
+
+无 KVM 环境：
+
+#+begin_src bash
+QEMU_ACCEL=tcg QEMU_CPU=max ./tools/qemu-dram/run-qemu-dram.sh
+#+end_src
+
+验证成功时会看到：
+
+#+begin_src text
+MEMHOG_CHECKSUM: status=pass
+RSWAP_DRAM_STATS: ... stores=... loads=... errors=0
+SWAP_VMSTAT: ... pswpin=... pswpout=...
+VALIDATION: PASS
+QEMU + Hermit DRAM validation succeeded.
+#+end_src
+
+串口日志和 QEMU 日志位于：
+
+#+begin_src text
+tools/qemu-dram/_work/guest-serial.log
+tools/qemu-dram/_work/qemu.log
+#+end_src
+
+* 分场景验证
+
+构建完成后可以跳过重复编译：
+
+#+begin_src bash
+SKIP_BUILD=1 ./tools/qemu-dram/validate-qemu-dram.sh
+#+end_src
+
+direct swapin 默认场景：
+
+#+begin_src bash
+SKIP_BUILD=1 BYPASS_SWAPCACHE=Y LAZY_POLL=N ./tools/qemu-dram/validate-qemu-dram.sh
+#+end_src
+
+direct swapin + lazy poll：
+
+#+begin_src bash
+SKIP_BUILD=1 BYPASS_SWAPCACHE=Y LAZY_POLL=Y ./tools/qemu-dram/validate-qemu-dram.sh
+#+end_src
+
+关闭 direct swapin，验证 native swapcache 路径也能从 backend 读回：
+
+#+begin_src bash
+SKIP_BUILD=1 BYPASS_SWAPCACHE=N LAZY_POLL=N ./tools/qemu-dram/validate-qemu-dram.sh
+#+end_src
+
+常用压测参数：
+
+#+begin_src bash
+GUEST_RAM_MB=4096
+RSWAP_MEM_GB=1
+SWAP_MB=1024
+MEMHOG_MB=1800
+TMPFS_FILL_MB=768
+TIMEOUT_SEC=240
+#+end_src
+
+例如：
+
+#+begin_src bash
+SKIP_BUILD=1 QEMU_ACCEL=tcg QEMU_CPU=max TIMEOUT_SEC=240 \
+  GUEST_RAM_MB=4096 MEMHOG_MB=1800 TMPFS_FILL_MB=768 \
+  SWAP_MB=1024 RSWAP_MEM_GB=1 BYPASS_SWAPCACHE=N LAZY_POLL=N \
+  ./tools/qemu-dram/validate-qemu-dram.sh
+#+end_src
+
+* 手动构建
+
+QEMU 脚本会自动设置最小配置。手动构建时请至少保证：
+
+#+begin_src text
+CONFIG_MEMCG=y
+CONFIG_SWAP=y
+CONFIG_HERMIT=y
+CONFIG_DEBUG_FS=y
+CONFIG_BLK_DEV_RAM=m 或 y
+# CONFIG_ZSWAP is not set
+#+end_src
+
+手动命令：
+
+#+begin_src bash
+make -C linux-stable olddefconfig
+make -C linux-stable -j$(nproc) bzImage modules_prepare drivers/block/brd.ko
+make -C remoteswap/client BACKEND=DRAM KDIR=$PWD/linux-stable KBUILD_MODPOST_WARN=1
+#+end_src
+
+只做局部对象编译：
+
+#+begin_src bash
+make -C linux-stable -j$(nproc) \
+  mm/page_io.o mm/memory.o mm/vmscan.o mm/memcontrol.o \
+  mm/swap_state.o arch/x86/mm/fault.o kernel/fork.o
+#+end_src
+
+* 运行时开关
+
+Hermit 控制项位于：
+
+#+begin_src text
+/sys/kernel/debug/hermit/
+#+end_src
+
+常用开关：
+
+| 开关 | 含义 |
+|------+------|
+| =bypass_swapcache= | page fault 时尝试 direct swapin |
+| =batch_swapout= | 启用 batch swapout 相关逻辑 |
+| =batch_tlb= | batch TLB 相关开关 |
+| =batch_io= | batch I/O 相关开关 |
+| =vaddr_swapout= | 5.14 vaddr/vpage reclaim 开关，目前 6.6 未完整恢复 |
+| =speculative_io= | speculative I/O 开关 |
+| =speculative_lock= | speculative lock 开关 |
+| =lazy_poll= | direct swapin 后延迟 poll |
+| =apt_reclaim= | Hermit async reclaim 相关开关 |
+| =sthd_cnt= | swap thread 数量 |
+| =reclaim_mode= | reclaim 模式变量 |
+
+QEMU 脚本会自动写入当前 6.6 已存在的开关。
+
+* 观测方式
+
+DRAM backend：
+
+#+begin_src bash
+cat /sys/kernel/debug/rswap_dram/stores
+cat /sys/kernel/debug/rswap_dram/loads
+cat /sys/kernel/debug/rswap_dram/load_misses
+cat /sys/kernel/debug/rswap_dram/errors
+#+end_src
+
+Linux swap 统计：
+
+#+begin_src bash
+grep -E 'pswpin|pswpout' /proc/vmstat
+#+end_src
+
+Hermit 用户态 helper：
+
+#+begin_src bash
+/bin/hermit_swap_stats reset boot
+/bin/hermit_swap_stats stats after_reload
+#+end_src
+
+=get_swap_stats= 会同时把详细 profiling report 打到 dmesg。QEMU 脚本会把关键行
+筛成：
+
+#+begin_src text
+HERMIT_SWAP_STATS: ...
+HERMIT_DMESG: ...
+RSWAP_DRAM_STATS: ...
+SWAP_VMSTAT: ...
+#+end_src
+
+* Profiling 说明
+
+当前已恢复的主要类别：
+
+- swap major/minor/non-swap fault duration。
+- swapin =do_swap_page()= breakdown。
+- backend read/write latency，仍使用 =ADC_RDMA_READ_LAT= 和
+  =ADC_RDMA_WRITE_LAT= 名称以保持 5.14 ABI。
+- memcg charge 和 reclaim breakdown。
+- vmscan reclaim/swapout 中的 reference check、unmap、TLB flush、write page。
+- swap readahead/prefetch 和 swapcache hit-on-prefetch。
+
+正常可能为 0 的字段：
+
+- =ADC_POLL_STORE=：DRAM backend 是同步 store。
+- =ADC_HERMIT_RMAP1_LAT= / =ADC_HERMIT_RMAP2_LAT=：vaddr/vpage reclaim 尚未完整恢复。
+- =ADC_PAGE_RECLAIM=：没有触发 memcg reclaim 时可能为 0。
+- =ADC_PREFETCH= / =ADC_RD_CACHE_ASYNC=：关闭 readahead 或走 direct bypass
+  swapcache 时可能为 0。
+
+完整点位映射见：
+
+#+begin_src text
+docs/plan/stage5-adaptation-6.6-profiling.md
+#+end_src
+
+* 重要路径
+
+Hermit direct swapin：
+
+#+begin_src text
+do_swap_page()
+  -> swap_cache_get_folio() miss
+  -> HMT_BPS_SCACHE && swap_count == 1
+  -> hermit_direct_swap_readpage()
+  -> hermit_backend_load()
+  -> hermit_poll_read()
+  -> set_pte_at()
+#+end_src
+
+Native swapcache swapin + Hermit backend：
+
+#+begin_src text
+do_swap_page()
+  -> swapin_readahead()
+  -> swap_readpage()
+  -> zswap miss
+  -> hermit_backend_load()
+  -> native swap read fallback
+#+end_src
+
+Hermit DRAM swapout：
+
+#+begin_src text
+shrink_folio_list()
+  -> pageout()
+  -> swap_writepage()
+  -> zswap_store()
+  -> hermit_backend_store()
+  -> native swap write fallback
+#+end_src
+
+* 文档索引
+
+#+begin_src text
+patch-6-6.org                              当前补丁总览
+docs/plan/stage1-adaptation-6.15.md        基础代码迁移
+docs/plan/stage2-adaptation-6.15.md        接入swap路径
+docs/plan/stage3-adaptation-6.6.md         do_swap_page / 6.6 迁移分析
+docs/plan/stage4-adaptation-6.6-dram.md    DRAM backend 迁移和 QEMU 验证
+docs/plan/stage5-adaptation-6.6-profiling.md 5.14 profiling 点迁移
+#+end_src
+
+* 后续计划
+
+- 把 RDMA backend 从 frontswap 迁移到 =hermit_backend_ops=。
+- 恢复 5.14 Hermit vaddr/vpage directed reclaim。
+- 增加 backend invalidate / slot lifecycle 管理。
+- 进一步校准 MGLRU、THP 和 large folio 下的 profiling 语义。
+- 更新 =remoteswap/README.md= 中旧 RDMA/frontswap 操作说明。

@@ -1,0 +1,361 @@
+* 迁移 Hermit 到 Linux 6.6
+
+当前新版目录为 =hermit-6.6=：
+
+- 内核目录：=linux-stable=
+- remoteswap 目录：=remoteswap=
+- QEMU DRAM 验证目录：=tools/qemu-dram=
+
+当前重点是 6.6 DRAM 模式和 5.14 profiling 点迁移。RDMA backend 还没有完整迁移。
+
+** 修改记录
+
+*** 复制 hermit 代码
+*** 迁移 swap_stats.h 统计
+
+hermit 的 adc_macros.h/adc_timer.h 硬编码了一些信息？
+
+将 451 reset_swap_stats sys_reset_swap_stats/452 get_swap_stats sys_get_swap_stats 系统调用号迁移到 471/472
+添加 syscall,迁移 extended_syscalls.c
+
+*** 添加 mem_cgroup 相关统计字段
+total_pg_charge/total_pg_uncharge/hmt_sc/sthds
+
+*** page 接口换成 folio 接口
+暂时保留 linux 原生接口，不完全迁移包装
+page_memcg(page)->folio_memcg(page_folio(page))
+total_mapcount(page)->folio_mapcount(page_folio(page))
+page_referenced(page, ...)->folio_referenced(page_folio(page), ...)
+clear_page_idle(page)->folio_clear_idle(page_folio(page))
+test_and_clear_page_young(page)->folio_test_clear_young(page_folio(page))
+
+
+*** TODO 继续添加 hermit 相关统计(profiling 版本系统函数)
+folio_test_clear_readahead()->PG_prefetch (ADC_HIT_ON_PREFETCH)
+ADC_PREFETCH_SWAPIN 统计
+
+- 已新增 hermit_pf_profile_ctx，用 current->hermit_pf_ctx 在 fault、memcg、vmscan、page_io、swap_state 之间共享同一份 pf_breakdown。
+- 已恢复主要 page fault / swapin / swapout / reclaim / backend latency 统计点。
+- ADC_HERMIT_RMAP1_LAT / ADC_HERMIT_RMAP2_LAT 仍等待 vaddr/vpage reclaim 完整恢复。
+
+*** HOLD PG_prefetch 移植
+不用 hermit 的 PG_prefetch 私有页标识，直接用新版内核提供的 folio_set_readahead(folio)标记函数
+
+*** DONE 迁移 hermit 的内存路径
+frontswap/remoteswap page-in/page-out 等路径
+hermit_issue_read(),hermit_poll_read()
+do_swap_page(),hermit_vma_prefetch(),read_swap_cache_async()等
+线程上下文等功能还没有适配
+**** DONE 适配 vmscan 中内存回收逻辑
+修改原来使用 frontswap 的接口
+移植 HMT_BPS_SCACHE native_direct_swapin
+
+当前 vmscan 已经恢复 native folio reclaim 上的 profiling 插点；
+5.14 的 hermit_try_to_unmap()/hermit_page_referenced() directed reclaim 还没有完整接回 6.6。
+
+**** DONE 添加 hermit_backend 适配函数
+#+begin_quote hermit_backend
+5.14:
+do_swap_page()
+-> frontswap_load_async()
+-> frontswap_ops->load_async()
+-> rswap RDMA/DRAM
+
+6.6 当前方案:
+do_swap_page()
+-> hermit_issue_read()
+-> hermit_backend_load()
+-> hermit_backend_ops->load()
+-> rswap DRAM backend
+#+end_quote
+
+补充：
+- 6.6 不恢复 frontswap，改为 hermit_backend_ops。
+- DRAM backend 已注册到 hermit_backend_ops。
+- RDMA backend 仍保留旧 frontswap 代码，后续迁移。
+
+**** DONE 添加 page_io 中读写协议
+hermit_issue_read/hermit_poll_read 等
+
+page_io 当前路径：
+- swap_readpage(): zswap miss 后尝试 hermit_backend_load()，失败再回退 native swap read。
+- swap_writepage(): zswap store 后尝试 hermit_backend_store()，成功则完成 writeback 并跳过 native swap write。
+
+**** DONE 适配 do_swap_page 路径
+先尝试适配 swapin 部分的逻辑
+***** DONE 恢复原生 profiling
+***** DONE 切换到 hermit_issue_read()/hermit_poll_read()
+#+begin_quote 路径
+do_swap_page()
+-> swap_cache_get_folio()
+-> miss
+-> HMT_BPS_SCACHE && swapcount == 1
+-> allocate folio
+-> memcg swapin charge
+-> swapcache_prepare()
+-> hermit_issue_read()
+-> optional prefetch
+-> hermit_poll_read()
+-> folio uptodate check
+-> arch_swap_restore()
+-> swap_free()
+-> rmap / set_pte
+#+end_quote
+
+*** large folio / THP / MGLRU 等保持 linux 6.6 原生行为
+
+*** DONE remoteswap DRAM 迁移（RDMA 需要实机测试）
+
+主要缺口
+
+vmscan 当前已经接上 profiling，但主要还是 native folio reclaim：hermit_try_to_free_mem_cgroup_pages() 仍包装 try_to_free_mem_cgroup_pages()，没有完全恢复 5.14 的 shrink_node_profiling/shrink_lruvec_profiling/shrink_page_list_profiling。
+
+5.14 的 Hermit 定向 rmap 没有真正接入：rmap.c/pagewalk.c/vmscan.c 没有 hermit_try_to_unmap()、hermit_addr_vma_walk() 的完整实现接入。
+
+batch swapout/TLB/batch account 的统计点已部分恢复到 6.6 folio reclaim 位置，但语义仍与 5.14 profiling 版本不完全一致。
+
+frontswap/rswap 后端迁移状态：
+- DRAM backend 已迁移到 hermit_backend_ops。
+- swapout/store 已在 page_io.c 接入 hermit_backend_store()。
+- swapin/load 已在 do_swap_page() direct path 和 swap_readpage() native path 接入 hermit_backend_load()。
+- RDMA backend 仍未迁移，rswap_rdma_ops.c 中还保留旧 frontswap_ops 逻辑。
+
+pref_request 相关接口在 hermit.h 里保留了声明，但缺少 5.14 那套结构定义和完整实现，属于残留骨架。
+
+hermit_mem_cgroup_swapin_charge_page() 旧 page 接口不再作为主路径使用，6.6 当前主路径是 mem_cgroup_swapin_charge_folio()。
+
+** 内存路径适配
+#+begin_quote 5.14 linux 原生
+
+用户访问 swapped-out 页
+        |
+        v
+page fault
+        |
+        v
+handle_mm_fault()
+        |
+        v
+do_swap_page()
+        |
+        +--> lookup_swap_cache()
+        |        |
+        |        +--> 命中: minor swap fault
+        |
+        +--> 未命中: swapin_readahead()
+                 |
+                 v
+          read_swap_cache_async()
+                 |
+                 v
+          swap_readpage()
+                 |
+                 +--> frontswap_load() 可选
+                 |
+                 +--> swap device BIO read
+
+内存压力 / memcg 超限
+        |
+        v
+try_to_free_pages()
+try_to_free_mem_cgroup_pages()
+        |
+        v
+shrink_node()
+        |
+        v
+shrink_lruvec()
+        |
+        v
+shrink_page_list()
+        |
+        v
+try_to_unmap()
+        |
+        v
+swap_writepage()
+        |
+        +--> frontswap_store() 可选
+        |
+        +--> swap device BIO write
+#+end_quote
+
+#+begin_quote 5.14 hermit
+用户访问 swapped-out 页
+        |
+        v
+page fault
+        |
+        v
+handle_mm_fault_profiling()
+        |
+        v
+do_swap_page_profiling()
+        |
+        +--> ADC_PF_SWAP_BIT / pf_breakdown 计时
+        |
+        +--> lookup_swap_cache()
+        |        |
+        |        +--> 命中:
+        |              ADC_HIT_ON_PREFETCH++
+        |              minor swap fault 统计
+        |
+        +--> 未命中:
+                 |
+                 +--> 若 HMT_BPS_SCACHE && swap_count == 1
+                 |        |
+                 |        v
+                 | hermit_swapin_bypass_swapcache()
+                 |        |
+                 |        +--> hermit_issue_read()
+                 |        +--> hermit_poll_read()
+                 |
+                 +--> 否则:
+                          |
+                          v
+                   hermit_swapin_readahead()
+                          |
+                          +--> prefetch pages
+                          +--> ADC_PREFETCH_SWAPIN++
+                          +--> remote/frontswap read
+
+memcg charge
+        |
+        v
+try_charge_profiling()
+        |
+        +--> ADC_CGROUP_ACCOUNT
+        |
+        +--> 超限:
+              hermit_try_to_free_mem_cgroup_pages()
+
+内存压力 / Hermit swap thread
+        |
+        v
+hmt_async_reclaim()
+        |
+        v
+hermit_try_to_free_mem_cgroup_pages()
+        |
+        v
+shrink_node_profiling()
+        |
+        v
+shrink_lruvec_profiling()
+        |
+        v
+shrink_page_list_profiling()
+        |
+        +--> page_referenced / hermit_page_referenced
+        |
+        +--> try_to_unmap / hermit_try_to_unmap
+        |
+        +--> batch TLB / batch IO
+        |
+        v
+swap_writepage_on_core()
+        |
+        v
+frontswap_store_on_core()
+        |
+        v
+rswap-client RDMA/DRAM backend
+#+end_quote
+
+#+begin_quote 6.6 原版
+用户访问 swapped-out 页
+        |
+        v
+page fault
+        |
+        v
+handle_mm_fault()
+        |
+        v
+do_swap_page()
+        |
+        +--> swap_cache_get_folio()
+        |        |
+        |        +--> 命中: minor swap fault
+        |
+        +--> 未命中:
+                 |
+                 +--> alloc_swap_folio()
+                 |        |
+                 |        v
+                 | mem_cgroup_swapin_charge_folio()
+                 |
+                 +--> swapin_readahead()
+                          |
+                          v
+                   read_swap_cache_async()
+                          |
+                          v
+                   swap_read_folio()
+                          |
+                          +--> zswap_load()
+                          |
+                          +--> swap device read
+
+内存压力 / memcg 超限
+        |
+        v
+try_to_free_pages()
+try_to_free_mem_cgroup_pages()
+        |
+        v
+shrink_node()
+        |
+        v
+shrink_lruvec()
+        |
+        v
+shrink_folio_list()
+        |
+        v
+try_to_unmap(folio)
+        |
+        v
+swap_writepage()
+        |
+        +--> zswap_store()
+        |
+        +--> __swap_writepage()
+                 |
+                 v
+          swap device write
+#+end_quote
+
+#+begin_quote 6.6 hermit
+page fault -> do_swap_page() -> swap_cache_get_folio()
+    -> 命中 readahead 页:
+         ADC_HIT_ON_PREFETCH++, folio_test_clear_readahead()
+    -> 未命中:
+         若 HMT_BPS_SCACHE && swap_count == 1:
+             direct swapin -> hermit_issue_read() -> hermit_backend_load() -> hermit_poll_read()
+         否则:
+             swapin_readahead()
+             -> target_folios: ADC_ONDEMAND_SWAPIN++
+             -> neighbor_folios: folio_set_readahead(), ADC_PREFETCH_SWAPIN++
+             -> swap_readpage()
+             -> hermit_backend_load() 或 native swap read fallback
+
+swapout / reclaim:
+shrink_folio_list()
+-> pageout()
+-> swap_writepage()
+-> zswap_store()
+-> hermit_backend_store()
+-> native swap write fallback
+
+memcg charge -> try_charge_memcg() -> total_pg_charge++
+                                    -> hmt_async_reclaim()
+
+// Hermit worker
+hmt_async_reclaim()
+-> hermit_reclaim_high()
+-> hermit_try_to_free_mem_cgroup_pages()
+-> try_to_free_mem_cgroup_pages()
+-> shrink_lruvec() / shrink_folio_list()
+
+#+end_quote

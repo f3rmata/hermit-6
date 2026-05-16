@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR=$(realpath "$(dirname "$0")")
 HERMIT_DIR=$(realpath "$SCRIPT_DIR/../..")
 KERNEL_TREE=$(realpath "$HERMIT_DIR/linux-stable")
-REMOTESWAP_CLIENT_DIR=$(realpath "$HERMIT_DIR/remoteswap-6.6/client")
+REMOTESWAP_CLIENT_DIR=$(realpath "$HERMIT_DIR/remoteswap/client")
 WORK_DIR=${WORK_DIR:-"$SCRIPT_DIR/_work"}
 JOBS=${JOBS:-$(nproc)}
 KERNEL_CONFIG=${KERNEL_CONFIG:-config}
-MEMHOG_SRC="$SCRIPT_DIR/memhog.c"
+MEMHOG_SRC="$SCRIPT_DIR/src/memhog.c"
 MEMHOG_BIN="$WORK_DIR/memhog"
-SWAP_STATS_SRC="$SCRIPT_DIR/hermit_swap_stats.c"
+SWAP_STATS_SRC="$SCRIPT_DIR/src/hermit_swap_stats.c"
 SWAP_STATS_BIN="$WORK_DIR/hermit_swap_stats"
 KCFLAGS_EXTRA=${KCFLAGS_EXTRA:-}
 HOSTCFLAGS_EXTRA=${HOSTCFLAGS_EXTRA:-}
