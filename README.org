@@ -342,10 +342,83 @@ docs/plan/stage4-adaptation-6.6-dram.md    DRAM backend 迁移和 QEMU 验证
 docs/plan/stage5-adaptation-6.6-profiling.md 5.14 profiling 点迁移
 #+end_src
 
-* 后续计划
+* TODO 后续计划
 
 - 把 RDMA backend 从 frontswap 迁移到 =hermit_backend_ops=。
 - 恢复 5.14 Hermit vaddr/vpage directed reclaim。
 - 增加 backend invalidate / slot lifecycle 管理。
 - 进一步校准 MGLRU、THP 和 large folio 下的 profiling 语义。
 - 更新 =remoteswap/README.md= 中旧 RDMA/frontswap 操作说明。
+
+** [/] 5.14 → 6.6 移植遗留问题
+
+以下问题不影响单次 DRAM swapout→swapin→校验测试，但在多轮测试或多 swap 设备场景
+下可能导致错误。
+
+*** [ ] 缺少 invalidate_page / invalidate_area 回调
+
+=hermit_backend_ops= 没有 swap entry 失效或 swapoff 的通知回调。5.14 的
+=frontswap_ops= 包含 =invalidate_page= 和 =invalidate_area=，当 swap slot 被释放
+或 swap 设备被关闭时自动清除后端中的对应页面。
+
+当前影响：
+- DRAM backend 的 =local_dram_valid= bitmap 在 swap slot 被释放后不会清除。
+- swapoff→swapon 循环中，旧 swap entry 的 bitmap bit 仍然为 1，新 swapout 可能
+  分配到同一 offset，读取时命中的是上一轮的旧数据。
+
+*** [ ] 缺少 per-swap-device bitmap 隔离
+
+5.14 的 =frontswap_map= 是 per-swap-device 的 bitmap，每个 swap 设备独立追踪。
+6.6 DRAM backend 使用单一的全局 =local_dram_valid= bitmap，offset 仅由
+=swp_offset(entry)= 计算，不区分 =swp_type=。
+
+当前影响：
+- 同时挂载多个 swap 设备时，type=0 offset=100 和 type=1 offset=100 映射到 DRAM
+  中同一位置，互相覆盖。
+
+*** [ ] 异步 store / batch swapout 路径未迁移
+
+5.14 的 =vmscan.c= 使用 =frontswap_store_on_core= + =frontswap_poll_store= 实现
+异步批量 swapout，=under_write_pages= 链表追踪进行中的写操作。6.6 的
+=hermit_swap_writepage= 仅调用 =hermit_backend_store(..., async=false)= 做同步写，
+=hermit_post_pageout_rls_pages= 和 =ADC_POLL_STORE= 的 batch 完成路径未迁移到
+6.6 =vmscan.c=。
+
+当前影响：
+- DRAM backend 是同步 store，功能不受影响。
+- RDMA backend 迁移后将无法使用异步批量提交，写性能会退化。
+
+*** [ ] hermit_backend_peek_load 定义了但预取路径未调用
+
+5.14 的 =swap_state.c= 预取循环中使用 =frontswap_peek_load(cpu)= 检测按需读是否
+已完成，若完成则提前退出预取循环。6.6 中 =hermit_backend_peek_load= 已在
+=hermit_backend.c= 实现并导出，但 =swap_state.c= 的预取路径未调用。
+
+当前影响：
+- DRAM backend 的 =peek_load= 始终返回 1（未完成），预取检查逻辑本身不依赖它，
+  暂无实际影响。
+- RDMA backend 迁移后预取可能继续发送无用请求。
+
+*** [ ] Hermit 自定义 readahead 函数未迁移
+
+5.14 提供了四个后端感知的 readahead/prefetch 函数：
+=hermit_swapin_readahead=、=hermit_swap_cluster_readahead=、
+=hermit_vma_prefetch=、=hermit_swap_ra_info=。6.6 使用标准内核的
+=swapin_readahead= / =swap_cluster_readahead=，这些函数不直接与 backend 交互。
+
+当前影响：
+- DRAM backend 下 readahead 走 =swap_readpage= → =hermit_swap_readpage= →
+  =rswap_dram_read= 路径，功能正常。
+- 但 bypass swapcache direct swapin 路径（=hermit_direct_swap_readpage=）中
+  没有预取逻辑，5.14 的 =hermit_swapin_bypass_swapcache= 中自带的
+  =hermit_vma_prefetch= 在 6.6 中缺失。
+
+*** [ ] async 参数始终为 false
+
+内核侧所有调用点传给 =hermit_backend_load= 和 =hermit_backend_store= 的 =async=
+参数均为 =false=。5.14 的 =load_async= / =store_on_core= 异步路径未接入。接口中
+的 =async= 参数目前是死代码。
+
+当前影响：
+- DRAM backend 忽略 =async= 参数，无实际影响。
+- RDMA backend 迁移后需要将对应路径改为 =async=true= 才能使用异步读写。
