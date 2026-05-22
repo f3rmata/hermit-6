@@ -63,7 +63,6 @@ hermit-6.6/
 未完成或限制：
 
 - RDMA backend 尚未迁移到 =hermit_backend_ops=。
-- Hermit vaddr/vpage directed reclaim 尚未完整恢复到 6.6 folio/rmap 路径。
 - =ADC_POLL_STORE= 在 DRAM 同步 store 模式下预期为 0。
 - 大 folio、THP、复杂 MGLRU 路径优先保留 Linux 6.6 原生行为。
 - 第一轮不建议在仍有 active swap entry 时 =rmmod rswap-client.ko=；测试中直接
@@ -110,7 +109,7 @@ git submodule update --init --depth=10 -- linux-stable
 默认验证：
 
 可能需要调整 MEMHOG_MB，TMPFS_FILL_MB 参数，
-使内核触发swap交换，并且 bench 不会被 oom kill 掉
+使内核触发 swap 交换，并且 bench 不会被 oom kill 掉
 
 #+begin_src bash
 ./tools/qemu-dram/validate-qemu-dram.sh

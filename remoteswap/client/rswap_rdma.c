@@ -147,8 +147,8 @@ void two_sided_message_done(struct ib_cq *cq, struct ib_wc *wc)
 		       __LINE__, wc->opcode);
 		goto out;
 	}
-	atomic_dec(&rdma_queue->rdma_post_counter);
 out:
+	atomic_dec(&rdma_queue->rdma_post_counter);
 	return;
 }
 
@@ -412,31 +412,39 @@ int rswap_create_rdma_queue(struct rdma_session_context *rdma_session,
 	int ret = 0;
 	struct rdma_cm_id *cm_id;
 	struct rswap_rdma_queue *rdma_queue;
+	struct rswap_rdma_dev *rdma_dev;
 	int cq_num_cqes;
 	int comp_vector = 0;
+	bool created_dev = false;
 
 	rdma_queue = &(rdma_session->rdma_queues[rdma_queue_index]);
 	cm_id = rdma_queue->cm_id;
 
 	if (rdma_session->rdma_dev == NULL) {
-		rdma_session->rdma_dev =
-			kzalloc(sizeof(struct rswap_rdma_dev), GFP_KERNEL);
+		rdma_dev = kzalloc(sizeof(*rdma_dev), GFP_KERNEL);
+		if (!rdma_dev)
+			return -ENOMEM;
 
-		rdma_session->rdma_dev->pd = ib_alloc_pd(
+		rdma_dev->pd = ib_alloc_pd(
 			cm_id->device, IB_ACCESS_LOCAL_WRITE |
 					       IB_ACCESS_REMOTE_READ |
 					       IB_ACCESS_REMOTE_WRITE);
-		rdma_session->rdma_dev->dev =
-			rdma_session->rdma_dev->pd->device;
-
-		if (IS_ERR(rdma_session->rdma_dev->pd)) {
+		if (IS_ERR(rdma_dev->pd)) {
+			ret = PTR_ERR(rdma_dev->pd);
+			rdma_dev->pd = NULL;
 			pr_err("%s, ib_alloc_pd failed\n", __func__);
-			goto err;
+			kfree(rdma_dev);
+			return ret;
 		}
-		pr_info("%s, created pd %p\n", __func__,
-			rdma_session->rdma_dev->pd);
+		rdma_dev->dev = rdma_dev->pd->device;
+		rdma_session->rdma_dev = rdma_dev;
+		created_dev = true;
 
-		setup_rdma_session_comm_buffer(rdma_session);
+		pr_info("%s, created pd %p\n", __func__, rdma_dev->pd);
+
+		ret = setup_rdma_session_comm_buffer(rdma_session);
+		if (ret)
+			goto err;
 	}
 
 	cq_num_cqes =
@@ -454,6 +462,7 @@ int rswap_create_rdma_queue(struct rdma_session_context *rdma_session,
 	if (IS_ERR(rdma_queue->cq)) {
 		pr_err("%s, ib_create_cq failed\n", __func__);
 		ret = PTR_ERR(rdma_queue->cq);
+		rdma_queue->cq = NULL;
 		goto err;
 	}
 
@@ -464,6 +473,24 @@ int rswap_create_rdma_queue(struct rdma_session_context *rdma_session,
 	}
 
 err:
+	if (ret) {
+		if (rdma_queue->qp) {
+			rdma_destroy_qp(cm_id);
+			rdma_queue->qp = NULL;
+		}
+		if (rdma_queue->cq) {
+			ib_destroy_cq(rdma_queue->cq);
+			rdma_queue->cq = NULL;
+		}
+		if (created_dev) {
+			rswap_free_buffers(rdma_session);
+			if (rdma_session->rdma_dev &&
+			    rdma_session->rdma_dev->pd)
+				ib_dealloc_pd(rdma_session->rdma_dev->pd);
+			kfree(rdma_session->rdma_dev);
+			rdma_session->rdma_dev = NULL;
+		}
+	}
 	return ret;
 }
 
@@ -514,15 +541,33 @@ int rswap_setup_buffers(struct rdma_session_context *rdma_session)
 		kzalloc(sizeof(struct message), GFP_KERNEL);
 	rdma_session->rdma_send_req.send_buf =
 		kzalloc(sizeof(struct message), GFP_KERNEL);
+	if (!rdma_session->rdma_recv_req.recv_buf ||
+	    !rdma_session->rdma_send_req.send_buf) {
+		ret = -ENOMEM;
+		goto err;
+	}
 
 	rdma_session->rdma_recv_req.recv_dma_addr =
 		ib_dma_map_single(rdma_session->rdma_dev->dev,
 				  rdma_session->rdma_recv_req.recv_buf,
 				  sizeof(struct message), DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(rdma_session->rdma_dev->dev,
+				 rdma_session->rdma_recv_req.recv_dma_addr)) {
+		ret = -ENOMEM;
+		rdma_session->rdma_recv_req.recv_dma_addr = 0;
+		goto err;
+	}
+
 	rdma_session->rdma_send_req.send_dma_addr =
 		ib_dma_map_single(rdma_session->rdma_dev->dev,
 				  rdma_session->rdma_send_req.send_buf,
 				  sizeof(struct message), DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(rdma_session->rdma_dev->dev,
+				 rdma_session->rdma_send_req.send_dma_addr)) {
+		ret = -ENOMEM;
+		rdma_session->rdma_send_req.send_dma_addr = 0;
+		goto err;
+	}
 
 	print_debug(
 		"%s, Got dma/bus address 0x%llx, for the recv_buf 0x%llx \n",
@@ -540,6 +585,10 @@ int rswap_setup_buffers(struct rdma_session_context *rdma_session)
 		    __func__);
 	print_debug(KERN_INFO "%s is done. \n", __func__);
 
+	return ret;
+
+err:
+	rswap_free_buffers(rdma_session);
 	return ret;
 }
 
@@ -565,6 +614,7 @@ int rswap_connect_remote_memory_server(
 	ret = ib_post_recv(rdma_queue->qp, &rdma_session->rdma_recv_req.rq_wr,
 			   &bad_wr);
 	if (ret) {
+		atomic_dec(&rdma_queue->rdma_post_counter);
 		pr_err("%s: post a 2-sided RDMA message error \n", __func__);
 		goto err;
 	}
@@ -572,7 +622,7 @@ int rswap_connect_remote_memory_server(
 	ret = rdma_connect(rdma_queue->cm_id, &conn_param);
 	if (ret) {
 		pr_err("%s, rdma_connect error %d\n", __func__, ret);
-		return ret;
+		goto err;
 	}
 
 	wait_event_interruptible(rdma_queue->sem,
@@ -605,10 +655,13 @@ int init_remote_chunk_list(struct rdma_session_context *rdma_session)
 	int ret = 0;
 	uint32_t i;
 
+	kfree(rdma_session->remote_mem_pool.chunks);
 	rdma_session->remote_mem_pool.chunks = (struct remote_chunk *)kzalloc(
 		sizeof(struct remote_chunk) *
 			rdma_session->remote_mem_pool.chunk_num,
 		GFP_KERNEL);
+	if (!rdma_session->remote_mem_pool.chunks)
+		return -ENOMEM;
 
 	for (i = 0; i < rdma_session->remote_mem_pool.chunk_num; i++) {
 		rdma_session->remote_mem_pool.chunks[i].chunk_state = EMPTY;
@@ -664,6 +717,9 @@ int init_rdma_sessions(struct rdma_session_context *rdma_session)
 
 	rdma_session->rdma_queues = kzalloc(
 		sizeof(struct rswap_rdma_queue) * num_queues, GFP_KERNEL);
+	if (!rdma_session->rdma_queues)
+		return -ENOMEM;
+
 	rdma_session->send_queue_depth = RDMA_SEND_QUEUE_DEPTH + 1;
 	rdma_session->recv_queue_depth = RDMA_RECV_QUEUE_DEPTH + 1;
 
@@ -673,11 +729,16 @@ int init_rdma_sessions(struct rdma_session_context *rdma_session)
 	if (ret == 0) {
 		pr_err("Assign ip %s to  rdma_session->addr : %s failed.\n",
 		       server_ip, rdma_session->addr);
+		ret = -EINVAL;
 		goto err;
 	}
 	rdma_session->addr_type = AF_INET;
+	ret = 0;
+	return ret;
 
 err:
+	kfree(rdma_session->rdma_queues);
+	rdma_session->rdma_queues = NULL;
 	return ret;
 }
 
@@ -721,7 +782,8 @@ int rswap_init_rdma_queue(struct rdma_session_context *rdma_session, int idx)
 	if (IS_ERR(rdma_queue->cm_id)) {
 		pr_err("failed to create cm id: %ld\n",
 		       PTR_ERR(rdma_queue->cm_id));
-		ret = -ENODEV;
+		ret = PTR_ERR(rdma_queue->cm_id);
+		rdma_queue->cm_id = NULL;
 		goto err;
 	}
 
@@ -736,7 +798,7 @@ int rswap_init_rdma_queue(struct rdma_session_context *rdma_session, int idx)
 	if (unlikely(rdma_queue->fs_rdma_req_cache == NULL)) {
 		pr_err("%s, allocate rdma_queue->fs_rdma_req_cache failed.\n",
 		       __func__);
-		ret = -1;
+		ret = -ENOMEM;
 		goto err;
 	}
 
@@ -744,13 +806,20 @@ int rswap_init_rdma_queue(struct rdma_session_context *rdma_session, int idx)
 	if (unlikely(ret)) {
 		pr_err("%s, bind socket error (addr or route resolve error)\n",
 		       __func__);
-		return ret;
+		goto err;
 	}
 
 	return ret;
 
 err:
-	rdma_destroy_id(rdma_queue->cm_id);
+	if (rdma_queue->fs_rdma_req_cache) {
+		kmem_cache_destroy(rdma_queue->fs_rdma_req_cache);
+		rdma_queue->fs_rdma_req_cache = NULL;
+	}
+	if (!IS_ERR_OR_NULL(rdma_queue->cm_id)) {
+		rdma_destroy_id(rdma_queue->cm_id);
+		rdma_queue->cm_id = NULL;
+	}
 	return ret;
 }
 
@@ -767,11 +836,13 @@ int rdma_session_connect(struct rdma_session_context *rdma_session)
 		if (unlikely(ret)) {
 			pr_err("%s,init rdma queue [%d] failed.\n", __func__,
 			       i);
+			goto err;
 		}
 
 		ret = rswap_create_rdma_queue(rdma_session, i);
 		if (unlikely(ret)) {
 			pr_err("%s, Create rdma queues failed. \n", __func__);
+			goto err;
 		}
 
 		ret = rswap_connect_remote_memory_server(rdma_session, i);
@@ -804,6 +875,8 @@ int rdma_session_connect(struct rdma_session_context *rdma_session)
 
 err:
 	pr_err("ERROR in %s \n", __func__);
+	rswap_free_buffers(rdma_session);
+	rswap_free_rdma_structure(rdma_session);
 	return ret;
 }
 
@@ -812,16 +885,40 @@ err:
  */
 void rswap_free_buffers(struct rdma_session_context *rdma_session)
 {
+	struct ib_device *dev = NULL;
+
 	if (rdma_session == NULL)
 		return;
 
-	if (rdma_session->rdma_recv_req.recv_buf != NULL)
-		kfree(rdma_session->rdma_recv_req.recv_buf);
-	if (rdma_session->rdma_send_req.send_buf != NULL)
-		kfree(rdma_session->rdma_send_req.send_buf);
+	if (rdma_session->rdma_dev)
+		dev = rdma_session->rdma_dev->dev;
 
-	if (rdma_session->remote_mem_pool.chunks != NULL)
+	if (dev && rdma_session->rdma_recv_req.recv_dma_addr) {
+		ib_dma_unmap_single(dev,
+				    rdma_session->rdma_recv_req.recv_dma_addr,
+				    sizeof(struct message), DMA_BIDIRECTIONAL);
+		rdma_session->rdma_recv_req.recv_dma_addr = 0;
+	}
+	if (dev && rdma_session->rdma_send_req.send_dma_addr) {
+		ib_dma_unmap_single(dev,
+				    rdma_session->rdma_send_req.send_dma_addr,
+				    sizeof(struct message), DMA_BIDIRECTIONAL);
+		rdma_session->rdma_send_req.send_dma_addr = 0;
+	}
+
+	if (rdma_session->rdma_recv_req.recv_buf != NULL) {
+		kfree(rdma_session->rdma_recv_req.recv_buf);
+		rdma_session->rdma_recv_req.recv_buf = NULL;
+	}
+	if (rdma_session->rdma_send_req.send_buf != NULL) {
+		kfree(rdma_session->rdma_send_req.send_buf);
+		rdma_session->rdma_send_req.send_buf = NULL;
+	}
+
+	if (rdma_session->remote_mem_pool.chunks != NULL) {
 		kfree(rdma_session->remote_mem_pool.chunks);
+		rdma_session->remote_mem_pool.chunks = NULL;
+	}
 
 	print_debug("%s, Free RDMA buffers done. \n", __func__);
 }
@@ -837,32 +934,48 @@ void rswap_free_rdma_structure(struct rdma_session_context *rdma_session)
 	if (rdma_session == NULL)
 		return;
 
-	for (i = 0; i < num_queues; i++) {
+	for (i = 0; rdma_session->rdma_queues && i < num_queues; i++) {
 		rdma_queue = &(rdma_session->rdma_queues[i]);
-		if (rdma_queue->cm_id != NULL) {
-			rdma_destroy_id(rdma_queue->cm_id);
-			print_debug(
-				"%s, free rdma_queue[%d] rdma_cm_id done. \n",
-				__func__, i);
-		}
-
 		if (rdma_queue->qp != NULL) {
-			ib_destroy_qp(rdma_queue->qp);
+			if (!IS_ERR_OR_NULL(rdma_queue->cm_id))
+				rdma_destroy_qp(rdma_queue->cm_id);
+			else
+				ib_destroy_qp(rdma_queue->qp);
+			rdma_queue->qp = NULL;
 			print_debug("%s, free rdma_queue[%d] ib_qp  done. \n",
 				    __func__, i);
 		}
 
 		if (rdma_queue->cq != NULL) {
 			ib_destroy_cq(rdma_queue->cq);
+			rdma_queue->cq = NULL;
 			print_debug("%s, free rdma_queue[%d] ib_cq  done. \n",
 				    __func__, i);
 		}
+
+		if (!IS_ERR_OR_NULL(rdma_queue->cm_id)) {
+			rdma_destroy_id(rdma_queue->cm_id);
+			rdma_queue->cm_id = NULL;
+			print_debug(
+				"%s, free rdma_queue[%d] rdma_cm_id done. \n",
+				__func__, i);
+		}
+
+		if (rdma_queue->fs_rdma_req_cache) {
+			kmem_cache_destroy(rdma_queue->fs_rdma_req_cache);
+			rdma_queue->fs_rdma_req_cache = NULL;
+		}
 	}
 
-	if (rdma_session->rdma_dev->pd != NULL) {
+	if (rdma_session->rdma_dev && rdma_session->rdma_dev->pd != NULL) {
 		ib_dealloc_pd(rdma_session->rdma_dev->pd);
+		rdma_session->rdma_dev->pd = NULL;
 		print_debug("%s, Free device PD  done. \n", __func__);
 	}
+	kfree(rdma_session->rdma_dev);
+	rdma_session->rdma_dev = NULL;
+	kfree(rdma_session->rdma_queues);
+	rdma_session->rdma_queues = NULL;
 	print_debug("%s, Free RDMA structures,cm_id,qp,cq,pd done. \n",
 		    __func__);
 }
@@ -877,6 +990,9 @@ int rswap_disconnect_and_collect_resource(
 	int i;
 	struct rswap_rdma_queue *rdma_queue;
 
+	if (!rdma_session || !rdma_session->rdma_queues)
+		return 0;
+
 	for (i = 0; i < num_queues; i++) {
 		rdma_queue = &(rdma_session->rdma_queues[i]);
 
@@ -887,7 +1003,11 @@ int rswap_disconnect_and_collect_resource(
 		}
 		rdma_queue->freed++;
 
-		if (rdma_queue->state != CM_DISCONNECT) {
+		if (IS_ERR_OR_NULL(rdma_queue->cm_id))
+			continue;
+
+		if (rdma_queue->state >= CONNECTED &&
+		    rdma_queue->state != CM_DISCONNECT) {
 			ret = rdma_disconnect(rdma_queue->cm_id);
 			if (ret) {
 				pr_err("%s, RDMA disconnect failed. \n",
@@ -900,6 +1020,11 @@ int rswap_disconnect_and_collect_resource(
 			__func__, i);
 	}
 	for (i = 0; i < num_queues; i++) {
+		rdma_queue = &(rdma_session->rdma_queues[i]);
+		if (IS_ERR_OR_NULL(rdma_queue->cm_id) ||
+		    rdma_queue->state < CONNECTED ||
+		    rdma_queue->state == CM_DISCONNECT)
+			continue;
 		wait_event_interruptible(rdma_queue->sem,
 					 rdma_queue->state == CM_DISCONNECT);
 	}

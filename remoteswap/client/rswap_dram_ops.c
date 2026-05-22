@@ -55,11 +55,25 @@ static int rswap_hermit_peek_load(int cpu)
 	return 1;
 }
 
+static int rswap_hermit_poll_store(int cpu)
+{
+	(void)cpu;
+	return 0;
+}
+
+static int rswap_hermit_peek_store(int cpu)
+{
+	(void)cpu;
+	return 0;
+}
+
 static const struct hermit_backend_ops rswap_hermit_ops = {
 	.load = rswap_hermit_load,
 	.store = rswap_hermit_store,
 	.poll_load = rswap_hermit_poll_load,
 	.peek_load = rswap_hermit_peek_load,
+	.poll_store = rswap_hermit_poll_store,
+	.peek_store = rswap_hermit_peek_store,
 };
 
 int rswap_register_backend(void)

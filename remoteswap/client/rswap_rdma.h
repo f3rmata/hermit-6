@@ -7,18 +7,17 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/init.h>
+#include <linux/completion.h>
 
 // Swap
 #include <linux/swapfile.h>
 #include <linux/swap.h>
-#include <linux/frontswap.h>
 
 // For infiniband
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
 #include <linux/pci.h> // Use the dma_addr_t defined in types.h as the DMA/BUS address.
 #include <linux/inet.h>
-#include <linux/lightnvm.h>
 #include <linux/sed-opal.h>
 
 // Utilities
@@ -105,6 +104,12 @@ struct fs_rdma_req {
 	struct ib_rdma_wr rdma_wr;
 
 	struct rswap_rdma_queue *rdma_queue;
+	struct completion done;
+	pgoff_t offset;
+	enum rdma_queue_type type;
+	int status;
+	bool sync;
+	bool dma_mapped;
 };
 
 struct two_sided_rdma_send {
@@ -220,7 +225,10 @@ int send_message_to_remote(struct rdma_session_context *rdma_session,
 			   int rdma_queue_ind, int messge_type, int chunk_num);
 
 int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
-		    enum rdma_queue_type type);
+		    enum rdma_queue_type type, bool sync,
+		    struct fs_rdma_req **sync_req);
+int rswap_rdma_wait_req(struct rswap_rdma_queue *rdma_queue,
+			struct fs_rdma_req *rdma_req);
 
 void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue);
 void drain_all_rdma_queues(int target_mem_server);
