@@ -35,7 +35,7 @@ sudo reboot
 On the host machine,
 ```bash
 cd remoteswap/client
-make
+make BACKEND=RDMA KDIR=$PWD/../../linux-stable
 ```
 
 There should be a kernel module called `rswap-client.ko` under the client/ directory, which indicates a build success.
@@ -55,11 +55,28 @@ Similar to Fastswap, remoteswap supports debugging using local memory as a fake 
 
 ```bash
 # (under the remoteswap/client dir)
-make BACKEND=DRAM
+make BACKEND=DRAM KDIR=$PWD/../../linux-stable
 ```
 
 When built with `BACKEND=DRAM`, the client does not require Mellanox OFED
 headers or symbols, which makes it suitable for local QEMU bring-up.
+
+### RDMA client backend
+
+Linux 6.6 Hermit no longer uses the removed `frontswap_ops` interface.
+The RDMA client registers a `hermit_backend_ops` backend instead:
+
+```bash
+# (under the remoteswap/client dir)
+make BACKEND=RDMA KDIR=$PWD/../../linux-stable
+```
+
+By default the module uses the RDMA headers from the 6.6 kernel tree. If you
+need Mellanox OFED headers/symbols, pass `USE_OFA=1` or set `OFA_DIR`:
+
+```bash
+make BACKEND=RDMA USE_OFA=1 OFA_DIR=/usr/src/ofa_kernel/default KDIR=$PWD/../../linux-stable
+```
 
 ## Usage
 
@@ -109,12 +126,22 @@ You can optionally check system log via `dmesg`. A success should look like (1 c
 ```
 rswap_request_for_chunk, Got 12 chunks from memory server.
 rdma_session_connect,Exit the main() function with built RDMA conenction rdma_session_context:0xffffffffc08f7460.
-frontswap module loaded
+rswap_rdma: Hermit backend registered
+```
+
+RDMA backend counters are exposed through debugfs:
+
+```bash
+sudo cat /sys/kernel/debug/rswap_rdma/stores
+sudo cat /sys/kernel/debug/rswap_rdma/loads
+sudo cat /sys/kernel/debug/rswap_rdma/load_misses
+sudo cat /sys/kernel/debug/rswap_rdma/wc_errors
 ```
 
 4. To uninstall the kernel module, one can run the following command on the host server
 ```bash
 cd remoteswap/client
+sudo swapoff -a
 sudo ./manage_rswap_client.sh uninstall
 ```
 
