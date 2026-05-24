@@ -3,30 +3,29 @@
 
 * 简介
 
-=hermit-6.6= 是 Hermit 从 Linux 5.14 迁移到 Linux 6.6 的工作目录。
+=hermit-6= 是 Hermit 从 Linux 5.14 迁移到 Linux 6.6 的工作目录。
 
 当前内核位于 =linux-stable=，基线是 Linux =v6.6.138=，Hermit 修改在该内核
-子仓库的 =hermit= 分支上。当前可运行目标是 DRAM 模式：swapout 写入本地 DRAM
-mock backend，swapin 再从同一个 backend 读回，用 QEMU 验证数据正确性和
-profiling 输出。
+子仓库的 =hermit= 分支上。当前可运行目标包括 DRAM 模式和 RDMA 模式：
+DRAM backend 用 QEMU 验证数据正确性和 profiling 输出；RDMA backend 已迁移到
+=hermit_backend_ops=，用于实验室机器上的远端内存测试。
 
 当前重点：
 
 - 用 =hermit_backend_ops= 替代 5.14 依赖的 frontswap。
 - 跑通 DRAM backend 的 swapout/store 和 swapin/load。
 - 恢复 5.14 Hermit profiling 的主要观测点。
+- 恢复 vaddr/vpage directed reclaim 的安全子集。
+- 将 RDMA backend 从 frontswap 迁移到 =hermit_backend_ops=。
 - 提供 QEMU DRAM 自动验证脚本。
-
-当前不包含完整 RDMA backend 迁移。RDMA 相关代码仍保留在 =remoteswap= 中，但
-6.6 下第一轮验证请使用 ~BACKEND=DRAM~。
 
 * 目录结构
 
 #+begin_src text
-hermit-6.6/
+hermit-6/
   linux-stable/              Linux 6.6.138 + Hermit kernel patch
   remoteswap/                rswap client/server 代码
-  remoteswap/client/         DRAM backend module: rswap-client.ko
+  remoteswap/client/         DRAM/RDMA backend module: rswap-client.ko
   tools/qemu-dram/           QEMU DRAM 构建和验证工具
   tools/qemu-dram/src/       memhog 与 hermit_swap_stats helper
   docs/plan/                 分阶段迁移记录
@@ -48,6 +47,7 @@ hermit-6.6/
 - =do_swap_page()= 支持 =bypass_swapcache= direct swapin。
 - =swap_readpage()= 和 =swap_writepage()= 支持 Hermit backend load/store。
 - =remoteswap/client= 的 DRAM backend 已注册到 =hermit_backend_ops=。
+- =remoteswap/client= 的 RDMA backend 已注册到 =hermit_backend_ops=。
 - DRAM backend 提供 debugfs counter：
 
   #+begin_src text
@@ -57,16 +57,29 @@ hermit-6.6/
   /sys/kernel/debug/rswap_dram/errors
   #+end_src
 
+- RDMA backend 提供 debugfs counter：
+
+  #+begin_src text
+  /sys/kernel/debug/rswap_rdma/stores
+  /sys/kernel/debug/rswap_rdma/loads
+  /sys/kernel/debug/rswap_rdma/load_misses
+  /sys/kernel/debug/rswap_rdma/post_errors
+  /sys/kernel/debug/rswap_rdma/wc_errors
+  /sys/kernel/debug/rswap_rdma/poll_loads
+  /sys/kernel/debug/rswap_rdma/poll_stores
+  #+end_src
+
+- =vaddr_swapout= 已恢复 order-0、匿名、单映射页的安全子集。
 - QEMU 验证会检查 checksum、=pswpin=、=pswpout=、backend store/load 计数和
   Hermit profiling dmesg。
 
 未完成或限制：
 
-- RDMA backend 尚未迁移到 =hermit_backend_ops=。
-- =ADC_POLL_STORE= 在 DRAM 同步 store 模式下预期为 0。
+- =ADC_POLL_STORE= 在 DRAM 同步 store 模式下预期为 0；RDMA store 会 post 后
+  立即 poll/drain，尚未恢复 5.14 的跨页 batch async store。
 - 大 folio、THP、复杂 MGLRU 路径优先保留 Linux 6.6 原生行为。
-- 第一轮不建议在仍有 active swap entry 时 =rmmod rswap-client.ko=；测试中直接
-  QEMU poweroff。
+- 不建议在仍有 active swap entry 时 =rmmod rswap-client.ko=；测试中应先
+  =swapoff=，QEMU 验证中可直接 poweroff。
 
 * 依赖
 
@@ -96,7 +109,7 @@ QEMU_ACCEL=tcg QEMU_CPU=max
 
 #+begin_src bash
 git clone https://github.com/f3rmata/hermit-6.git
-cd hermit-6.6
+cd hermit-6
 git submodule update --init --depth=10 -- linux-stable
 #+end_src
 
@@ -229,7 +242,7 @@ Hermit 控制项位于：
 | =batch_swapout= | 启用 batch swapout 相关逻辑 |
 | =batch_tlb= | batch TLB 相关开关 |
 | =batch_io= | batch I/O 相关开关 |
-| =vaddr_swapout= | 5.14 vaddr/vpage reclaim 开关，目前 6.6 未完整恢复 |
+| =vaddr_swapout= | 5.14 vaddr/vpage reclaim 开关；6.6 已恢复安全子集 |
 | =speculative_io= | speculative I/O 开关 |
 | =speculative_lock= | speculative lock 开关 |
 | =lazy_poll= | direct swapin 后延迟 poll |
@@ -248,6 +261,18 @@ cat /sys/kernel/debug/rswap_dram/stores
 cat /sys/kernel/debug/rswap_dram/loads
 cat /sys/kernel/debug/rswap_dram/load_misses
 cat /sys/kernel/debug/rswap_dram/errors
+#+end_src
+
+RDMA backend：
+
+#+begin_src bash
+cat /sys/kernel/debug/rswap_rdma/stores
+cat /sys/kernel/debug/rswap_rdma/loads
+cat /sys/kernel/debug/rswap_rdma/load_misses
+cat /sys/kernel/debug/rswap_rdma/post_errors
+cat /sys/kernel/debug/rswap_rdma/wc_errors
+cat /sys/kernel/debug/rswap_rdma/poll_loads
+cat /sys/kernel/debug/rswap_rdma/poll_stores
 #+end_src
 
 Linux swap 统计：
@@ -287,8 +312,11 @@ SWAP_VMSTAT: ...
 
 正常可能为 0 的字段：
 
-- =ADC_POLL_STORE=：DRAM backend 是同步 store。
-- =ADC_HERMIT_RMAP1_LAT= / =ADC_HERMIT_RMAP2_LAT=：vaddr/vpage reclaim 尚未完整恢复。
+- =ADC_POLL_STORE=：DRAM backend 是同步 store；RDMA backend 触发 store 后
+  立即 poll/drain 时应非 0。
+- =ADC_HERMIT_RMAP1_LAT= / =ADC_HERMIT_RMAP2_LAT=：仅在 =vaddr_swapout= 开启、
+  当前 reclaim 命中 order-0 匿名单映射页时非 0；kswapd、THP、KSM、hugetlb、
+  large folio、多映射页会回退 native rmap。
 - =ADC_PAGE_RECLAIM=：没有触发 memcg reclaim 时可能为 0。
 - =ADC_PREFETCH= / =ADC_RD_CACHE_ASYNC=：关闭 readahead 或走 direct bypass
   swapcache 时可能为 0。
@@ -324,7 +352,7 @@ do_swap_page()
   -> native swap read fallback
 #+end_src
 
-Hermit DRAM swapout：
+Hermit backend swapout：
 
 #+begin_src text
 shrink_folio_list()
@@ -332,7 +360,8 @@ shrink_folio_list()
   -> swap_writepage()
   -> zswap_store()
   -> hermit_backend_store()
-  -> native swap write fallback
+  -> hermit_backend_poll_store()
+  -> native swap write-through
 #+end_src
 
 * 文档索引
@@ -344,20 +373,21 @@ docs/plan/stage2-adaptation-6.15.md        接入swap路径
 docs/plan/stage3-adaptation-6.6.md         do_swap_page / 6.6 迁移分析
 docs/plan/stage4-adaptation-6.6-dram.md    DRAM backend 迁移和 QEMU 验证
 docs/plan/stage5-adaptation-6.6-profiling.md 5.14 profiling 点迁移
+docs/plan/stage6-adaptation-6.6-vaddr-vpage.md vaddr/vpage reclaim 安全子集
+docs/plan/stage7-adaptation-6.6-rdma.md    RDMA backend 迁移
 #+end_src
 
 * TODO 后续计划
 
-- 把 RDMA backend 从 frontswap 迁移到 =hermit_backend_ops=。
-- 恢复 5.14 Hermit vaddr/vpage directed reclaim。
-- 增加 backend invalidate / slot lifecycle 管理。
+- 为 backend 增加 invalidate / slot lifecycle 管理。
+- 为 backend bitmap 增加 per-swap-device 隔离。
+- 恢复 5.14 的跨页 async batch store / pageout 完成链路。
+- 恢复 direct bypass swapcache 路径中的 Hermit 自定义 readahead/prefetch。
+- 优化 Hermit async reclaim worker，避免长时间占用单个 CPU。
 - 进一步校准 MGLRU、THP 和 large folio 下的 profiling 语义。
-- 更新 =remoteswap/README.md= 中旧 RDMA/frontswap 操作说明。
+- 持续更新 =remoteswap/README.md= 中实验室 RDMA 配置和排错说明。
 
-** [/] 5.14 → 6.6 移植遗留问题
-
-以下问题不影响单次 DRAM swapout→swapin→校验测试，但在多轮测试或多 swap 设备场景
-下可能导致错误。
+** [/] 5.14 → 6.6 移植遗留TODO
 
 *** [ ] 缺少 invalidate_page / invalidate_area 回调
 
@@ -367,30 +397,36 @@ docs/plan/stage5-adaptation-6.6-profiling.md 5.14 profiling 点迁移
 
 当前影响：
 - DRAM backend 的 =local_dram_valid= bitmap 在 swap slot 被释放后不会清除。
+- RDMA backend 的 =rswap_rdma_valid= bitmap 在 swap slot 被释放后也不会清除。
 - swapoff→swapon 循环中，旧 swap entry 的 bitmap bit 仍然为 1，新 swapout 可能
   分配到同一 offset，读取时命中的是上一轮的旧数据。
+- 当前 swapout 保持写穿，native swap 设备上有副本；但 backend load 优先于
+  native read，若 valid bit 过期且 backend 内容未被新 store 覆盖，仍可能返回旧页。
 
 *** [ ] 缺少 per-swap-device bitmap 隔离
 
 5.14 的 =frontswap_map= 是 per-swap-device 的 bitmap，每个 swap 设备独立追踪。
-6.6 DRAM backend 使用单一的全局 =local_dram_valid= bitmap，offset 仅由
+6.6 DRAM/RDMA backend 使用单一的全局 valid bitmap，offset 仅由
 =swp_offset(entry)= 计算，不区分 =swp_type=。
 
 当前影响：
-- 同时挂载多个 swap 设备时，type=0 offset=100 和 type=1 offset=100 映射到 DRAM
-  中同一位置，互相覆盖。
+- 同时挂载多个 swap 设备时，type=0 offset=100 和 type=1 offset=100 映射到
+  backend 中同一位置，互相覆盖。
 
-*** [ ] 异步 store / batch swapout 路径未迁移
+*** [ ] 跨页异步 store / batch swapout 路径未恢复
 
 5.14 的 =vmscan.c= 使用 =frontswap_store_on_core= + =frontswap_poll_store= 实现
 异步批量 swapout，=under_write_pages= 链表追踪进行中的写操作。6.6 的
-=hermit_swap_writepage= 仅调用 =hermit_backend_store(..., async=false)= 做同步写，
-=hermit_post_pageout_rls_pages= 和 =ADC_POLL_STORE= 的 batch 完成路径未迁移到
-6.6 =vmscan.c=。
+=hermit_swap_writepage= 会调用 =hermit_backend_store(..., async=false)=，随后立即
+=hermit_backend_poll_store(cpu)=，再继续 native swap write-through。RDMA backend
+内部会 post =QP_STORE=，但 page_io 层马上 drain，不会像 5.14 一样跨多个页面批量
+提交和延迟收割。
 
 当前影响：
 - DRAM backend 是同步 store，功能不受影响。
-- RDMA backend 迁移后将无法使用异步批量提交，写性能会退化。
+- RDMA backend 功能已恢复，但写路径保守，性能低于 5.14 的 batch async store。
+- =ADC_POLL_STORE= 在 RDMA 下可以非 0，但它表示立即 drain，不等价于 5.14 的
+  batch 完成路径。
 
 *** [ ] hermit_backend_peek_load 定义了但预取路径未调用
 
@@ -401,7 +437,7 @@ docs/plan/stage5-adaptation-6.6-profiling.md 5.14 profiling 点迁移
 当前影响：
 - DRAM backend 的 =peek_load= 始终返回 1（未完成），预取检查逻辑本身不依赖它，
   暂无实际影响。
-- RDMA backend 迁移后预取可能继续发送无用请求。
+- RDMA backend 下预取可能继续发送无用请求。
 
 *** [ ] Hermit 自定义 readahead 函数未迁移
 
@@ -411,18 +447,34 @@ docs/plan/stage5-adaptation-6.6-profiling.md 5.14 profiling 点迁移
 =swapin_readahead= / =swap_cluster_readahead=，这些函数不直接与 backend 交互。
 
 当前影响：
-- DRAM backend 下 readahead 走 =swap_readpage= → =hermit_swap_readpage= →
-  =rswap_dram_read= 路径，功能正常。
+- DRAM/RDMA backend 下 readahead 走 =swap_readpage= →
+  =hermit_swap_readpage= → =hermit_backend_load= 路径，功能正常。
 - 但 bypass swapcache direct swapin 路径（=hermit_direct_swap_readpage=）中
   没有预取逻辑，5.14 的 =hermit_swapin_bypass_swapcache= 中自带的
   =hermit_vma_prefetch= 在 6.6 中缺失。
 
-*** [ ] async 参数始终为 false
+*** [x] direct swapin async 已恢复，但 native read/store 仍是保守同步语义
 
-内核侧所有调用点传给 =hermit_backend_load= 和 =hermit_backend_store= 的 =async=
-参数均为 =false=。5.14 的 =load_async= / =store_on_core= 异步路径未接入。接口中
-的 =async= 参数目前是死代码。
+direct bypass swapcache 路径中的 =hermit_issue_read()= 已调用
+=hermit_backend_load(..., async=true)=，RDMA backend 会 post READ，后续由
+=hermit_poll_read()= / =lazy_poll= 收口。native =swap_readpage()= fallback 仍用
+=async=false=，store 路径也保持 post 后立即 poll 的写穿语义。
 
 当前影响：
-- DRAM backend 忽略 =async= 参数，无实际影响。
-- RDMA backend 迁移后需要将对应路径改为 =async=true= 才能使用异步读写。
+- direct swapin 的异步读功能已恢复。
+- native swapcache read path 为同步 backend load。
+- store 还没有恢复 5.14 的跨页 batch async。
+
+*** [ ] Hermit high reclaim worker 可能长时间占用 CPU
+
+当前 =hermit_high_work_func= 通过 =schedule_work_on()= 周期性重排到固定 CPU。
+在强 memcg 压力下，内核可能打印：
+
+#+begin_src text
+workqueue: hermit_high_work_func hogged CPU for >10000us, consider switching to WQ_UNBOUND
+#+end_src
+
+当前影响：
+- 功能上不一定出错，但说明单次 reclaim work 太重或固定 CPU 被长时间占用。
+- 后续可考虑改为专用 =alloc_workqueue(..., WQ_UNBOUND | WQ_MEM_RECLAIM, ...)=，
+  或限制每次 work 的 reclaim 批量。
