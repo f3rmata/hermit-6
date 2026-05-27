@@ -46,6 +46,12 @@ hermit-6/
 
 - =do_swap_page()= 支持 =bypass_swapcache= direct swapin。
 - =swap_readpage()= 和 =swap_writepage()= 支持 Hermit backend load/store。
+- =hermit_backend_ops= 支持 =invalidate_page= / =invalidate_area=，swap slot
+  释放和 =swapoff= 会清理 backend entry。
+- DRAM/RDMA backend 使用完整 =swp_entry_t= 到 backend slot 的 XArray 映射，
+  避免多个 swap 设备相同 offset 互相覆盖。
+- direct bypass swapcache 路径恢复了保守的 VMA readahead/prefetch；prefetch
+  页进入 swapcache，按需页仍绕过 swapcache。
 - =remoteswap/client= 的 DRAM backend 已注册到 =hermit_backend_ops=。
 - =remoteswap/client= 的 RDMA backend 已注册到 =hermit_backend_ops=。
 - DRAM backend 提供 debugfs counter：
@@ -70,6 +76,8 @@ hermit-6/
   #+end_src
 
 - =vaddr_swapout= 已恢复 order-0、匿名、单映射页的安全子集。
+- Hermit high reclaim worker 使用 =WQ_UNBOUND | WQ_MEM_RECLAIM= 专用
+  workqueue，不再固定重排到单个 CPU。
 - QEMU 验证会检查 checksum、=pswpin=、=pswpout=、backend store/load 计数和
   Hermit profiling dmesg。
 
@@ -216,6 +224,17 @@ CONFIG_BLK_DEV_RAM=m 或 y
 make -C linux-stable olddefconfig
 make -C linux-stable -j$(nproc) bzImage modules_prepare drivers/block/brd.ko
 make -C remoteswap/client BACKEND=DRAM KDIR=$PWD/linux-stable KBUILD_MODPOST_WARN=1
+#+end_src
+
+RDMA backend 需要当前 Hermit 内核启用并构建 RDMA core 符号，例如
+=CONFIG_INFINIBAND=、=CONFIG_RDMA_CM=、=CONFIG_IW_CM= 或对应 mlx5/irdma 驱动；
+否则本地编译会在 =MODPOST= 阶段报告 =rdma_resolve_addr=、
+=ib_process_cq_direct= 等符号未定义。实验室机器可使用内核树自带 RDMA 或 OFED：
+
+#+begin_src bash
+make -C remoteswap/client BACKEND=RDMA KDIR=$PWD/linux-stable
+make -C remoteswap/client BACKEND=RDMA USE_OFA=1 \
+  OFA_DIR=/usr/src/ofa_kernel/default KDIR=$PWD/linux-stable
 #+end_src
 
 只做局部对象编译：
@@ -379,39 +398,35 @@ docs/plan/stage7-adaptation-6.6-rdma.md    RDMA backend 迁移
 
 * TODO 后续计划
 
-- 为 backend 增加 invalidate / slot lifecycle 管理。
-- 为 backend bitmap 增加 per-swap-device 隔离。
+- [x] 为 backend 增加 invalidate / slot lifecycle 管理。
+- [x] 为 backend bitmap 增加 per-swap-device 隔离。
 - 恢复 5.14 的跨页 async batch store / pageout 完成链路。
-- 恢复 direct bypass swapcache 路径中的 Hermit 自定义 readahead/prefetch。
-- 优化 Hermit async reclaim worker，避免长时间占用单个 CPU。
+- [x] 恢复 direct bypass swapcache 路径中的 Hermit 自定义 readahead/prefetch
+  的安全子集。
+- [x] 优化 Hermit async reclaim worker，避免长时间占用单个 CPU。
 - 进一步校准 MGLRU、THP 和 large folio 下的 profiling 语义。
 - 持续更新 =remoteswap/README.md= 中实验室 RDMA 配置和排错说明。
 
-** [/] 5.14 → 6.6 移植遗留TODO
+** [6/7] 5.14 → 6.6 移植遗留TODO
 
-*** [ ] 缺少 invalidate_page / invalidate_area 回调
+*** [x] 缺少 invalidate_page / invalidate_area 回调
 
-=hermit_backend_ops= 没有 swap entry 失效或 swapoff 的通知回调。5.14 的
-=frontswap_ops= 包含 =invalidate_page= 和 =invalidate_area=，当 swap slot 被释放
-或 swap 设备被关闭时自动清除后端中的对应页面。
+已补齐。=hermit_backend_ops= 现在包含 =invalidate_page= 和
+=invalidate_area=，并在 =swap_range_free()= 与 =swapoff= 路径调用：
 
-当前影响：
-- DRAM backend 的 =local_dram_valid= bitmap 在 swap slot 被释放后不会清除。
-- RDMA backend 的 =rswap_rdma_valid= bitmap 在 swap slot 被释放后也不会清除。
-- swapoff→swapon 循环中，旧 swap entry 的 bitmap bit 仍然为 1，新 swapout 可能
-  分配到同一 offset，读取时命中的是上一轮的旧数据。
-- 当前 swapout 保持写穿，native swap 设备上有副本；但 backend load 优先于
-  native read，若 valid bit 过期且 backend 内容未被新 store 覆盖，仍可能返回旧页。
+- =swap_range_free()=：释放单个或一段 swap slot 时清理对应 backend entry。
+- =swapoff=：关闭 swap 设备时清理对应 =swp_type= 的全部 backend entry。
+- DRAM/RDMA backend 会同时清理 XArray 映射、used bitmap 和 valid bitmap。
 
-*** [ ] 缺少 per-swap-device bitmap 隔离
+*** [x] 缺少 per-swap-device bitmap 隔离
 
-5.14 的 =frontswap_map= 是 per-swap-device 的 bitmap，每个 swap 设备独立追踪。
-6.6 DRAM/RDMA backend 使用单一的全局 valid bitmap，offset 仅由
-=swp_offset(entry)= 计算，不区分 =swp_type=。
+已补齐。DRAM/RDMA backend 不再直接用 =swp_offset(entry)= 作为远端 slot。
+当前实现使用完整 =entry.val= 作为 XArray key，按需分配 backend slot：
 
-当前影响：
-- 同时挂载多个 swap 设备时，type=0 offset=100 和 type=1 offset=100 映射到
-  backend 中同一位置，互相覆盖。
+- store：为完整 =swp_entry_t= 保留或复用一个 backend slot，写成功后置 valid。
+- load：先查完整 entry 映射，再检查 valid；miss 返回 =-ENOENT=，回退 native
+  swap read。
+- invalidate：释放 entry 时归还 slot，避免 swapoff/swapon 后读到旧数据。
 
 *** [ ] 跨页异步 store / batch swapout 路径未恢复
 
@@ -428,30 +443,24 @@ docs/plan/stage7-adaptation-6.6-rdma.md    RDMA backend 迁移
 - =ADC_POLL_STORE= 在 RDMA 下可以非 0，但它表示立即 drain，不等价于 5.14 的
   batch 完成路径。
 
-*** [ ] hermit_backend_peek_load 定义了但预取路径未调用
+*** [x] hermit_backend_peek_load 定义了但预取路径未调用
 
-5.14 的 =swap_state.c= 预取循环中使用 =frontswap_peek_load(cpu)= 检测按需读是否
-已完成，若完成则提前退出预取循环。6.6 中 =hermit_backend_peek_load= 已在
-=hermit_backend.c= 实现并导出，但 =swap_state.c= 的预取路径未调用。
+已接入 direct bypass swapcache 的保守 VMA prefetch。预取循环在每次提交
+prefetch 前调用 =hermit_backend_peek_load(cpu)=：
 
-当前影响：
-- DRAM backend 的 =peek_load= 始终返回 1（未完成），预取检查逻辑本身不依赖它，
-  暂无实际影响。
-- RDMA backend 下预取可能继续发送无用请求。
+- DRAM backend 的 =peek_load= 仍返回 1，表示不提前截断预取。
+- RDMA backend 的 =peek_load= 查询 load queue pending counter；按需读完成后，
+  prefetch 循环提前停止，避免继续发送无用请求。
 
-*** [ ] Hermit 自定义 readahead 函数未迁移
+*** [x] Hermit 自定义 readahead 函数未迁移
 
-5.14 提供了四个后端感知的 readahead/prefetch 函数：
-=hermit_swapin_readahead=、=hermit_swap_cluster_readahead=、
-=hermit_vma_prefetch=、=hermit_swap_ra_info=。6.6 使用标准内核的
-=swapin_readahead= / =swap_cluster_readahead=，这些函数不直接与 backend 交互。
+已恢复 direct bypass swapcache 场景下最关键的安全子集：
 
-当前影响：
-- DRAM/RDMA backend 下 readahead 走 =swap_readpage= →
-  =hermit_swap_readpage= → =hermit_backend_load= 路径，功能正常。
-- 但 bypass swapcache direct swapin 路径（=hermit_direct_swap_readpage=）中
-  没有预取逻辑，5.14 的 =hermit_swapin_bypass_swapcache= 中自带的
-  =hermit_vma_prefetch= 在 6.6 中缺失。
+- 按需页仍由 =hermit_issue_read(..., async=true)= 直接读入非 swapcache folio。
+- 邻近页通过 =__read_swap_cache_async()= 加入 swapcache，再走
+  =swap_readpage()= → =hermit_swap_readpage()= → backend load。
+- 该实现保留 6.6 原生 swapcache 生命周期，不复用 5.14 的旧 frontswap async
+  page lock 语义。
 
 *** [x] direct swapin async 已恢复，但 native read/store 仍是保守同步语义
 
@@ -465,16 +474,15 @@ direct bypass swapcache 路径中的 =hermit_issue_read()= 已调用
 - native swapcache read path 为同步 backend load。
 - store 还没有恢复 5.14 的跨页 batch async。
 
-*** [ ] Hermit high reclaim worker 可能长时间占用 CPU
+*** [x] Hermit high reclaim worker 可能长时间占用 CPU
 
-当前 =hermit_high_work_func= 通过 =schedule_work_on()= 周期性重排到固定 CPU。
-在强 memcg 压力下，内核可能打印：
+已改为专用 unbound workqueue：
 
 #+begin_src text
-workqueue: hermit_high_work_func hogged CPU for >10000us, consider switching to WQ_UNBOUND
+alloc_workqueue("hermit_high_reclaim",
+                WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_CPU_INTENSIVE, 0)
 #+end_src
 
-当前影响：
-- 功能上不一定出错，但说明单次 reclaim work 太重或固定 CPU 被长时间占用。
-- 后续可考虑改为专用 =alloc_workqueue(..., WQ_UNBOUND | WQ_MEM_RECLAIM, ...)=，
-  或限制每次 work 的 reclaim 批量。
+同时 =memcg= cleanup 会 =cancel_work_sync()= 所有 Hermit reclaim work，避免
+pending work 在 memcg 释放后继续访问旧对象。后续仍可进一步限制单次 reclaim
+批量，这是性能调优项，不影响当前正确性。

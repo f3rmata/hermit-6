@@ -2,8 +2,12 @@
 #include <linux/bitops.h>
 #include <linux/debugfs.h>
 #include <linux/err.h>
+#include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
+#include <linux/xarray.h>
 
 #include "rswap_dram.h"
 #include "constants.h"
@@ -11,7 +15,10 @@
 static void *local_dram;
 static uint64_t local_mem_size;
 static unsigned long local_nr_pages;
+static unsigned long *local_dram_used;
 static unsigned long *local_dram_valid;
+static DEFINE_XARRAY(local_dram_slots);
+static DEFINE_MUTEX(local_dram_slots_lock);
 static struct dentry *rswap_dram_debugfs_dir;
 
 static atomic_t rswap_dram_stores;
@@ -65,6 +72,131 @@ static int rswap_dram_check_offset(size_t roffset)
 static unsigned long rswap_dram_offset_to_page(size_t roffset)
 {
 	return roffset >> PAGE_SHIFT;
+}
+
+static int rswap_dram_slot_to_offset(unsigned long slot, size_t *roffset)
+{
+	if (slot >= local_nr_pages)
+		return -EINVAL;
+
+	*roffset = (size_t)slot << PAGE_SHIFT;
+	return 0;
+}
+
+static int rswap_dram_reserve_slot_locked(swp_entry_t entry,
+					  unsigned long *slot)
+{
+	void *item;
+	int ret;
+
+	item = xa_load(&local_dram_slots, entry.val);
+	if (item) {
+		*slot = xa_to_value(item);
+		clear_bit(*slot, local_dram_valid);
+		return 0;
+	}
+
+	*slot = find_first_zero_bit(local_dram_used, local_nr_pages);
+	if (*slot >= local_nr_pages)
+		return -ENOSPC;
+
+	set_bit(*slot, local_dram_used);
+	clear_bit(*slot, local_dram_valid);
+	ret = xa_err(xa_store(&local_dram_slots, entry.val, xa_mk_value(*slot),
+			      GFP_ATOMIC));
+	if (ret) {
+		clear_bit(*slot, local_dram_used);
+		return ret;
+	}
+
+	return 0;
+}
+
+int rswap_dram_prepare_store(swp_entry_t entry, size_t *roffset)
+{
+	unsigned long slot;
+	int ret;
+
+	if (!local_dram || !local_dram_used || !local_dram_valid)
+		return -ENODEV;
+
+	mutex_lock(&local_dram_slots_lock);
+	ret = rswap_dram_reserve_slot_locked(entry, &slot);
+	mutex_unlock(&local_dram_slots_lock);
+	if (ret)
+		return ret;
+
+	return rswap_dram_slot_to_offset(slot, roffset);
+}
+
+int rswap_dram_prepare_load(swp_entry_t entry, size_t *roffset)
+{
+	unsigned long slot;
+	void *item;
+	int ret = 0;
+
+	if (!local_dram || !local_dram_used || !local_dram_valid)
+		return -ENODEV;
+
+	mutex_lock(&local_dram_slots_lock);
+	item = xa_load(&local_dram_slots, entry.val);
+	if (!item) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	slot = xa_to_value(item);
+	if (slot >= local_nr_pages || !test_bit(slot, local_dram_valid)) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	ret = rswap_dram_slot_to_offset(slot, roffset);
+unlock:
+	mutex_unlock(&local_dram_slots_lock);
+	return ret;
+}
+
+void rswap_dram_invalidate_page(swp_entry_t entry)
+{
+	unsigned long slot;
+	void *item;
+
+	mutex_lock(&local_dram_slots_lock);
+	item = xa_erase(&local_dram_slots, entry.val);
+	if (item) {
+		slot = xa_to_value(item);
+		if (slot < local_nr_pages) {
+			clear_bit(slot, local_dram_used);
+			clear_bit(slot, local_dram_valid);
+		}
+	}
+	mutex_unlock(&local_dram_slots_lock);
+}
+
+void rswap_dram_invalidate_area(unsigned int type)
+{
+	XA_STATE(xas, &local_dram_slots, 0);
+	unsigned long slot;
+	void *item;
+
+	mutex_lock(&local_dram_slots_lock);
+	xas_lock_irq(&xas);
+	xas_for_each(&xas, item, ULONG_MAX) {
+		swp_entry_t entry = { .val = xas.xa_index };
+
+		if (swp_type(entry) != type)
+			continue;
+
+		slot = xa_to_value(item);
+		xas_store(&xas, NULL);
+		if (slot < local_nr_pages) {
+			clear_bit(slot, local_dram_used);
+			clear_bit(slot, local_dram_valid);
+		}
+	}
+	xas_unlock_irq(&xas);
+	mutex_unlock(&local_dram_slots_lock);
 }
 
 int rswap_dram_write(struct page *page, size_t roffset)
@@ -133,11 +265,21 @@ int rswap_init_local_dram(int _mem_size)
 
 	local_mem_size = (uint64_t)_mem_size * ONE_GB;
 	local_nr_pages = local_mem_size >> PAGE_SHIFT;
+	local_dram_used = vzalloc(BITS_TO_LONGS(local_nr_pages) *
+				  sizeof(unsigned long));
+	if (!local_dram_used) {
+		pr_err("failed to allocate local dram used bitmap for 0x%llx bytes\n",
+		       local_mem_size);
+		return -ENOMEM;
+	}
+
 	local_dram_valid = vzalloc(BITS_TO_LONGS(local_nr_pages) *
 				   sizeof(unsigned long));
 	if (!local_dram_valid) {
 		pr_err("failed to allocate local dram valid bitmap for 0x%llx bytes\n",
 		       local_mem_size);
+		vfree(local_dram_used);
+		local_dram_used = NULL;
 		return -ENOMEM;
 	}
 
@@ -146,6 +288,8 @@ int rswap_init_local_dram(int _mem_size)
 		pr_err("failed to allocate local dram 0x%llx bytes for debug\n",
 		       local_mem_size);
 		vfree(local_dram_valid);
+		vfree(local_dram_used);
+		local_dram_used = NULL;
 		local_dram_valid = NULL;
 		local_nr_pages = 0;
 		return -ENOMEM;
@@ -160,11 +304,15 @@ int rswap_init_local_dram(int _mem_size)
 int rswap_remove_local_dram(void)
 {
 	rswap_dram_debugfs_remove();
+	xa_destroy(&local_dram_slots);
 	if (local_dram)
 		vfree(local_dram);
+	if (local_dram_used)
+		vfree(local_dram_used);
 	if (local_dram_valid)
 		vfree(local_dram_valid);
 	local_dram = NULL;
+	local_dram_used = NULL;
 	local_dram_valid = NULL;
 	local_nr_pages = 0;
 	pr_info("Free the allocated local_dram 0x%llx bytes \n",

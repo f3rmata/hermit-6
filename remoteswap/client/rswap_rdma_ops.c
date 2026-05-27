@@ -4,13 +4,18 @@
 #include <linux/debugfs.h>
 #include <linux/errno.h>
 #include <linux/hermit_backend.h>
+#include <linux/mutex.h>
 #include <linux/swapops.h>
 #include <linux/vmalloc.h>
+#include <linux/xarray.h>
 
 #include "rswap_rdma.h"
 
 static unsigned long *rswap_rdma_valid;
+static unsigned long *rswap_rdma_used;
 static unsigned long rswap_rdma_nr_pages;
+static DEFINE_XARRAY(rswap_rdma_slots);
+static DEFINE_MUTEX(rswap_rdma_slots_lock);
 static struct dentry *rswap_rdma_debugfs_dir;
 
 static atomic_t rswap_rdma_stores;
@@ -73,7 +78,13 @@ static int rswap_rdma_valid_init(int mem_size)
 	rswap_rdma_nr_pages = remote_bytes >> PAGE_SHIFT;
 	rswap_rdma_valid = vzalloc(BITS_TO_LONGS(rswap_rdma_nr_pages) *
 				   sizeof(unsigned long));
-	if (!rswap_rdma_valid) {
+	rswap_rdma_used = vzalloc(BITS_TO_LONGS(rswap_rdma_nr_pages) *
+				  sizeof(unsigned long));
+	if (!rswap_rdma_valid || !rswap_rdma_used) {
+		vfree(rswap_rdma_valid);
+		vfree(rswap_rdma_used);
+		rswap_rdma_valid = NULL;
+		rswap_rdma_used = NULL;
 		rswap_rdma_nr_pages = 0;
 		return -ENOMEM;
 	}
@@ -86,8 +97,11 @@ static int rswap_rdma_valid_init(int mem_size)
 static void rswap_rdma_valid_exit(void)
 {
 	rswap_rdma_debugfs_remove();
+	xa_destroy(&rswap_rdma_slots);
 	vfree(rswap_rdma_valid);
+	vfree(rswap_rdma_used);
 	rswap_rdma_valid = NULL;
+	rswap_rdma_used = NULL;
 	rswap_rdma_nr_pages = 0;
 }
 
@@ -101,15 +115,121 @@ static int rswap_rdma_check_offset(pgoff_t offset)
 	return 0;
 }
 
-static bool rswap_rdma_test_valid(pgoff_t offset)
-{
-	return rswap_rdma_valid && test_bit(offset, rswap_rdma_valid);
-}
-
 static void rswap_rdma_set_valid(pgoff_t offset)
 {
 	if (rswap_rdma_valid && offset < rswap_rdma_nr_pages)
 		set_bit(offset, rswap_rdma_valid);
+}
+
+static int rswap_rdma_reserve_slot_locked(swp_entry_t entry, pgoff_t *slot)
+{
+	void *item;
+	int ret;
+
+	item = xa_load(&rswap_rdma_slots, entry.val);
+	if (item) {
+		*slot = xa_to_value(item);
+		clear_bit(*slot, rswap_rdma_valid);
+		return 0;
+	}
+
+	*slot = find_first_zero_bit(rswap_rdma_used, rswap_rdma_nr_pages);
+	if (*slot >= rswap_rdma_nr_pages)
+		return -ENOSPC;
+
+	set_bit(*slot, rswap_rdma_used);
+	clear_bit(*slot, rswap_rdma_valid);
+	ret = xa_err(xa_store(&rswap_rdma_slots, entry.val, xa_mk_value(*slot),
+			      GFP_ATOMIC));
+	if (ret) {
+		clear_bit(*slot, rswap_rdma_used);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int rswap_rdma_prepare_store(swp_entry_t entry, pgoff_t *slot)
+{
+	int ret;
+
+	if (!rswap_rdma_valid || !rswap_rdma_used)
+		return -ENODEV;
+
+	mutex_lock(&rswap_rdma_slots_lock);
+	ret = rswap_rdma_reserve_slot_locked(entry, slot);
+	mutex_unlock(&rswap_rdma_slots_lock);
+	return ret;
+}
+
+static int rswap_rdma_prepare_load(swp_entry_t entry, pgoff_t *slot)
+{
+	void *item;
+	int ret = 0;
+
+	if (!rswap_rdma_valid || !rswap_rdma_used)
+		return -ENODEV;
+
+	mutex_lock(&rswap_rdma_slots_lock);
+	item = xa_load(&rswap_rdma_slots, entry.val);
+	if (!item) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	*slot = xa_to_value(item);
+	if (*slot >= rswap_rdma_nr_pages || !test_bit(*slot, rswap_rdma_valid))
+		ret = -ENOENT;
+unlock:
+	mutex_unlock(&rswap_rdma_slots_lock);
+	return ret;
+}
+
+static void rswap_rdma_release_entry(swp_entry_t entry)
+{
+	unsigned long slot;
+	void *item;
+
+	mutex_lock(&rswap_rdma_slots_lock);
+	item = xa_erase(&rswap_rdma_slots, entry.val);
+	if (item) {
+		slot = xa_to_value(item);
+		if (slot < rswap_rdma_nr_pages) {
+			clear_bit(slot, rswap_rdma_used);
+			clear_bit(slot, rswap_rdma_valid);
+		}
+	}
+	mutex_unlock(&rswap_rdma_slots_lock);
+}
+
+static void rswap_rdma_invalidate_page(swp_entry_t entry)
+{
+	rswap_rdma_release_entry(entry);
+}
+
+static void rswap_rdma_invalidate_area(unsigned int type)
+{
+	XA_STATE(xas, &rswap_rdma_slots, 0);
+	unsigned long slot;
+	void *item;
+
+	mutex_lock(&rswap_rdma_slots_lock);
+	xas_lock_irq(&xas);
+	xas_for_each(&xas, item, ULONG_MAX) {
+		swp_entry_t entry = { .val = xas.xa_index };
+
+		if (swp_type(entry) != type)
+			continue;
+
+		slot = xa_to_value(item);
+		xas_store(&xas, NULL);
+		if (slot < rswap_rdma_nr_pages) {
+			clear_bit(slot, rswap_rdma_used);
+			clear_bit(slot, rswap_rdma_valid);
+		}
+	}
+	xas_unlock_irq(&xas);
+	mutex_unlock(&rswap_rdma_slots_lock);
 }
 
 /**
@@ -471,16 +591,21 @@ static int rswap_rdma_peek_store(int cpu)
 static int rswap_hermit_store(swp_entry_t entry, struct page *page, int cpu,
 			      bool async)
 {
+	pgoff_t slot;
 	int ret;
 
 	(void)async;
 	if (unlikely(!online_cores))
 		return -ENODEV;
 
+	ret = rswap_rdma_prepare_store(entry, &slot);
+	if (unlikely(ret))
+		return ret;
+
 	cpu %= online_cores;
-	ret = rswap_rdma_send(cpu, swp_offset(entry), page, QP_STORE, false,
-			      NULL);
+	ret = rswap_rdma_send(cpu, slot, page, QP_STORE, false, NULL);
 	if (unlikely(ret)) {
+		rswap_rdma_release_entry(entry);
 		pr_err_ratelimited("rswap_rdma: store post failed for entry 0x%lx: %d\n",
 				   entry.val, ret);
 	}
@@ -493,23 +618,21 @@ static int rswap_hermit_load(swp_entry_t entry, struct page *page, int cpu,
 {
 	struct rswap_rdma_queue *rdma_queue;
 	struct fs_rdma_req *rdma_req = NULL;
-	pgoff_t offset = swp_offset(entry);
+	pgoff_t slot;
 	int ret;
 
 	if (unlikely(!online_cores))
 		return -ENODEV;
 
-	ret = rswap_rdma_check_offset(offset);
+	ret = rswap_rdma_prepare_load(entry, &slot);
+	if (ret == -ENOENT)
+		atomic_inc(&rswap_rdma_load_misses);
 	if (ret)
 		return ret;
-	if (!rswap_rdma_test_valid(offset)) {
-		atomic_inc(&rswap_rdma_load_misses);
-		return -ENOENT;
-	}
 
 	cpu %= online_cores;
 	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, QP_LOAD_SYNC);
-	ret = rswap_rdma_send(cpu, offset, page, QP_LOAD_SYNC, !async,
+	ret = rswap_rdma_send(cpu, slot, page, QP_LOAD_SYNC, !async,
 			      async ? NULL : &rdma_req);
 	if (unlikely(ret)) {
 		pr_err_ratelimited("rswap_rdma: load post failed for entry 0x%lx: %d\n",
@@ -528,6 +651,8 @@ static int rswap_hermit_load(swp_entry_t entry, struct page *page, int cpu,
 static const struct hermit_backend_ops rswap_hermit_ops = {
 	.load = rswap_hermit_load,
 	.store = rswap_hermit_store,
+	.invalidate_page = rswap_rdma_invalidate_page,
+	.invalidate_area = rswap_rdma_invalidate_area,
 	.poll_load = rswap_rdma_poll_load,
 	.peek_load = rswap_rdma_peek_load,
 	.poll_store = rswap_rdma_poll_store,

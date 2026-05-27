@@ -14,6 +14,10 @@
 
 int rswap_init_local_dram(int _mem_size);
 int rswap_remove_local_dram(void);
+int rswap_dram_prepare_store(swp_entry_t entry, size_t *roffset);
+int rswap_dram_prepare_load(swp_entry_t entry, size_t *roffset);
+void rswap_dram_invalidate_page(swp_entry_t entry);
+void rswap_dram_invalidate_area(unsigned int type);
 int rswap_dram_read(struct page *page, size_t roffset);
 int rswap_dram_write(struct page *page, size_t roffset);
 

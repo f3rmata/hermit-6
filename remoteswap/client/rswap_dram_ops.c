@@ -6,23 +6,25 @@
 #include "rswap_dram.h"
 #include "rswap_ops.h"
 
-static size_t rswap_entry_offset(swp_entry_t entry)
-{
-	return (size_t)swp_offset(entry) << PAGE_SHIFT;
-}
-
 static int rswap_hermit_store(swp_entry_t entry, struct page *page, int cpu,
 			      bool async)
 {
+	size_t roffset;
 	int ret;
 
 	(void)cpu;
 	(void)async;
 
-	ret = rswap_dram_write(page, rswap_entry_offset(entry));
-	if (unlikely(ret))
+	ret = rswap_dram_prepare_store(entry, &roffset);
+	if (ret)
+		return ret;
+
+	ret = rswap_dram_write(page, roffset);
+	if (unlikely(ret)) {
+		rswap_dram_invalidate_page(entry);
 		pr_err_ratelimited("rswap_dram: store failed for entry 0x%lx: %d\n",
 				   entry.val, ret);
+	}
 
 	return ret;
 }
@@ -30,12 +32,17 @@ static int rswap_hermit_store(swp_entry_t entry, struct page *page, int cpu,
 static int rswap_hermit_load(swp_entry_t entry, struct page *page, int cpu,
 			     bool async)
 {
+	size_t roffset;
 	int ret;
 
 	(void)cpu;
 	(void)async;
 
-	ret = rswap_dram_read(page, rswap_entry_offset(entry));
+	ret = rswap_dram_prepare_load(entry, &roffset);
+	if (ret)
+		return ret;
+
+	ret = rswap_dram_read(page, roffset);
 	if (unlikely(ret && ret != -ENOENT))
 		pr_err_ratelimited("rswap_dram: load failed for entry 0x%lx: %d\n",
 				   entry.val, ret);
@@ -70,6 +77,8 @@ static int rswap_hermit_peek_store(int cpu)
 static const struct hermit_backend_ops rswap_hermit_ops = {
 	.load = rswap_hermit_load,
 	.store = rswap_hermit_store,
+	.invalidate_page = rswap_dram_invalidate_page,
+	.invalidate_area = rswap_dram_invalidate_area,
 	.poll_load = rswap_hermit_poll_load,
 	.peek_load = rswap_hermit_peek_load,
 	.poll_store = rswap_hermit_poll_store,
