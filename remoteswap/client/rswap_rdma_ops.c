@@ -240,7 +240,6 @@ void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
 	int nr_pending = atomic_read(&rdma_queue->rdma_post_counter);
 	int nr_done = 0;
 
-	preempt_disable();
 	while (atomic_read(&rdma_queue->rdma_post_counter) > 0) {
 		int nr_completed;
 		// IB_POLL_BATCH is 16 by default
@@ -250,7 +249,6 @@ void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
 			break;
 		cpu_relax();
 	}
-	preempt_enable();
 }
 
 void write_drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
