@@ -2,9 +2,9 @@
 #include <linux/bitops.h>
 #include <linux/debugfs.h>
 #include <linux/err.h>
-#include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <linux/xarray.h>
@@ -18,7 +18,7 @@ static unsigned long local_nr_pages;
 static unsigned long *local_dram_used;
 static unsigned long *local_dram_valid;
 static DEFINE_XARRAY(local_dram_slots);
-static DEFINE_MUTEX(local_dram_slots_lock);
+static DEFINE_SPINLOCK(local_dram_slots_lock);
 static struct dentry *rswap_dram_debugfs_dir;
 
 static atomic_t rswap_dram_stores;
@@ -114,15 +114,16 @@ static int rswap_dram_reserve_slot_locked(swp_entry_t entry,
 
 int rswap_dram_prepare_store(swp_entry_t entry, size_t *roffset)
 {
+	unsigned long flags;
 	unsigned long slot;
 	int ret;
 
 	if (!local_dram || !local_dram_used || !local_dram_valid)
 		return -ENODEV;
 
-	mutex_lock(&local_dram_slots_lock);
+	spin_lock_irqsave(&local_dram_slots_lock, flags);
 	ret = rswap_dram_reserve_slot_locked(entry, &slot);
-	mutex_unlock(&local_dram_slots_lock);
+	spin_unlock_irqrestore(&local_dram_slots_lock, flags);
 	if (ret)
 		return ret;
 
@@ -131,6 +132,7 @@ int rswap_dram_prepare_store(swp_entry_t entry, size_t *roffset)
 
 int rswap_dram_prepare_load(swp_entry_t entry, size_t *roffset)
 {
+	unsigned long flags;
 	unsigned long slot;
 	void *item;
 	int ret = 0;
@@ -138,7 +140,7 @@ int rswap_dram_prepare_load(swp_entry_t entry, size_t *roffset)
 	if (!local_dram || !local_dram_used || !local_dram_valid)
 		return -ENODEV;
 
-	mutex_lock(&local_dram_slots_lock);
+	spin_lock_irqsave(&local_dram_slots_lock, flags);
 	item = xa_load(&local_dram_slots, entry.val);
 	if (!item) {
 		ret = -ENOENT;
@@ -153,16 +155,17 @@ int rswap_dram_prepare_load(swp_entry_t entry, size_t *roffset)
 
 	ret = rswap_dram_slot_to_offset(slot, roffset);
 unlock:
-	mutex_unlock(&local_dram_slots_lock);
+	spin_unlock_irqrestore(&local_dram_slots_lock, flags);
 	return ret;
 }
 
 void rswap_dram_invalidate_page(swp_entry_t entry)
 {
+	unsigned long flags;
 	unsigned long slot;
 	void *item;
 
-	mutex_lock(&local_dram_slots_lock);
+	spin_lock_irqsave(&local_dram_slots_lock, flags);
 	item = xa_erase(&local_dram_slots, entry.val);
 	if (item) {
 		slot = xa_to_value(item);
@@ -171,32 +174,35 @@ void rswap_dram_invalidate_page(swp_entry_t entry)
 			clear_bit(slot, local_dram_valid);
 		}
 	}
-	mutex_unlock(&local_dram_slots_lock);
+	spin_unlock_irqrestore(&local_dram_slots_lock, flags);
 }
 
 void rswap_dram_invalidate_area(unsigned int type)
 {
-	XA_STATE(xas, &local_dram_slots, 0);
+	unsigned long flags;
+	unsigned long index = 0;
 	unsigned long slot;
 	void *item;
 
-	mutex_lock(&local_dram_slots_lock);
-	xas_lock_irq(&xas);
-	xas_for_each(&xas, item, ULONG_MAX) {
-		swp_entry_t entry = { .val = xas.xa_index };
+	spin_lock_irqsave(&local_dram_slots_lock, flags);
+	while ((item = xa_find(&local_dram_slots, &index, ULONG_MAX,
+			       XA_PRESENT))) {
+		swp_entry_t entry = { .val = index };
 
-		if (swp_type(entry) != type)
+		if (swp_type(entry) != type) {
+			index++;
 			continue;
+		}
 
+		item = xa_erase(&local_dram_slots, index);
 		slot = xa_to_value(item);
-		xas_store(&xas, NULL);
 		if (slot < local_nr_pages) {
 			clear_bit(slot, local_dram_used);
 			clear_bit(slot, local_dram_valid);
 		}
+		index++;
 	}
-	xas_unlock_irq(&xas);
-	mutex_unlock(&local_dram_slots_lock);
+	spin_unlock_irqrestore(&local_dram_slots_lock, flags);
 }
 
 int rswap_dram_write(struct page *page, size_t roffset)

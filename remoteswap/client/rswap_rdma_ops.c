@@ -4,7 +4,7 @@
 #include <linux/debugfs.h>
 #include <linux/errno.h>
 #include <linux/hermit_backend.h>
-#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/swapops.h>
 #include <linux/vmalloc.h>
 #include <linux/xarray.h>
@@ -15,7 +15,7 @@ static unsigned long *rswap_rdma_valid;
 static unsigned long *rswap_rdma_used;
 static unsigned long rswap_rdma_nr_pages;
 static DEFINE_XARRAY(rswap_rdma_slots);
-static DEFINE_MUTEX(rswap_rdma_slots_lock);
+static DEFINE_SPINLOCK(rswap_rdma_slots_lock);
 static struct dentry *rswap_rdma_debugfs_dir;
 
 static atomic_t rswap_rdma_stores;
@@ -151,26 +151,28 @@ static int rswap_rdma_reserve_slot_locked(swp_entry_t entry, pgoff_t *slot)
 
 static int rswap_rdma_prepare_store(swp_entry_t entry, pgoff_t *slot)
 {
+	unsigned long flags;
 	int ret;
 
 	if (!rswap_rdma_valid || !rswap_rdma_used)
 		return -ENODEV;
 
-	mutex_lock(&rswap_rdma_slots_lock);
+	spin_lock_irqsave(&rswap_rdma_slots_lock, flags);
 	ret = rswap_rdma_reserve_slot_locked(entry, slot);
-	mutex_unlock(&rswap_rdma_slots_lock);
+	spin_unlock_irqrestore(&rswap_rdma_slots_lock, flags);
 	return ret;
 }
 
 static int rswap_rdma_prepare_load(swp_entry_t entry, pgoff_t *slot)
 {
+	unsigned long flags;
 	void *item;
 	int ret = 0;
 
 	if (!rswap_rdma_valid || !rswap_rdma_used)
 		return -ENODEV;
 
-	mutex_lock(&rswap_rdma_slots_lock);
+	spin_lock_irqsave(&rswap_rdma_slots_lock, flags);
 	item = xa_load(&rswap_rdma_slots, entry.val);
 	if (!item) {
 		ret = -ENOENT;
@@ -181,16 +183,17 @@ static int rswap_rdma_prepare_load(swp_entry_t entry, pgoff_t *slot)
 	if (*slot >= rswap_rdma_nr_pages || !test_bit(*slot, rswap_rdma_valid))
 		ret = -ENOENT;
 unlock:
-	mutex_unlock(&rswap_rdma_slots_lock);
+	spin_unlock_irqrestore(&rswap_rdma_slots_lock, flags);
 	return ret;
 }
 
 static void rswap_rdma_release_entry(swp_entry_t entry)
 {
+	unsigned long flags;
 	unsigned long slot;
 	void *item;
 
-	mutex_lock(&rswap_rdma_slots_lock);
+	spin_lock_irqsave(&rswap_rdma_slots_lock, flags);
 	item = xa_erase(&rswap_rdma_slots, entry.val);
 	if (item) {
 		slot = xa_to_value(item);
@@ -199,7 +202,7 @@ static void rswap_rdma_release_entry(swp_entry_t entry)
 			clear_bit(slot, rswap_rdma_valid);
 		}
 	}
-	mutex_unlock(&rswap_rdma_slots_lock);
+	spin_unlock_irqrestore(&rswap_rdma_slots_lock, flags);
 }
 
 static void rswap_rdma_invalidate_page(swp_entry_t entry)
@@ -209,27 +212,30 @@ static void rswap_rdma_invalidate_page(swp_entry_t entry)
 
 static void rswap_rdma_invalidate_area(unsigned int type)
 {
-	XA_STATE(xas, &rswap_rdma_slots, 0);
+	unsigned long flags;
+	unsigned long index = 0;
 	unsigned long slot;
 	void *item;
 
-	mutex_lock(&rswap_rdma_slots_lock);
-	xas_lock_irq(&xas);
-	xas_for_each(&xas, item, ULONG_MAX) {
-		swp_entry_t entry = { .val = xas.xa_index };
+	spin_lock_irqsave(&rswap_rdma_slots_lock, flags);
+	while ((item = xa_find(&rswap_rdma_slots, &index, ULONG_MAX,
+			       XA_PRESENT))) {
+		swp_entry_t entry = { .val = index };
 
-		if (swp_type(entry) != type)
+		if (swp_type(entry) != type) {
+			index++;
 			continue;
+		}
 
+		item = xa_erase(&rswap_rdma_slots, index);
 		slot = xa_to_value(item);
-		xas_store(&xas, NULL);
 		if (slot < rswap_rdma_nr_pages) {
 			clear_bit(slot, rswap_rdma_used);
 			clear_bit(slot, rswap_rdma_valid);
 		}
+		index++;
 	}
-	xas_unlock_irq(&xas);
-	mutex_unlock(&rswap_rdma_slots_lock);
+	spin_unlock_irqrestore(&rswap_rdma_slots_lock, flags);
 }
 
 /**
