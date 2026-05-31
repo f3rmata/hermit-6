@@ -37,6 +37,7 @@ MODES=${MODES:-"local cgroup-linux cgroup-hermit"}
 BASE_RUN_ID=${BASE_RUN_ID:-"$(date +%Y%m%d-%H%M%S)-${KERNEL_TAG}"}
 
 for mode in $MODES; do
+  mode=$(normalize_mode "$mode")
   run_id="${BASE_RUN_ID}-${mode}"
   result_dir="$RESULT_ROOT/$run_id"
   rdma_log "=== kernel=$KERNEL_TAG mode=$mode result=$result_dir ==="

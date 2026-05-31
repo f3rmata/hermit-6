@@ -45,7 +45,7 @@ start_memcached() {
     set_cgroup_limit_mb "${LOAD_CGROUP_LIMIT_MB:-max}"
   fi
 
-  bin="../../../memcached/memcached"
+  bin=$(find_memcached_bin)
   log_file="$RESULT_DIR/memcached.log"
 
   if [ -s "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then

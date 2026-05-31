@@ -28,6 +28,14 @@ bool_to_yn() {
   esac
 }
 
+normalize_mode() {
+  case "${1:-local}" in
+    cgroup_linux) printf 'cgroup-linux' ;;
+    cgroup_hermit) printf 'cgroup-hermit' ;;
+    *) printf '%s' "${1:-local}" ;;
+  esac
+}
+
 min_int() {
   if [ "$1" -lt "$2" ]; then
     printf '%s' "$1"
@@ -62,7 +70,7 @@ HERMIT6_ROOT=${HERMIT6_ROOT:-$(cd "$RDMA_DIR/../.." && pwd)}
 WORKSPACE_ROOT=${WORKSPACE_ROOT:-$(cd "$HERMIT6_ROOT/.." && pwd)}
 HERMIT5_ROOT=${HERMIT5_ROOT:-"$WORKSPACE_ROOT/hermit-5.14"}
 
-MODE=${MODE:-local}
+MODE=$(normalize_mode "${MODE:-local}")
 KERNEL_TAG=${KERNEL_TAG:-$(detect_kernel_tag)}
 PORT=${PORT:-11211}
 SERVER_ADDR=${SERVER_ADDR:-127.0.0.1}
@@ -215,6 +223,22 @@ sudo_mkdir() {
   fi
 }
 
+sudo_test() {
+  if [ "$(id -u)" -eq 0 ]; then
+    test "$@"
+  else
+    sudo test "$@"
+  fi
+}
+
+sudo_cat() {
+  if [ "$(id -u)" -eq 0 ]; then
+    cat "$1"
+  else
+    sudo cat "$1"
+  fi
+}
+
 cgroup_version() {
   if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
     printf '2'
@@ -324,7 +348,7 @@ apply_requested_cgroup_limit() {
 }
 
 mount_debugfs_if_needed() {
-  if [ -d /sys/kernel/debug/hermit ]; then
+  if sudo_test -d /sys/kernel/debug/hermit 2>/dev/null; then
     return 0
   fi
   if mountpoint -q /sys/kernel/debug; then
@@ -341,7 +365,7 @@ set_debugfs_file() {
   local file=$1
   local value=$2
 
-  if [ -e "$file" ]; then
+  if sudo_test -e "$file" 2>/dev/null; then
     sudo_write "$value" "$file"
   fi
 }
@@ -354,7 +378,7 @@ configure_hermit_mode() {
   local flag
   mount_debugfs_if_needed
 
-  if [ ! -d /sys/kernel/debug/hermit ]; then
+  if ! sudo_test -d /sys/kernel/debug/hermit 2>/dev/null; then
     rdma_log "Hermit debugfs is absent; skip Hermit mode configuration"
     return 0
   fi
@@ -386,7 +410,8 @@ configure_hermit_mode() {
       set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode 0
       ;;
     cgroup-linux|linux|local)
-      if [ -d /sys/kernel/debug/rswap_rdma ] || [ -d /sys/kernel/debug/rswap_dram ]; then
+      if sudo_test -d /sys/kernel/debug/rswap_rdma 2>/dev/null || \
+         sudo_test -d /sys/kernel/debug/rswap_dram 2>/dev/null; then
         rdma_log "warning: an rswap backend is loaded; $MODE is not a pure Linux baseline unless rswap-client is unloaded"
       fi
       ;;
@@ -437,8 +462,8 @@ read_debug_counter() {
 
   for dir in /sys/kernel/debug/rswap_rdma /sys/kernel/debug/rswap_dram; do
     file="$dir/$key"
-    if [ -r "$file" ]; then
-      cat "$file"
+    if sudo_test -r "$file" 2>/dev/null; then
+      sudo_cat "$file"
       return 0
     fi
   done

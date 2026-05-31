@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/common.sh"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --mode) MODE=$2; shift 2 ;;
+    --mode) MODE=$(normalize_mode "$2"); shift 2 ;;
     --kernel) KERNEL_TAG=$2; shift 2 ;;
     --port) PORT=$2; shift 2 ;;
     --result-dir) RESULT_DIR=$2; PID_FILE="$RESULT_DIR/memcached.pid"; shift 2 ;;
@@ -33,7 +33,7 @@ if [ "${START_MEMCACHED:-1}" = "1" ]; then
     PID_FILE=$PID_FILE "$SCRIPT_DIR/memcached.sh" start
 fi
 
-MUTILATE_BIN="../../../mutilate/mutilate"
+MUTILATE_BIN=$(find_mutilate_bin)
 LOAD_LOG="$RESULT_DIR/load.log"
 
 rdma_log "loading $RECORDS records into memcached at $SERVER_ADDR:$PORT"

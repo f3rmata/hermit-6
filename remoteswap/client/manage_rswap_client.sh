@@ -2,7 +2,7 @@
 
 
 ### Macros ###
-mem_server_ip="10.0.0.2"
+mem_server_ip="192.168.61.53"
 mem_server_port="9400"
 
 if [ -z "${HOME}" ]; then

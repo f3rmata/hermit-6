@@ -10,7 +10,7 @@ ulimit -n 65535
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --mode) MODE=$2; shift 2 ;;
+    --mode) MODE=$(normalize_mode "$2"); shift 2 ;;
     --kernel) KERNEL_TAG=$2; shift 2 ;;
     --port) PORT=$2; shift 2 ;;
     --loads) LOADS=$2; shift 2 ;;
@@ -40,7 +40,7 @@ if [[ "$MODE" == cgroup-* ]]; then
   save_config
 fi
 
-MUTILATE_BIN="../../../mutilate/mutilate"
+MUTILATE_BIN=$(find_mutilate_bin)
 CSV_FILE="$RESULT_DIR/mutilate_load_vs_latency.csv"
 SUMMARY_FILE="$RESULT_DIR/summary.csv"
 
