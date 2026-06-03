@@ -38,6 +38,7 @@ start_memcached() {
   local bin pid log_file
   mkdir -p "$RESULT_DIR"
   detect_core_layout
+  build_bench_prefix
   save_config
 
   if [[ "$MODE" == cgroup-* ]]; then
@@ -55,12 +56,12 @@ start_memcached() {
 
   rdma_log "starting memcached on cores $MEMCACHED_CORES, threads $MEMCACHED_THREADS"
   if [ "$(id -u)" -eq 0 ]; then
-    taskset -c "$MEMCACHED_CORES" "$bin" -u "${MEMCACHED_USER:-root}" \
+    "${BENCH_CMD_PREFIX[@]}" taskset -c "$MEMCACHED_CORES" "$bin" -u "${MEMCACHED_USER:-root}" \
       -p "$PORT" -t "$MEMCACHED_THREADS" -m "$MEMCACHED_MEM_MB" \
       -c "$MEMCACHED_MAX_CONN" ${MEMCACHED_EXTRA_ARGS:-} \
       > "$log_file" 2>&1 &
   else
-    taskset -c "$MEMCACHED_CORES" "$bin" \
+    "${BENCH_CMD_PREFIX[@]}" taskset -c "$MEMCACHED_CORES" "$bin" \
       -p "$PORT" -t "$MEMCACHED_THREADS" -m "$MEMCACHED_MEM_MB" \
       -c "$MEMCACHED_MAX_CONN" ${MEMCACHED_EXTRA_ARGS:-} \
       > "$log_file" 2>&1 &

@@ -65,6 +65,100 @@ cpu_range() {
   fi
 }
 
+join_csv() {
+  local IFS=,
+  printf '%s' "$*"
+}
+
+socket_primary_cpus() {
+  local socket=$1
+  lscpu -p=CPU,NODE,SOCKET,CORE 2>/dev/null |
+    awk -F, -v sock="$socket" '$0 !~ /^#/ && $3 == sock && !seen[$4]++ { print $1 }'
+}
+
+socket_all_cpus() {
+  local socket=$1
+  lscpu -p=CPU,NODE,SOCKET,CORE 2>/dev/null |
+    awk -F, -v sock="$socket" '$0 !~ /^#/ && $3 == sock { print $1 }'
+}
+
+socket_numa_node() {
+  local socket=$1
+  lscpu -p=CPU,NODE,SOCKET,CORE 2>/dev/null |
+    awk -F, -v sock="$socket" '$0 !~ /^#/ && $3 == sock { print $2; exit }'
+}
+
+detect_socket_core_layout() {
+  local socket=$1
+  local primary=()
+  local all_cpus=()
+  local selected=()
+  local reserve=()
+  local cpu used selected_cpu mem_threads mutilate_threads primary_count
+
+  while read -r cpu; do
+    [ -n "$cpu" ] && primary+=("$cpu")
+  done < <(socket_primary_cpus "$socket")
+
+  if [ "${#primary[@]}" -eq 0 ]; then
+    return 1
+  fi
+
+  if [ "$BENCH_USE_SMT" = "1" ]; then
+    primary=()
+    while read -r cpu; do
+      [ -n "$cpu" ] && primary+=("$cpu")
+    done < <(socket_all_cpus "$socket")
+  fi
+
+  while read -r cpu; do
+    [ -n "$cpu" ] && all_cpus+=("$cpu")
+  done < <(socket_all_cpus "$socket")
+
+  primary_count=${#primary[@]}
+  if [ -z "${MEMCACHED_THREADS:-}" ]; then
+    mem_threads=$(max_int 1 $((primary_count / 2)))
+  else
+    mem_threads=$MEMCACHED_THREADS
+  fi
+
+  if [ -z "${MUTILATE_THREADS:-}" ]; then
+    mutilate_threads=$(max_int 1 $((primary_count - mem_threads)))
+  else
+    mutilate_threads=$MUTILATE_THREADS
+  fi
+
+  if [ "$((mem_threads + mutilate_threads))" -gt "$primary_count" ]; then
+    mem_threads=$(max_int 1 $((primary_count / 2)))
+    mutilate_threads=$(max_int 1 $((primary_count - mem_threads)))
+  fi
+
+  if [ -z "${MEMCACHED_CORES:-}" ]; then
+    MEMCACHED_CORES=$(join_csv "${primary[@]:0:$mem_threads}")
+  fi
+  if [ -z "${MUTILATE_CORES:-}" ]; then
+    MUTILATE_CORES=$(join_csv "${primary[@]:$mem_threads:$mutilate_threads}")
+  fi
+
+  selected=("${primary[@]:0:$((mem_threads + mutilate_threads))}")
+  for cpu in "${all_cpus[@]}"; do
+    used=0
+    for selected_cpu in "${selected[@]}"; do
+      if [ "$cpu" = "$selected_cpu" ]; then
+        used=1
+        break
+      fi
+    done
+    [ "$used" = "0" ] && reserve+=("$cpu")
+  done
+
+  HERMIT_RESERVED_CORES=$(join_csv "${reserve[@]}")
+  MEMCACHED_THREADS=$mem_threads
+  MUTILATE_THREADS=$mutilate_threads
+  BENCH_NUMA_NODE=${BENCH_NUMA_NODE:-$(socket_numa_node "$socket")}
+  return 0
+}
+
 RDMA_DIR=${RDMA_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 HERMIT6_ROOT=${HERMIT6_ROOT:-$(cd "$RDMA_DIR/../.." && pwd)}
 WORKSPACE_ROOT=${WORKSPACE_ROOT:-$(cd "$HERMIT6_ROOT/.." && pwd)}
@@ -79,8 +173,9 @@ KEYSIZE=${KEYSIZE:-fb_key}
 VALUESIZE=${VALUESIZE:-fb_value}
 IADIST=${IADIST:-fb_ia}
 UPDATE_RATIO=${UPDATE_RATIO:-0.002}
-DURATION=${DURATION:-30}
+DURATION=${DURATION:-40}
 LOADS=${LOADS:-"500000 750000 1000000 1250000 1500000 2000000 3000000 4000000"}
+BENCH_REPEATS=${BENCH_REPEATS:-3}
 
 CGROUP_NAME=${CGROUP_NAME:-mc}
 CGROUP_LIMIT_MB=${CGROUP_LIMIT_MB:-}
@@ -90,6 +185,18 @@ MEMCACHED_MAX_CONN=${MEMCACHED_MAX_CONN:-32768}
 STHD_CNT=${STHD_CNT:-16}
 LAZY_POLL=${LAZY_POLL:-N}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
+
+CORE_LAYOUT=${CORE_LAYOUT:-socket}
+BENCH_SOCKET=${BENCH_SOCKET:-1}
+BENCH_NUMA_NODE=${BENCH_NUMA_NODE:-}
+BENCH_NUMACTL=${BENCH_NUMACTL:-1}
+BENCH_USE_SMT=${BENCH_USE_SMT:-0}
+WAIT_SWAP_STABLE=${WAIT_SWAP_STABLE:-1}
+SWAP_STABLE_INTERVAL_SEC=${SWAP_STABLE_INTERVAL_SEC:-5}
+SWAP_STABLE_QUIET_SAMPLES=${SWAP_STABLE_QUIET_SAMPLES:-3}
+SWAP_STABLE_TIMEOUT_SEC=${SWAP_STABLE_TIMEOUT_SEC:-300}
+SWAP_STABLE_MAX_DELTA=${SWAP_STABLE_MAX_DELTA:-0}
+WAIT_STABLE_KEYS=${WAIT_STABLE_KEYS:-"pswpin pswpout backend_loads backend_stores"}
 
 RESULT_ROOT=${RESULT_ROOT:-"$RDMA_DIR/results"}
 RUN_ID=${RUN_ID:-"$(date +%Y%m%d-%H%M%S)-${KERNEL_TAG}-${MODE}"}
@@ -148,6 +255,14 @@ find_mutilate_bin() {
 detect_core_layout() {
   local total reserve available mem_threads mutilate_threads
   total=${CPU_TOTAL:-$(getconf _NPROCESSORS_ONLN)}
+
+  if [ "$CORE_LAYOUT" = "socket" ] && detect_socket_core_layout "$BENCH_SOCKET"; then
+    CPU_TOTAL=$total
+    export CPU_TOTAL MEMCACHED_THREADS MUTILATE_THREADS
+    export MEMCACHED_CORES MUTILATE_CORES HERMIT_RESERVED_CORES BENCH_NUMA_NODE
+    return 0
+  fi
+
   reserve=0
 
   if [[ "$MODE" == *hermit* ]]; then
@@ -202,6 +317,14 @@ detect_core_layout() {
   CPU_TOTAL=$total
   export CPU_TOTAL MEMCACHED_THREADS MUTILATE_THREADS
   export MEMCACHED_CORES MUTILATE_CORES HERMIT_RESERVED_CORES
+}
+
+build_bench_prefix() {
+  BENCH_CMD_PREFIX=()
+  if [ "$BENCH_NUMACTL" = "1" ] && [ -n "${BENCH_NUMA_NODE:-}" ] &&
+     command -v numactl >/dev/null 2>&1; then
+    BENCH_CMD_PREFIX=(numactl "--cpunodebind=$BENCH_NUMA_NODE" "--membind=$BENCH_NUMA_NODE")
+  fi
 }
 
 sudo_write() {
@@ -470,6 +593,102 @@ read_debug_counter() {
   printf '0'
 }
 
+read_activity_counter() {
+  case "$1" in
+    pswpin|pswpout|pgfault|pgmajfault)
+      read_vmstat_key "$1"
+      ;;
+    backend_loads)
+      read_debug_counter loads
+      ;;
+    backend_stores)
+      read_debug_counter stores
+      ;;
+    backend_load_misses)
+      read_debug_counter load_misses
+      ;;
+    backend_errors)
+      read_debug_counter errors
+      ;;
+    *)
+      printf '0'
+      ;;
+  esac
+}
+
+read_activity_total() {
+  local key val total=0
+  for key in $WAIT_STABLE_KEYS; do
+    val=$(read_activity_counter "$key")
+    if [[ "$val" =~ ^[0-9]+$ ]]; then
+      total=$((total + val))
+    fi
+  done
+  printf '%s' "$total"
+}
+
+wait_for_swap_stable() {
+  local label=$1
+  local wait_log=$2
+  local start_ts now_ts elapsed start_total prev curr delta quiet samples status
+
+  WAIT_LAST_STATUS=disabled
+  WAIT_LAST_SECONDS=0
+  WAIT_LAST_SAMPLES=0
+  WAIT_LAST_DELTA=0
+
+  if [ "$WAIT_SWAP_STABLE" != "1" ]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$wait_log")"
+  if [ ! -s "$wait_log" ]; then
+    printf 'label,start_ts,end_ts,wait_sec,status,samples,start_total,end_total,last_delta,keys\n' > "$wait_log"
+  fi
+
+  start_ts=$(date +%s)
+  start_total=$(read_activity_total)
+  prev=$start_total
+  curr=$prev
+  delta=0
+  quiet=0
+  samples=0
+  status=timeout
+  now_ts=$start_ts
+  elapsed=0
+
+  while true; do
+    sleep "$SWAP_STABLE_INTERVAL_SEC"
+    samples=$((samples + 1))
+    curr=$(read_activity_total)
+    delta=$((curr - prev))
+    if [ "$delta" -le "$SWAP_STABLE_MAX_DELTA" ]; then
+      quiet=$((quiet + 1))
+    else
+      quiet=0
+    fi
+    prev=$curr
+
+    now_ts=$(date +%s)
+    elapsed=$((now_ts - start_ts))
+    if [ "$quiet" -ge "$SWAP_STABLE_QUIET_SAMPLES" ]; then
+      status=stable
+      break
+    fi
+    if [ "$elapsed" -ge "$SWAP_STABLE_TIMEOUT_SEC" ]; then
+      break
+    fi
+  done
+
+  WAIT_LAST_STATUS=$status
+  WAIT_LAST_SECONDS=$elapsed
+  WAIT_LAST_SAMPLES=$samples
+  WAIT_LAST_DELTA=$delta
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+    "$label" "$start_ts" "$now_ts" "$elapsed" "$status" "$samples" \
+    "$start_total" "$curr" "$delta" "$WAIT_STABLE_KEYS" >> "$wait_log"
+}
+
 memcached_stats() {
   if ! command -v nc >/dev/null 2>&1; then
     return 0
@@ -480,7 +699,7 @@ memcached_stats() {
 stat_from_file() {
   local file=$1
   local key=$2
-  awk -v k="$key" '$1 == "STAT" && $2 == k { print $3; found=1 } END { if (!found) print 0 }' "$file"
+  awk -v k="$key" '$1 == "STAT" && $2 == k { gsub(/\r/, "", $3); print $3; found=1 } END { if (!found) print 0 }' "$file"
 }
 
 kv_from_file() {
@@ -538,6 +757,12 @@ save_config() {
     printf 'records=%s\n' "$RECORDS"
     printf 'duration=%s\n' "$DURATION"
     printf 'loads=%s\n' "$LOADS"
+    printf 'bench_repeats=%s\n' "$BENCH_REPEATS"
+    printf 'core_layout=%s\n' "$CORE_LAYOUT"
+    printf 'bench_socket=%s\n' "$BENCH_SOCKET"
+    printf 'bench_numa_node=%s\n' "${BENCH_NUMA_NODE:-}"
+    printf 'bench_numactl=%s\n' "$BENCH_NUMACTL"
+    printf 'bench_use_smt=%s\n' "$BENCH_USE_SMT"
     printf 'memcached_mem_mb=%s\n' "$MEMCACHED_MEM_MB"
     printf 'memcached_threads=%s\n' "${MEMCACHED_THREADS:-}"
     printf 'memcached_cores=%s\n' "${MEMCACHED_CORES:-}"
@@ -547,5 +772,11 @@ save_config() {
     printf 'sthd_cnt=%s\n' "$STHD_CNT"
     printf 'local_ratio_pct=%s\n' "${LOCAL_RATIO_PCT:-}"
     printf 'cgroup_limit_mb=%s\n' "${CGROUP_LIMIT_MB:-}"
+    printf 'wait_swap_stable=%s\n' "$WAIT_SWAP_STABLE"
+    printf 'swap_stable_interval_sec=%s\n' "$SWAP_STABLE_INTERVAL_SEC"
+    printf 'swap_stable_quiet_samples=%s\n' "$SWAP_STABLE_QUIET_SAMPLES"
+    printf 'swap_stable_timeout_sec=%s\n' "$SWAP_STABLE_TIMEOUT_SEC"
+    printf 'swap_stable_max_delta=%s\n' "$SWAP_STABLE_MAX_DELTA"
+    printf 'wait_stable_keys=%s\n' "$WAIT_STABLE_KEYS"
   } > "$RESULT_DIR/config.env"
 }

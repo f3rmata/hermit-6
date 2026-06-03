@@ -25,6 +25,7 @@ done
 
 mkdir -p "$RESULT_DIR"
 detect_core_layout
+build_bench_prefix
 configure_hermit_mode
 save_config
 
@@ -37,7 +38,7 @@ MUTILATE_BIN=$(find_mutilate_bin)
 LOAD_LOG="$RESULT_DIR/load.log"
 
 rdma_log "loading $RECORDS records into memcached at $SERVER_ADDR:$PORT"
-taskset -c "$MUTILATE_CORES" "$MUTILATE_BIN" \
+"${BENCH_CMD_PREFIX[@]}" taskset -c "$MUTILATE_CORES" "$MUTILATE_BIN" \
   -s "$SERVER_ADDR:$PORT" --loadonly -r "$RECORDS" \
   --keysize="$KEYSIZE" --valuesize="$VALUESIZE" \
   > "$LOAD_LOG" 2>&1
