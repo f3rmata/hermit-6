@@ -46,7 +46,7 @@ CSV_FILE="$RESULT_DIR/mutilate_load_vs_latency.csv"
 SUMMARY_FILE="$RESULT_DIR/summary.csv"
 WAIT_LOG="$RESULT_DIR/swap-wait.csv"
 
-CSV_HEADER="kernel_tag,uname,mode,local_ratio_pct,cgroup_limit_mb,offered_qps,repeat,wait_before_sec,wait_status,wait_samples,wait_last_delta,achieved_qps,read_avg_us,read_p99_us,update_avg_us,update_p99_us,miss_rate_pct,skipped_txs_pct,pswpin_delta,pswpout_delta,backend_loads_delta,backend_stores_delta,backend_load_misses_delta,backend_errors_delta,memcached_curr_items,memcached_evictions,memcached_bytes,log_file"
+CSV_HEADER="kernel_tag,uname,mode,hermit_swapout_policy,rswap_backend,local_ratio_pct,cgroup_limit_mb,offered_qps,repeat,wait_before_sec,wait_status,wait_samples,wait_last_delta,achieved_qps,read_avg_us,read_p99_us,update_avg_us,update_p99_us,miss_rate_pct,skipped_txs_pct,pswpin_delta,pswpout_delta,backend_loads_delta,backend_stores_delta,backend_load_misses_delta,backend_errors_delta,hermit_swapout_backend_stores_delta,hermit_swapout_backend_store_errors_delta,hermit_swapout_backend_poll_errors_delta,hermit_swapout_native_fallbacks_delta,hermit_swapout_exclusive_completions_delta,hermit_swapout_writethrough_completions_delta,hermit_swapout_large_folio_fallbacks_delta,memcached_curr_items,memcached_evictions,memcached_bytes,log_file"
 SUMMARY_HEADER="$CSV_HEADER,samples,achieved_qps_min,achieved_qps_max,read_p99_us_min,read_p99_us_max"
 
 printf '%s\n' "$CSV_HEADER" > "$CSV_FILE"
@@ -111,12 +111,19 @@ for load in $LOADS; do
     backend_stores_delta=$(delta_from_files "$before_kv" "$after_kv" backend_stores)
     backend_load_misses_delta=$(delta_from_files "$before_kv" "$after_kv" backend_load_misses)
     backend_errors_delta=$(delta_from_files "$before_kv" "$after_kv" backend_errors)
+    hermit_swapout_backend_stores_delta=$(delta_from_files "$before_kv" "$after_kv" hermit_swapout_backend_stores)
+    hermit_swapout_backend_store_errors_delta=$(delta_from_files "$before_kv" "$after_kv" hermit_swapout_backend_store_errors)
+    hermit_swapout_backend_poll_errors_delta=$(delta_from_files "$before_kv" "$after_kv" hermit_swapout_backend_poll_errors)
+    hermit_swapout_native_fallbacks_delta=$(delta_from_files "$before_kv" "$after_kv" hermit_swapout_native_fallbacks)
+    hermit_swapout_exclusive_completions_delta=$(delta_from_files "$before_kv" "$after_kv" hermit_swapout_exclusive_completions)
+    hermit_swapout_writethrough_completions_delta=$(delta_from_files "$before_kv" "$after_kv" hermit_swapout_writethrough_completions)
+    hermit_swapout_large_folio_fallbacks_delta=$(delta_from_files "$before_kv" "$after_kv" hermit_swapout_large_folio_fallbacks)
 
     curr_items=$(kv_from_file "$after_kv" memcached_curr_items)
     evictions=$(kv_from_file "$after_kv" memcached_evictions)
     bytes=$(kv_from_file "$after_kv" memcached_bytes)
 
-    row="$KERNEL_TAG,$(uname -r),$MODE,${LOCAL_RATIO_PCT:-},${CGROUP_LIMIT_MB:-},$load,$repeat,$wait_before_sec,$wait_status,$wait_samples,$wait_last_delta,$achieved_qps,$read_avg,$read_p99,$update_avg,$update_p99,$miss_rate,$skipped_rate,$pswpin_delta,$pswpout_delta,$backend_loads_delta,$backend_stores_delta,$backend_load_misses_delta,$backend_errors_delta,$curr_items,$evictions,$bytes,$temp_log"
+    row="$KERNEL_TAG,$(uname -r),$MODE,$HERMIT_SWAPOUT_POLICY,$(detect_rswap_backend),${LOCAL_RATIO_PCT:-},${CGROUP_LIMIT_MB:-},$load,$repeat,$wait_before_sec,$wait_status,$wait_samples,$wait_last_delta,$achieved_qps,$read_avg,$read_p99,$update_avg,$update_p99,$miss_rate,$skipped_rate,$pswpin_delta,$pswpout_delta,$backend_loads_delta,$backend_stores_delta,$backend_load_misses_delta,$backend_errors_delta,$hermit_swapout_backend_stores_delta,$hermit_swapout_backend_store_errors_delta,$hermit_swapout_backend_poll_errors_delta,$hermit_swapout_native_fallbacks_delta,$hermit_swapout_exclusive_completions_delta,$hermit_swapout_writethrough_completions_delta,$hermit_swapout_large_folio_fallbacks_delta,$curr_items,$evictions,$bytes,$temp_log"
     printf '%s\n' "$row" >> "$CSV_FILE"
 
     rdma_log "repeat=$repeat achieved=$achieved_qps qps read_p99=${read_p99}us wait=${wait_before_sec}s status=$wait_status pswpin_delta=$pswpin_delta pswpout_delta=$pswpout_delta"
@@ -142,6 +149,13 @@ numeric_fields = {
     "skipped_txs_pct", "pswpin_delta", "pswpout_delta",
     "backend_loads_delta", "backend_stores_delta",
     "backend_load_misses_delta", "backend_errors_delta",
+    "hermit_swapout_backend_stores_delta",
+    "hermit_swapout_backend_store_errors_delta",
+    "hermit_swapout_backend_poll_errors_delta",
+    "hermit_swapout_native_fallbacks_delta",
+    "hermit_swapout_exclusive_completions_delta",
+    "hermit_swapout_writethrough_completions_delta",
+    "hermit_swapout_large_folio_fallbacks_delta",
     "memcached_curr_items", "memcached_evictions", "memcached_bytes",
 }
 

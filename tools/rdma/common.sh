@@ -185,6 +185,8 @@ MEMCACHED_MAX_CONN=${MEMCACHED_MAX_CONN:-32768}
 STHD_CNT=${STHD_CNT:-16}
 LAZY_POLL=${LAZY_POLL:-N}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
+HERMIT_SWAPOUT_POLICY=${HERMIT_SWAPOUT_POLICY:-exclusive}
+RSWAP_REQUIRED_BACKEND=${RSWAP_REQUIRED_BACKEND:-rdma}
 
 CORE_LAYOUT=${CORE_LAYOUT:-socket}
 BENCH_SOCKET=${BENCH_SOCKET:-1}
@@ -497,8 +499,29 @@ set_hermit_flag() {
   set_debugfs_file "/sys/kernel/debug/hermit/$1" "$2"
 }
 
+read_hermit_counter() {
+  local key=$1
+  local file="/sys/kernel/debug/hermit/$key"
+
+  if sudo_test -r "$file" 2>/dev/null; then
+    sudo_cat "$file"
+    return 0
+  fi
+  printf '0'
+}
+
+detect_rswap_backend() {
+  if sudo_test -d /sys/kernel/debug/rswap_rdma 2>/dev/null; then
+    printf 'rdma'
+  elif sudo_test -d /sys/kernel/debug/rswap_dram 2>/dev/null; then
+    printf 'dram'
+  else
+    printf 'none'
+  fi
+}
+
 configure_hermit_mode() {
-  local flag
+  local flag backend
   mount_debugfs_if_needed
 
   if ! sudo_test -d /sys/kernel/debug/hermit 2>/dev/null; then
@@ -508,7 +531,7 @@ configure_hermit_mode() {
 
   for flag in bypass_swapcache batch_swapout batch_tlb batch_io batch_account \
               vaddr_swapout speculative_io speculative_lock lazy_poll \
-              apt_reclaim swap_thread prefetch_thread; do
+              apt_reclaim exclusive_swapout swap_thread prefetch_thread; do
     set_hermit_flag "$flag" N
   done
 
@@ -529,6 +552,21 @@ configure_hermit_mode() {
       set_hermit_flag apt_reclaim Y
       set_hermit_flag swap_thread Y
       set_hermit_flag prefetch_thread N
+      case "$HERMIT_SWAPOUT_POLICY" in
+        exclusive)
+          set_hermit_flag exclusive_swapout Y
+          ;;
+        writethrough|write-through)
+          set_hermit_flag exclusive_swapout N
+          ;;
+        *)
+          rdma_die "unknown HERMIT_SWAPOUT_POLICY=$HERMIT_SWAPOUT_POLICY; use exclusive or writethrough"
+          ;;
+      esac
+      backend=$(detect_rswap_backend)
+      if [ -n "$RSWAP_REQUIRED_BACKEND" ] && [ "$backend" != "$RSWAP_REQUIRED_BACKEND" ]; then
+        rdma_die "Hermit benchmark requires rswap backend '$RSWAP_REQUIRED_BACKEND', found '$backend'. Load the RDMA client or set RSWAP_REQUIRED_BACKEND= to disable this check."
+      fi
       set_debugfs_file /sys/kernel/debug/hermit/sthd_cnt "$STHD_CNT"
       set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode 0
       ;;
@@ -609,6 +647,15 @@ read_activity_counter() {
       ;;
     backend_errors)
       read_debug_counter errors
+      ;;
+    hermit_swapout_native_fallbacks)
+      read_hermit_counter swapout_native_fallbacks
+      ;;
+    hermit_swapout_exclusive_completions)
+      read_hermit_counter swapout_exclusive_completions
+      ;;
+    hermit_swapout_writethrough_completions)
+      read_hermit_counter swapout_writethrough_completions
       ;;
     *)
       printf '0'
@@ -740,6 +787,13 @@ capture_counters() {
     printf 'backend_post_errors=%s\n' "$(read_debug_counter post_errors)"
     printf 'backend_wc_errors=%s\n' "$(read_debug_counter wc_errors)"
     printf 'backend_errors=%s\n' "$(read_debug_counter errors)"
+    printf 'hermit_swapout_backend_stores=%s\n' "$(read_hermit_counter swapout_backend_stores)"
+    printf 'hermit_swapout_backend_store_errors=%s\n' "$(read_hermit_counter swapout_backend_store_errors)"
+    printf 'hermit_swapout_backend_poll_errors=%s\n' "$(read_hermit_counter swapout_backend_poll_errors)"
+    printf 'hermit_swapout_native_fallbacks=%s\n' "$(read_hermit_counter swapout_native_fallbacks)"
+    printf 'hermit_swapout_exclusive_completions=%s\n' "$(read_hermit_counter swapout_exclusive_completions)"
+    printf 'hermit_swapout_writethrough_completions=%s\n' "$(read_hermit_counter swapout_writethrough_completions)"
+    printf 'hermit_swapout_large_folio_fallbacks=%s\n' "$(read_hermit_counter swapout_large_folio_fallbacks)"
     printf 'memcached_curr_items=%s\n' "$(stat_from_file "$stats_file" curr_items)"
     printf 'memcached_evictions=%s\n' "$(stat_from_file "$stats_file" evictions)"
     printf 'memcached_bytes=%s\n' "$(stat_from_file "$stats_file" bytes)"
@@ -770,6 +824,11 @@ save_config() {
     printf 'mutilate_cores=%s\n' "${MUTILATE_CORES:-}"
     printf 'hermit_reserved_cores=%s\n' "${HERMIT_RESERVED_CORES:-}"
     printf 'sthd_cnt=%s\n' "$STHD_CNT"
+    printf 'bypass_swapcache=%s\n' "$BYPASS_SWAPCACHE"
+    printf 'lazy_poll=%s\n' "$LAZY_POLL"
+    printf 'hermit_swapout_policy=%s\n' "$HERMIT_SWAPOUT_POLICY"
+    printf 'rswap_required_backend=%s\n' "$RSWAP_REQUIRED_BACKEND"
+    printf 'rswap_backend=%s\n' "$(detect_rswap_backend)"
     printf 'local_ratio_pct=%s\n' "${LOCAL_RATIO_PCT:-}"
     printf 'cgroup_limit_mb=%s\n' "${CGROUP_LIMIT_MB:-}"
     printf 'wait_swap_stable=%s\n' "$WAIT_SWAP_STABLE"
