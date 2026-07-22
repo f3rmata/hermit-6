@@ -36,7 +36,6 @@ ADC_PREFETCH_SWAPIN 统计
 
 - 已新增 hermit_pf_profile_ctx，用 current->hermit_pf_ctx 在 fault、memcg、vmscan、page_io、swap_state 之间共享同一份 pf_breakdown。
 - 已恢复主要 page fault / swapin / swapout / reclaim / backend latency 统计点。
-- ADC_HERMIT_RMAP1_LAT / ADC_HERMIT_RMAP2_LAT 仍等待 vaddr/vpage reclaim 完整恢复。
 
 *** HOLD PG_prefetch 移植
 不用 hermit 的 PG_prefetch 私有页标识，直接用新版内核提供的 folio_set_readahead(folio)标记函数
