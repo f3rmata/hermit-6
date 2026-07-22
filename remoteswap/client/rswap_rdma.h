@@ -11,14 +11,12 @@
 // Swap
 #include <linux/swapfile.h>
 #include <linux/swap.h>
-#include <linux/frontswap.h>
 
 // For infiniband
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
 #include <linux/pci.h> // Use the dma_addr_t defined in types.h as the DMA/BUS address.
 #include <linux/inet.h>
-#include <linux/lightnvm.h>
 #include <linux/sed-opal.h>
 
 // Utilities
@@ -26,7 +24,7 @@
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
 #include <linux/scatterlist.h>
-#include <asm/uaccess.h> // copy data from kernel space to user space
+#include <linux/uaccess.h> // copy data from kernel space to user space
 #include <linux/slab.h> // kmem_cache
 #include <linux/debugfs.h>
 #include <linux/vmalloc.h>
@@ -141,6 +139,7 @@ struct rswap_rdma_queue {
 	spinlock_t cq_lock;
 	uint8_t freed;
 	atomic_t rdma_post_counter;
+	atomic_t rdma_error;
 
 	int q_index;
 	enum rdma_queue_type type;

@@ -1,125 +1,91 @@
-# Remoteswap
-A RDMA-based remote swap system for remote memory and disaggregated clusters. The codebase is larged adopted from Fastswap (https://github.com/clusterfarmem/fastswap) and Canvas (https://github.com/uclasystem/canvas), but is enhanced with our optimizations.
+# Remoteswap on Hermit 6.18
 
-## Prerequisites
-Remoteswap is developed and tested under the following settings:
+Remoteswap provides the DRAM validation backend and the RDMA backend used by
+the Hermit-enabled Linux `v6.18.38` tree in this repository.
 
-Hardware:
-* Infiniband: Mellanox ConnectX-3/4 (40Gbps), or Mellanox ConnectX-6 (100Gbps)
-* RoCE: Mellanox ConnectX-5 25GbE, or Mellanox ConnectX-5 Ex 100GbE
+## Backends
 
-Software:
-* OS: Ubuntu 18.04/20.04
-* gcc 7.5.0/9.4.0
-* Mellanox OFED driver: 5.4-3.1.0.0-LTS (for ConnectX-5 and 6), or 4.9-4.1.7.0-LTS (for ConnectX-3).
-
-## Build & Install
-
-### Install MLNX_OFED driver
-Here is an example on Ubuntu 20.04:
-```bash
-# Download the MLNX OFED driver for the Ubuntu 20.04
-wget https://content.mellanox.com/ofed/MLNX_OFED-5.4-3.1.0.0/MLNX_OFED_LINUX-5.4-3.1.0.0-ubuntu20.04-x86_64.tgz
-tar xzf MLNX_OFED_LINUX-5.4-3.1.0.0-ubuntu20.04-x86_64.tgz
-cd MLNX_OFED_LINUX-5.4-3.1.0.0-ubuntu20.04-x86_64
-
-# Install the MLNX OFED driver against linux-5.14-rc5
-sudo ./mlnxofedinstall --add-kernel-support --force
-# restart openibd service as required
-sudo systemctl restart openibd
-# reboot
-sudo reboot
-```
-
-### Client
-On the host machine,
-```bash
-cd remoteswap/client
-make
-```
-
-There should be a kernel module called `rswap-client.ko` under the client/ directory, which indicates a build success.
-
-### Server
-On the memory server,
-```bash
-cd remotswap/server
-make
-```
-
-We should get a `rswap-server` after the compilation.
-
-### DRAM client backend
-
-Similar to Fastswap, remoteswap supports debugging using local memory as a fake "remote memory pool". In such case, there is no "remoteswap-server", and the "remoteswap-client" should be built in the following way:
+The local DRAM backend is intended for QEMU and functional testing. It has no
+OFED dependency:
 
 ```bash
-# (under the remoteswap/client dir)
-make BACKEND=DRAM
+make -C client KDIR="$PWD/../linux-stable" BACKEND=DRAM
 ```
 
-When built with `BACKEND=DRAM`, the client does not require Mellanox OFED
-headers or symbols, which makes it suitable for local QEMU bring-up.
-
-## Usage
-
-1. On the memory server, run `rswap-server` first. This process must be alive all the time so either run it inside `tmux` or `screen`, or run it as a system service.
-
-For now, we have to know the online core number of the **host server** first. You can check `/proc/cpuinfo` on the host server or simply get the number via `top` or `htop`.
-A wrong core number will crash the kernel module.
+The RDMA backend uses an external Mellanox OFED build for the exact target
+kernel. `OFA_DIR` must contain both `include/` and `Module.symvers`:
 
 ```bash
-cd remoteswap/server
-./rswap-server <memory server ip> <memory server port> <memory pool size in GB> <number of cores on host server>
-# an example: ./rswap-server 10.0.0.4 9400 48 32
+make -C client \
+  KDIR="$PWD/../linux-stable" \
+  BACKEND=RDMA \
+  OFA_DIR=/usr/src/ofa_kernel/default
 ```
 
-2. On the host server, edit the parameters in `manage_rswap_client.sh` under `remoteswap/client` directory.
+The RDMA build does not use the in-tree Linux RDMA core. Build or install OFED
+against the Hermit `v6.18.38` kernel first. Do not mix headers or symbol CRCs
+from another kernel.
 
-Here is an excerpt of the script:
+## Hardware
+
+The original deployment targets include Mellanox ConnectX-3/4/5/6 adapters
+over InfiniBand or RoCE. Driver, firmware, link mode, MTU, addressing, and the
+memory server must be configured consistently on both machines.
+
+## Server
+
+Build and start the memory server before loading the client:
 
 ```bash
-# The swap file/partition size should be equal to the whole size of remote memory
-SWAP_PARTITION_SIZE="48"
-
-server_ip="10.0.0.2"
-server_port="9400"
-swap_file="/mnt/swapfile"
+make -C server OFA_DIR=/usr/src/ofa_kernel/default
+./server/rswap-server <server-ip> <port> <pool-size-gib> <client-cpu-count>
 ```
 
-Make sure that "SWAP_PARTITION_SIZE" equals to the remote memory pool size you set when running `rswap-server`, as well as "server_ip" and "server_port" here.
+The client CPU count determines the number of RDMA queues. A mismatch can
+exceed the server's available queue slots.
 
-"swap_file" is the path which the script uses to create a special file as a fake swap partition in the size of `SWAP_PARTITION_SIZE`GB. The script will create the file by itself but the path must be valid. The path can be "/mnt/swapfile" here, or somewhere under your home like "${HOME}/aaa/bbb".
+## Client
 
-3. On the host server, install the `rswap-client` kernel module, which will establish the connection to the server and finalize the setup.
+The remote pool size, swap size, server address, and port must agree. The
+existing management script exposes those settings, or the module can be loaded
+directly:
 
 ```bash
-./manage_rswap_client.sh install
+sudo insmod client/rswap-client.ko \
+  sip=10.0.0.2 sport=9400 rmsize=48
 ```
 
-The script should have done everything but in case here is the command to install the kernel module manually:
+After the RDMA session is connected, successful Hermit registration emits:
+
+```text
+rswap: Hermit RDMA backend registered
+```
+
+Hermit then stores order-0 swap folios remotely. A successful remote store is
+authoritative and skips the local swap BIO; a failed store falls back to the
+native swap path. Direct asynchronous swapin and lazy polling are controlled
+through `/sys/kernel/debug/hermit/`.
+
+Before unloading the client, disable the associated swap device and ensure no
+remote entries or outstanding RDMA requests remain:
 
 ```bash
-sudo insmod ./rswap-client.ko sip=${mem_server_ip} sport=${mem_server_port} rmsize=${SWAP_PARTITION_SIZE_GB}
+sudo swapoff <swap-device-or-file>
+sudo rmmod rswap_client
 ```
 
-It might take a while to allocate and register all memory in the memory pool, and establish the connection. The system should have been fully set up now.
+## Validation
 
-You can optionally check system log via `dmesg`. A success should look like (1 chunk is 4GB so 12 chunks are essentially 48GB remote memory):
-```
-rswap_request_for_chunk, Got 12 chunks from memory server.
-rdma_session_connect,Exit the main() function with built RDMA conenction rdma_session_context:0xffffffffc08f7460.
-frontswap module loaded
-```
+`BACKEND=DRAM` plus `tools/qemu-dram/validate-qemu-dram.sh` validates data
+checksums, backend counters, swap vmstat, profiling output, and the absence of
+local swap writes after successful remote stores.
 
-4. To uninstall the kernel module, one can run the following command on the host server
-```bash
-cd remoteswap/client
-sudo ./manage_rswap_client.sh uninstall
-```
+An RDMA build only proves API and symbol compatibility. End-to-end validation
+also requires the matching OFED runtime, a supported NIC, a reachable memory
+server, successful queue setup, and a swap pressure test that verifies data on
+reload.
 
-## Acknowledgement
-The codebase is largely adopted from Fastswap (https://github.com/clusterfarmem/fastswap) and Canvas (https://github.com/uclasystem/canvas).
+## Origins
 
-## Contact
-Please contact yifanqiao [at] g [dot] ucla [dot] edu for assistance.
+The codebase is derived from Fastswap and Canvas and retains their server
+protocol and queue layout.

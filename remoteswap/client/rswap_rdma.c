@@ -228,7 +228,7 @@ err:
 /**
  * Post a 2-sided request for chunk mapping.
  */
-int rswap_request_for_chunk(struct rdma_session_context *rdma_session)
+static int rswap_request_for_chunk(struct rdma_session_context *rdma_session)
 {
 	int ret = 0;
 	struct rswap_rdma_queue *rdma_queue;
@@ -261,7 +261,7 @@ err:
 /**
  * The rdma CM event handler function
  */
-int rswap_rdma_cm_event_handler(struct rdma_cm_id *cma_id,
+static int rswap_rdma_cm_event_handler(struct rdma_cm_id *cma_id,
 				struct rdma_cm_event *event)
 {
 	int ret = 0;
@@ -377,7 +377,7 @@ rdma_resolve_ip_to_ib_device(struct rdma_session_context *rdma_session,
  * Build the Queue Pair (QP).
  *
  */
-int rswap_create_qp(struct rdma_session_context *rdma_session,
+static int rswap_create_qp(struct rdma_session_context *rdma_session,
 		    struct rswap_rdma_queue *rdma_queue)
 {
 	struct ib_qp_init_attr init_attr;
@@ -473,7 +473,7 @@ err:
  * 		rdma_session_context->send_sgl
  * Post these 2 WRs to receive/send controll messages.
  */
-void rswap_setup_message_wr(struct rdma_session_context *rdma_session)
+static void rswap_setup_message_wr(struct rdma_session_context *rdma_session)
 {
 	rdma_session->rdma_recv_req.recv_sgl.addr =
 		rdma_session->rdma_recv_req.recv_dma_addr;
@@ -660,25 +660,26 @@ void bind_remote_memory_chunks(struct rdma_session_context *rdma_session)
  */
 int init_rdma_sessions(struct rdma_session_context *rdma_session)
 {
-	int ret = 0;
-
 	rdma_session->rdma_queues = kzalloc(
 		sizeof(struct rswap_rdma_queue) * num_queues, GFP_KERNEL);
+	if (!rdma_session->rdma_queues)
+		return -ENOMEM;
+
 	rdma_session->send_queue_depth = RDMA_SEND_QUEUE_DEPTH + 1;
 	rdma_session->recv_queue_depth = RDMA_RECV_QUEUE_DEPTH + 1;
 
 	rdma_session->port = htons(server_port);
-	ret = in4_pton(server_ip, strlen(server_ip), rdma_session->addr, -1,
-		       NULL);
-	if (ret == 0) {
+	if (!in4_pton(server_ip, strlen(server_ip), rdma_session->addr, -1,
+		      NULL)) {
 		pr_err("Assign ip %s to  rdma_session->addr : %s failed.\n",
 		       server_ip, rdma_session->addr);
-		goto err;
+		kfree(rdma_session->rdma_queues);
+		rdma_session->rdma_queues = NULL;
+		return -EINVAL;
 	}
 	rdma_session->addr_type = AF_INET;
 
-err:
-	return ret;
+	return 0;
 }
 
 /**
@@ -729,6 +730,7 @@ int rswap_init_rdma_queue(struct rdma_session_context *rdma_session, int idx)
 	init_waitqueue_head(&rdma_queue->sem);
 	spin_lock_init(&(rdma_queue->cq_lock));
 	atomic_set(&(rdma_queue->rdma_post_counter), 0);
+	atomic_set(&rdma_queue->rdma_error, 0);
 	rdma_queue->fs_rdma_req_cache =
 		kmem_cache_create("fs_rdma_req_cache",
 				  sizeof(struct fs_rdma_req), 0,
@@ -767,11 +769,13 @@ int rdma_session_connect(struct rdma_session_context *rdma_session)
 		if (unlikely(ret)) {
 			pr_err("%s,init rdma queue [%d] failed.\n", __func__,
 			       i);
+			goto err;
 		}
 
 		ret = rswap_create_rdma_queue(rdma_session, i);
 		if (unlikely(ret)) {
 			pr_err("%s, Create rdma queues failed. \n", __func__);
+			goto err;
 		}
 
 		ret = rswap_connect_remote_memory_server(rdma_session, i);

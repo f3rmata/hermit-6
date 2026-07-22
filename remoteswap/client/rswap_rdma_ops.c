@@ -1,7 +1,8 @@
-#include <linux/swap_stats.h>
-#include <linux/hermit.h>
+#include <linux/hermit_backend.h>
+#include <linux/swapops.h>
 
 #include "rswap_rdma.h"
+#include "rswap_ops.h"
 
 /**
  * Wait for the finish of ALL the outstanding rdma_request
@@ -24,7 +25,7 @@ void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
 	preempt_enable();
 }
 
-void write_drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
+static void write_drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
 {
 	int nr_pending = atomic_read(&rdma_queue->rdma_post_counter);
 	int nr_done = 0;
@@ -63,41 +64,21 @@ void drain_all_rdma_queues(int target_mem_server)
 /**
  * The callback function for rdma requests.
  */
-void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
+static void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct fs_rdma_req *rdma_req =
 		container_of(wc->wr_cqe, struct fs_rdma_req, cqe);
 	struct rswap_rdma_queue *rdma_queue = cq->cq_context;
 	struct ib_device *ibdev = rdma_queue->rdma_session->rdma_dev->dev;
-	bool unlock = true;
 	int cpu;
 	enum rdma_queue_type type;
-
-#if defined(RSWAP_KERNEL_SUPPORT) && RSWAP_KERNEL_SUPPORT >= 3
-	unlock = !hmt_ctl_flag(HMT_LAZY_POLL);
-#else
-	unlock = true;
-#endif
 
 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
 		pr_err("%s status is not success, it is=%d\n", __func__,
 		       wc->status);
+		atomic_set(&rdma_queue->rdma_error, -EIO);
 	}
 	get_rdma_queue_cpu_type(&rdma_session_global, rdma_queue, &cpu, &type);
-	if (type == QP_STORE) { // STORE requests
-		// set_page_writeback(rdma_req->page);
-		unlock_page(rdma_req->page);
-		// end_page_writeback(rdma_req->page);
-	} else if (type == QP_LOAD_SYNC) { // LOAD SYNC requests
-		// originally called in swap_readpage(). Moved here for asynchrony.
-		SetPageUptodate(rdma_req->page);
-		if (unlock)
-			unlock_page(rdma_req->page);
-	} else if (type == QP_LOAD_ASYNC) { // LOAD ASYNC requests
-		// originally called in swap_readpage(). Moved here for asynchrony.
-		SetPageUptodate(rdma_req->page);
-		unlock_page(rdma_req->page);
-	}
 
 	atomic_dec(&rdma_queue->rdma_post_counter);
 	ib_dma_unmap_page(ibdev, rdma_req->dma_addr, PAGE_SIZE,
@@ -105,7 +86,7 @@ void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 	kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
 }
 
-int fs_enqueue_send_wr(struct rdma_session_context *rdma_session,
+static int fs_enqueue_send_wr(struct rdma_session_context *rdma_session,
 		       struct rswap_rdma_queue *rdma_queue,
 		       struct fs_rdma_req *rdma_req)
 {
@@ -126,7 +107,8 @@ int fs_enqueue_send_wr(struct rdma_session_context *rdma_session,
 				pr_err("%s, post 1-sided RDMA send wr failed, "
 				       "return value :%d. counter %d \n",
 				       __func__, ret, test);
-				ret = -1;
+				atomic_dec(&rdma_queue->rdma_post_counter);
+				ret = -EIO;
 				goto err;
 			}
 
@@ -142,13 +124,13 @@ int fs_enqueue_send_wr(struct rdma_session_context *rdma_session,
 	}
 err:
 	pr_err(" Error in %s \n", __func__);
-	return -1;
+	return ret;
 }
 
 /**
- * Build a rdma_wr for frontswap data path.
+ * Build a work request for the Hermit backend data path.
  */
-int fs_build_rdma_wr(struct rdma_session_context *rdma_session,
+static int fs_build_rdma_wr(struct rdma_session_context *rdma_session,
 		     struct rswap_rdma_queue *rdma_queue,
 		     struct fs_rdma_req *rdma_req,
 		     struct remote_chunk *remote_chunk_ptr,
@@ -166,7 +148,6 @@ int fs_build_rdma_wr(struct rdma_session_context *rdma_session,
 	if (unlikely(ib_dma_mapping_error(dev, rdma_req->dma_addr))) {
 		pr_err("%s, ib_dma_mapping_error\n", __func__);
 		ret = -ENOMEM;
-		kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
 		goto out;
 	}
 
@@ -219,12 +200,18 @@ int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
 	page_addr = pgoff2addr(offset);
 	chunk_idx = page_addr >> CHUNK_SHIFT;
 	offset_within_chunk = page_addr & CHUNK_MASK;
+	if (chunk_idx >= rdma_session_global.remote_mem_pool.chunk_num) {
+		pr_err_ratelimited("rswap: swap offset 0x%lx exceeds remote pool\n",
+				   offset);
+		return -ERANGE;
+	}
 
 	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, type);
 	rdma_req = (struct fs_rdma_req *)kmem_cache_alloc(
 		rdma_queue->fs_rdma_req_cache, GFP_ATOMIC);
 	if (!rdma_req) {
 		pr_err("%s, get reserved fs_rdma_req failed. \n", __func__);
+		ret = -ENOMEM;
 		goto out;
 	}
 
@@ -236,12 +223,18 @@ int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
 			       type);
 	if (unlikely(ret)) {
 		pr_err("%s, Build rdma_wr failed.\n", __func__);
+		kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
 		goto out;
 	}
 
 	ret = fs_enqueue_send_wr(&rdma_session_global, rdma_queue, rdma_req);
 	if (unlikely(ret)) {
 		pr_err("%s, enqueue rdma_wr failed.\n", __func__);
+		ib_dma_unmap_page(rdma_session_global.rdma_dev->dev,
+				  rdma_req->dma_addr, PAGE_SIZE,
+				  type == QP_STORE ? DMA_TO_DEVICE :
+						     DMA_FROM_DEVICE);
+		kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
 		goto out;
 	}
 
@@ -249,211 +242,74 @@ out:
 	return ret;
 }
 
-/**
- * Synchronously write data to memory server.
- */
-int rswap_frontswap_store(unsigned type, pgoff_t swap_entry_offset,
-			  struct page *page)
+static int rswap_backend_store(swp_entry_t entry, struct page *page, int cpu,
+			       bool async)
 {
-	int ret = 0;
-	int cpu;
-	struct rswap_rdma_queue *rdma_queue;
+	struct rswap_rdma_queue *queue;
+	int ret;
 
-	cpu = get_cpu();
-	ret = rswap_rdma_send(cpu, swap_entry_offset, page, QP_STORE);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
-	put_cpu();
-	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, QP_STORE);
-	write_drain_rdma_queue(rdma_queue);
-
-	ret = 0;
-out:
-	return ret;
+	ret = rswap_rdma_send(cpu, swp_offset(entry), page, QP_STORE);
+	if (ret)
+		return ret;
+	queue = get_rdma_queue(&rdma_session_global, cpu, QP_STORE);
+	if (async)
+		return 0;
+	write_drain_rdma_queue(queue);
+	return atomic_xchg(&queue->rdma_error, 0);
 }
 
-int rswap_frontswap_store_on_core(unsigned type, pgoff_t swap_entry_offset,
-				  struct page *page, int core)
+static int rswap_backend_load(swp_entry_t entry, struct page *page, int cpu,
+			      bool async)
 {
-	int ret = 0;
+	struct rswap_rdma_queue *queue;
+	enum rdma_queue_type type = async ? QP_LOAD_ASYNC : QP_LOAD_SYNC;
+	int ret;
 
-	ret = rswap_rdma_send(core, swap_entry_offset, page, QP_STORE);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
-
-	ret = 0;
-out:
-	return ret;
+	ret = rswap_rdma_send(cpu, swp_offset(entry), page, type);
+	if (ret)
+		return ret;
+	queue = get_rdma_queue(&rdma_session_global, cpu, type);
+	if (async)
+		return 0;
+	drain_rdma_queue(queue);
+	return atomic_xchg(&queue->rdma_error, 0);
 }
 
-int rswap_frontswap_poll_store(int core)
+static int rswap_backend_poll_load(int cpu)
 {
-	struct rswap_rdma_queue *rdma_queue;
+	struct rswap_rdma_queue *queue;
 
-	core %= NR_WRITE_QUEUE;
-
-	rdma_queue = get_rdma_queue(&rdma_session_global, core, QP_STORE);
-	write_drain_rdma_queue(rdma_queue);
-	return 0;
+	queue = get_rdma_queue(&rdma_session_global, cpu, QP_LOAD_ASYNC);
+	drain_rdma_queue(queue);
+	return atomic_xchg(&queue->rdma_error, 0);
 }
 
-/**
- * Synchronously read data from memory server.
- *
- * return:
- *  0 : success
- *  non-zero : failed.
- */
-int rswap_frontswap_load(unsigned type, pgoff_t swap_entry_offset,
-			 struct page *page)
+static int rswap_backend_peek_load(int cpu)
 {
-	int ret = 0;
-	int cpu;
-	cpu = smp_processor_id();
-	ret = rswap_rdma_send(cpu, swap_entry_offset, page, QP_LOAD_SYNC);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
-
-	ret = 0;
-out:
-	return ret;
+	return peek_rdma_queue(get_rdma_queue(&rdma_session_global, cpu,
+					     QP_LOAD_ASYNC));
 }
 
-int rswap_frontswap_load_async(unsigned type, pgoff_t swap_entry_offset,
-			       struct page *page)
-{
-	int ret = 0;
-	int cpu;
-
-	cpu = smp_processor_id();
-	ret = rswap_rdma_send(cpu, swap_entry_offset, page, QP_LOAD_ASYNC);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
-
-	ret = 0;
-
-out:
-	return ret;
-}
-
-int rswap_frontswap_poll_load(int cpu)
-{
-	struct rswap_rdma_queue *rdma_queue;
-
-	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, QP_LOAD_SYNC);
-	drain_rdma_queue(rdma_queue);
-	return 0;
-}
-
-int rswap_frontswap_peek_load(int cpu)
-{
-	struct rswap_rdma_queue *rdma_queue =
-		get_rdma_queue(&rdma_session_global, cpu, QP_LOAD_SYNC);
-	return peek_rdma_queue(rdma_queue);
-}
-
-int rswap_frontswap_peek_store(int cpu)
-{
-	struct rswap_rdma_queue *rdma_queue;
-	cpu %= NR_WRITE_QUEUE;
-	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, QP_STORE);
-	return peek_rdma_queue(rdma_queue);
-}
-
-static void rswap_invalidate_page(unsigned type, pgoff_t offset)
-{
-	return;
-}
-
-static void rswap_invalidate_area(unsigned type)
-{
-	return;
-}
-
-static void rswap_frontswap_init(unsigned type)
-{
-}
-
-static struct frontswap_ops rswap_frontswap_ops = {
-	.init = rswap_frontswap_init,
-	.store = rswap_frontswap_store,
-	.load = rswap_frontswap_load,
-	.invalidate_page = rswap_invalidate_page,
-	.invalidate_area = rswap_invalidate_area,
-#ifdef RSWAP_KERNEL_SUPPORT
-	.load_async = rswap_frontswap_load_async,
-	.poll_load = rswap_frontswap_poll_load,
-#if RSWAP_KERNEL_SUPPORT >= 2
-	.store_on_core = rswap_frontswap_store_on_core,
-	.poll_store = rswap_frontswap_poll_store,
-#endif // RSWAP_KERNEL_SUPPORT >= 2
-#if RSWAP_KERNEL_SUPPORT >= 3
-	.peek_load = rswap_frontswap_peek_load,
-	.peek_store = rswap_frontswap_peek_store,
-#endif // RSWAP_KERNEL_SUPPORT >= 3
-#endif
+static const struct hermit_backend_ops rswap_backend_ops = {
+	.load = rswap_backend_load,
+	.store = rswap_backend_store,
+	.poll_load = rswap_backend_poll_load,
+	.peek_load = rswap_backend_peek_load,
 };
 
-int rswap_register_frontswap(void)
+int rswap_register_backend(void)
 {
-	int ret = 0;
-	// enable the frontswap path
-	frontswap_register_ops(&rswap_frontswap_ops);
+	int ret = hermit_register_backend(&rswap_backend_ops);
 
-	pr_info("frontswap module loaded\n");
+	if (!ret)
+		pr_info("rswap: Hermit RDMA backend registered\n");
 	return ret;
 }
 
-int rswap_replace_frontswap(void)
+void rswap_unregister_backend(void)
 {
-	frontswap_ops->init = rswap_frontswap_ops.init;
-	frontswap_ops->store = rswap_frontswap_ops.store;
-	frontswap_ops->load = rswap_frontswap_ops.load;
-	frontswap_ops->invalidate_page = rswap_frontswap_ops.invalidate_page,
-	frontswap_ops->invalidate_area = rswap_frontswap_ops.invalidate_area,
-#ifdef RSWAP_KERNEL_SUPPORT
-	frontswap_ops->load_async = rswap_frontswap_ops.load_async;
-	frontswap_ops->poll_load = rswap_frontswap_ops.poll_load;
-#if RSWAP_KERNEL_SUPPORT >= 2
-	frontswap_ops->store_on_core = rswap_frontswap_ops.store_on_core;
-	frontswap_ops->poll_store = rswap_frontswap_ops.poll_store;
-#endif // RSWAP_KERNEL_SUPPORT >= 2
-#if RSWAP_KERNEL_SUPPORT >= 3
-	frontswap_ops->peek_load = rswap_frontswap_ops.peek_load;
-	frontswap_ops->peek_store = rswap_frontswap_ops.peek_store;
-#endif // RSWAP_KERNEL_SUPPORT >= 3
-#endif
-	pr_info("frontswap ops replaced\n");
-	return 0;
-}
-
-void rswap_deregister_frontswap(void)
-{
-#ifdef RSWAP_KERNEL_SUPPORT
-	frontswap_ops->init = NULL;
-	frontswap_ops->store = NULL;
-	frontswap_ops->load = NULL;
-	frontswap_ops->load_async = NULL;
-	frontswap_ops->poll_load = NULL;
-#else
-	frontswap_ops->init = NULL;
-	frontswap_ops->store = NULL;
-	frontswap_ops->load = NULL;
-	frontswap_ops->poll_load = NULL;
-#endif
-	pr_info("frontswap ops deregistered\n");
+	hermit_unregister_backend(&rswap_backend_ops);
+	pr_info("rswap: Hermit RDMA backend unregistered\n");
 }
 
 int rswap_client_init(char *_server_ip, int _server_port, int _mem_size)
@@ -475,8 +331,11 @@ int rswap_client_init(char *_server_ip, int _server_port, int _mem_size)
 
 	// init the rdma session to memory server
 	ret = init_rdma_sessions(&rdma_session_global);
+	if (unlikely(ret)) {
+		pr_err("%s, init_rdma_sessions failed: %d\n", __func__, ret);
+		goto out;
+	}
 
-	// Build both the RDMA and Disk driver
 	ret = rdma_session_connect(&rdma_session_global);
 	if (unlikely(ret)) {
 		pr_err("%s, rdma_session_connect failed. \n", __func__);

@@ -16,9 +16,10 @@ TIMEOUT_SEC=${TIMEOUT_SEC:-60}
 SMP=${SMP:-4}
 GUEST_RAM_MB=${GUEST_RAM_MB:-4096}
 RSWAP_MEM_GB=${RSWAP_MEM_GB:-1}
+RSWAP_MODULE_ARGS=${RSWAP_MODULE_ARGS:-}
 SWAP_MB=${SWAP_MB:-1024}
 MEMHOG_MB=${MEMHOG_MB:-1600}
-TMPFS_FILL_MB=${TMPFS_FILL_MB:-435}
+TMPFS_FILL_MB=${TMPFS_FILL_MB:-400}
 SKIP_BUILD=${SKIP_BUILD:-0}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
 LAZY_POLL=${LAZY_POLL:-N}
@@ -174,6 +175,14 @@ dump_swap_vmstat() {
     echo "SWAP_VMSTAT: label=\$label pswpin=\$pswpin pswpout=\$pswpout"
 }
 
+read_ramdisk_write_sectors() {
+    if [ -r /sys/block/ram0/stat ]; then
+        awk '{ print \$7 }' /sys/block/ram0/stat
+    else
+        echo 0
+    fi
+}
+
 emit_validation_check() {
     name=\$1
     lhs=\$2
@@ -278,12 +287,13 @@ mdev -s
 run_step mkswap_ramdisk mkswap /dev/ram0
 run_step swapon_ramdisk swapon /dev/ram0
 
-run_step load_rswap_client insmod /rswap-client.ko rmsize=$RSWAP_MEM_GB
+run_step load_rswap_client insmod /rswap-client.ko rmsize=$RSWAP_MEM_GB $RSWAP_MODULE_ARGS
 run_step configure_hermit configure_hermit
 run_step reset_hermit_stats /bin/hermit_swap_stats reset boot
 dump_swap_vmstat boot
 PSWPIN_BOOT=\$(read_vmstat_counter pswpin)
 PSWPOUT_BOOT=\$(read_vmstat_counter pswpout)
+RAMDISK_WRITE_SECTORS_BOOT=\$(read_ramdisk_write_sectors)
 
 mkdir -p /mnt
 run_step mount_tmpfs mount -t tmpfs -o size=${TMPFS_FILL_MB}M tmpfs /mnt
@@ -315,10 +325,10 @@ PSWPIN_BEFORE=\$(read_vmstat_counter pswpin)
 PSWPOUT_BEFORE=\$(read_vmstat_counter pswpout)
 echo "VALIDATION_SNAPSHOT: label=before_reload stores=\$RSWAP_STORES_BEFORE loads=\$RSWAP_LOADS_BEFORE errors=\$RSWAP_ERRORS_BEFORE pswpin=\$PSWPIN_BEFORE pswpout=\$PSWPOUT_BEFORE"
 
-capture_dmesg /tmp/dmesg.before.before_reload
 dump_rswap_dram_stats before_reload
 dump_swap_vmstat before_reload
 /bin/hermit_swap_stats stats before_reload
+:> /tmp/dmesg.before.before_reload
 capture_dmesg /tmp/dmesg.after.before_reload
 emit_new_hermit_dmesg before_reload /tmp/dmesg.before.before_reload /tmp/dmesg.after.before_reload
 
@@ -338,18 +348,20 @@ fi
 memhog_wait_end=\$(now_ms)
 log_timing memhog_wait "\$memhog_wait_start" "\$memhog_wait_end" "pid=\$MEMHOG_PID rc=\$MEMHOG_RC"
 
-capture_dmesg /tmp/dmesg.before.after_reload
 dump_rswap_dram_stats after_reload
 dump_swap_vmstat after_reload
 /bin/hermit_swap_stats stats after_reload
+:> /tmp/dmesg.before.after_reload
 capture_dmesg /tmp/dmesg.after.after_reload
 emit_new_hermit_dmesg after_reload /tmp/dmesg.before.after_reload /tmp/dmesg.after.after_reload
 
+RSWAP_STORES_AFTER=\$(read_rswap_dram_counter stores)
 RSWAP_LOADS_AFTER=\$(read_rswap_dram_counter loads)
 RSWAP_ERRORS_AFTER=\$(read_rswap_dram_counter errors)
 PSWPIN_AFTER=\$(read_vmstat_counter pswpin)
 PSWPOUT_AFTER=\$(read_vmstat_counter pswpout)
-echo "VALIDATION_SNAPSHOT: label=after_reload stores=\$RSWAP_STORES_BEFORE loads=\$RSWAP_LOADS_AFTER errors=\$RSWAP_ERRORS_AFTER pswpin=\$PSWPIN_AFTER pswpout=\$PSWPOUT_AFTER memhog_rc=\$MEMHOG_RC"
+RAMDISK_WRITE_SECTORS_AFTER=\$(read_ramdisk_write_sectors)
+echo "VALIDATION_SNAPSHOT: label=after_reload stores=\$RSWAP_STORES_AFTER loads=\$RSWAP_LOADS_AFTER errors=\$RSWAP_ERRORS_AFTER pswpin=\$PSWPIN_AFTER pswpout=\$PSWPOUT_AFTER memhog_rc=\$MEMHOG_RC"
 
 boot_end_ms=\$(now_ms)
 log_timing end_to_end_guest "\$boot_start_ms" "\$boot_end_ms" "stores_before=\$RSWAP_STORES_BEFORE loads_before=\$RSWAP_LOADS_BEFORE loads_after=\$RSWAP_LOADS_AFTER errors_after=\$RSWAP_ERRORS_AFTER pswpin_boot=\$PSWPIN_BOOT pswpout_boot=\$PSWPOUT_BOOT pswpin_after=\$PSWPIN_AFTER pswpout_after=\$PSWPOUT_AFTER pswpin_delta=\$((PSWPIN_AFTER - PSWPIN_BOOT)) pswpout_delta=\$((PSWPOUT_AFTER - PSWPOUT_BOOT)) memhog_rc=\$MEMHOG_RC"
@@ -371,6 +383,9 @@ if ! emit_validation_check pswpout_after_gt_boot "\$PSWPOUT_AFTER" gt "\$PSWPOUT
     VALIDATION_PASS=0
 fi
 if ! emit_validation_check memhog_rc_eq_0 "\$MEMHOG_RC" eq 0; then
+    VALIDATION_PASS=0
+fi
+if ! emit_validation_check local_swap_write_sectors_unchanged "\$RAMDISK_WRITE_SECTORS_AFTER" eq "\$RAMDISK_WRITE_SECTORS_BOOT"; then
     VALIDATION_PASS=0
 fi
 

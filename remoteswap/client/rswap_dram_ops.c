@@ -1,10 +1,16 @@
 #include <linux/errno.h>
 #include <linux/hermit_backend.h>
+#include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/swapops.h>
 
 #include "rswap_dram.h"
 #include "rswap_ops.h"
+
+static bool force_local;
+module_param(force_local, bool, 0644);
+MODULE_PARM_DESC(force_local,
+		 "force native swap writes (diagnostic validation only)");
 
 static size_t rswap_entry_offset(swp_entry_t entry)
 {
@@ -18,6 +24,8 @@ static int rswap_hermit_store(swp_entry_t entry, struct page *page, int cpu,
 
 	(void)cpu;
 	(void)async;
+	if (force_local)
+		return -EOPNOTSUPP;
 
 	ret = rswap_dram_write(page, rswap_entry_offset(entry));
 	if (unlikely(ret))
@@ -52,7 +60,7 @@ static int rswap_hermit_poll_load(int cpu)
 static int rswap_hermit_peek_load(int cpu)
 {
 	(void)cpu;
-	return 1;
+	return 0;
 }
 
 static const struct hermit_backend_ops rswap_hermit_ops = {

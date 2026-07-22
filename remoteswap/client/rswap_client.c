@@ -26,7 +26,7 @@ module_param_named(sport, server_port, int, 0644);
 module_param_named(rmsize, remote_mem_size, int, 0644);
 
 // invoked by insmod
-int __init rswap_cpu_init(void)
+static int __init rswap_cpu_init(void)
 {
 	int ret = 0;
 
@@ -49,7 +49,7 @@ out:
 }
 
 // invoked by rmmod
-void __exit rswap_cpu_exit(void)
+static void __exit rswap_cpu_exit(void)
 {
 	printk(" Prepare to remove the CPU Server module.\n");
 	rswap_unregister_backend();

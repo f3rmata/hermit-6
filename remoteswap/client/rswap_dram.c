@@ -1,5 +1,6 @@
 #include <linux/errno.h>
 #include <linux/bitops.h>
+#include <linux/crc32.h>
 #include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/printk.h>
@@ -12,6 +13,7 @@ static void *local_dram;
 static uint64_t local_mem_size;
 static unsigned long local_nr_pages;
 static unsigned long *local_dram_valid;
+static u32 *local_dram_crc;
 static struct dentry *rswap_dram_debugfs_dir;
 
 static atomic_t rswap_dram_stores;
@@ -71,6 +73,7 @@ int rswap_dram_write(struct page *page, size_t roffset)
 {
 	void *page_vaddr;
 	unsigned long pgidx;
+	u32 crc;
 	int ret;
 
 	ret = rswap_dram_check_offset(roffset);
@@ -83,9 +86,11 @@ int rswap_dram_write(struct page *page, size_t roffset)
 
 	pgidx = rswap_dram_offset_to_page(roffset);
 	page_vaddr = kmap_atomic(page);
+	crc = crc32_le(~0U, page_vaddr, PAGE_SIZE);
 	copy_page((void *)(local_dram + roffset), page_vaddr);
 	kunmap_atomic(page_vaddr);
 
+	WRITE_ONCE(local_dram_crc[pgidx], crc);
 	set_bit(pgidx, local_dram_valid);
 	atomic_inc(&rswap_dram_stores);
 	return 0;
@@ -95,6 +100,7 @@ int rswap_dram_read(struct page *page, size_t roffset)
 {
 	void *page_vaddr;
 	unsigned long pgidx;
+	u32 crc;
 	int ret;
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
@@ -111,12 +117,19 @@ int rswap_dram_read(struct page *page, size_t roffset)
 	pgidx = rswap_dram_offset_to_page(roffset);
 	if (!test_bit(pgidx, local_dram_valid)) {
 		atomic_inc(&rswap_dram_load_misses);
+		pr_err_ratelimited("rswap_dram: load miss page=%lu\n", pgidx);
 		return -ENOENT;
 	}
-
 	page_vaddr = kmap_atomic(page);
 	copy_page(page_vaddr, (void *)(local_dram + roffset));
+	crc = crc32_le(~0U, page_vaddr, PAGE_SIZE);
 	kunmap_atomic(page_vaddr);
+	if (crc != READ_ONCE(local_dram_crc[pgidx])) {
+		atomic_inc(&rswap_dram_errors);
+		pr_err_ratelimited("rswap_dram: checksum mismatch for page %lu\n",
+				   pgidx);
+		return -EIO;
+	}
 
 	folio_mark_uptodate(page_folio(page));
 	atomic_inc(&rswap_dram_loads);
@@ -140,11 +153,20 @@ int rswap_init_local_dram(int _mem_size)
 		       local_mem_size);
 		return -ENOMEM;
 	}
+	local_dram_crc = vzalloc(local_nr_pages * sizeof(*local_dram_crc));
+	if (!local_dram_crc) {
+		vfree(local_dram_valid);
+		local_dram_valid = NULL;
+		local_nr_pages = 0;
+		return -ENOMEM;
+	}
 
 	local_dram = vzalloc(local_mem_size);
 	if (!local_dram) {
 		pr_err("failed to allocate local dram 0x%llx bytes for debug\n",
 		       local_mem_size);
+		vfree(local_dram_crc);
+		local_dram_crc = NULL;
 		vfree(local_dram_valid);
 		local_dram_valid = NULL;
 		local_nr_pages = 0;
@@ -164,8 +186,11 @@ int rswap_remove_local_dram(void)
 		vfree(local_dram);
 	if (local_dram_valid)
 		vfree(local_dram_valid);
+	if (local_dram_crc)
+		vfree(local_dram_crc);
 	local_dram = NULL;
 	local_dram_valid = NULL;
+	local_dram_crc = NULL;
 	local_nr_pages = 0;
 	pr_info("Free the allocated local_dram 0x%llx bytes \n",
 		local_mem_size);
