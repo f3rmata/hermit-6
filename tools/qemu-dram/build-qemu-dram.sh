@@ -76,6 +76,10 @@ prepare_kernel_config() {
             -e MEMCG \
             -e SWAP \
             -e DEBUG_FS \
+            -e TRANSPARENT_HUGEPAGE \
+            -d TRANSPARENT_HUGEPAGE_ALWAYS \
+            -e TRANSPARENT_HUGEPAGE_MADVISE \
+            -d TRANSPARENT_HUGEPAGE_NEVER \
             -m BLK_DEV_RAM \
             -d ZSWAP
     fi

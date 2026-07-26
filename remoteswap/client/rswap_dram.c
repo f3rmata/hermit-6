@@ -104,7 +104,6 @@ int rswap_dram_read(struct page *page, size_t roffset)
 	int ret;
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
-	VM_BUG_ON_PAGE(PageUptodate(page), page);
 
 	ret = rswap_dram_check_offset(roffset);
 	if (unlikely(ret)) {
@@ -131,8 +130,35 @@ int rswap_dram_read(struct page *page, size_t roffset)
 		return -EIO;
 	}
 
-	folio_mark_uptodate(page_folio(page));
 	atomic_inc(&rswap_dram_loads);
+	return 0;
+}
+
+int rswap_dram_write_folio(struct folio *folio, size_t roffset)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		ret = rswap_dram_write(folio_page(folio, i),
+				       roffset + i * PAGE_SIZE);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+int rswap_dram_read_folio(struct folio *folio, size_t roffset)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		ret = rswap_dram_read(folio_page(folio, i),
+				      roffset + i * PAGE_SIZE);
+		if (ret)
+			return ret;
+	}
 	return 0;
 }
 

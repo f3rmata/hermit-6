@@ -69,6 +69,7 @@ for load in $LOADS; do
     wait_samples=$WAIT_LAST_SAMPLES
     wait_last_delta=$WAIT_LAST_DELTA
 
+    require_memcached_healthy
     reset_hermit_stats "before-${load}-r${repeat}" > "$RESULT_DIR/hermit-reset-${load}-r${repeat}.log" 2>&1 || true
 
     before_kv="$RESULT_DIR/counters-before-${load}-r${repeat}.kv"

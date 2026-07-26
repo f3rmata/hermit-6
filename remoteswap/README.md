@@ -61,10 +61,31 @@ After the RDMA session is connected, successful Hermit registration emits:
 rswap: Hermit RDMA backend registered
 ```
 
-Hermit then stores order-0 swap folios remotely. A successful remote store is
-authoritative and skips the local swap BIO; a failed store falls back to the
-native swap path. Direct asynchronous swapin and lazy polling are controlled
-through `/sys/kernel/debug/hermit/`.
+Hermit stores folios from order 0 through `PMD_ORDER`. A successful remote
+store is authoritative and skips the local swap BIO; a failed store falls back
+to the native swap path. Direct asynchronous swapin and lazy polling are
+controlled through `/sys/kernel/debug/hermit/`.
+
+The transfer size is selected with `remote_order_mask`. Bit 0 is 4 KiB, bit 2
+is 16 KiB, and bit 9 is 2 MiB; bit 1 is not valid. The default is `0x1`, and
+bit 0 is mandatory so every configuration has a base-page path. For example:
+
+```bash
+# Enable 4 KiB, 64 KiB and 2 MiB transfers.
+echo 0x211 | sudo tee /sys/kernel/debug/hermit/remote_order_mask
+cat /sys/kernel/debug/hermit/effective_order_mask
+cat /sys/kernel/debug/hermit/order_stats
+```
+
+When a large order is enabled, the RDMA backend first submits one variable-size
+WR for the physically contiguous folio. A DMA-map, post, or completion failure
+causes the request to be retried as one 4 KiB WR per base page. If the order is
+disabled, the backend uses those 4 KiB WRs directly. `max_order` limits the
+largest single WR supported by the RDMA client, and `effective_order_mask` is
+the intersection of that capability with the runtime mask.
+
+The mask changes Hermit's transport only. THP/mTHP allocation remains under
+Linux's `/sys/kernel/mm/transparent_hugepage/` controls.
 
 Before unloading the client, disable the associated swap device and ensure no
 remote entries or outstanding RDMA requests remain:
@@ -77,8 +98,13 @@ sudo rmmod rswap_client
 ## Validation
 
 `BACKEND=DRAM` plus `tools/qemu-dram/validate-qemu-dram.sh` validates data
-checksums, backend counters, swap vmstat, profiling output, and the absence of
-local swap writes after successful remote stores.
+checksums, runtime mask switching, per-order counters, swap vmstat, profiling
+output, and the absence of local swap writes after successful remote stores.
+
+Use `THP_SIZE_KB=64 REMOTE_ORDER_MASK=0x11 BYPASS_SWAPCACHE=Y` to cover mTHP
+large-folio store and load. Use `THP_SIZE_KB=2048 REMOTE_ORDER_MASK=0x201` to
+cover PMD-sized THP store. Linux 6.18's PTE swapin aggregation currently covers
+mTHP orders below `PMD_ORDER`, so the 2 MiB case does not imply an order-9 load.
 
 An RDMA build only proves API and symbol compatibility. End-to-end validation
 also requires the matching OFED runtime, a supported NIC, a reachable memory

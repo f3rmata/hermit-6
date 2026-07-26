@@ -183,6 +183,8 @@ LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-}
 MEMCACHED_MEM_MB=${MEMCACHED_MEM_MB:-16384}
 MEMCACHED_MAX_CONN=${MEMCACHED_MAX_CONN:-32768}
 STHD_CNT=${STHD_CNT:-16}
+RECLAIM_MODE=${RECLAIM_MODE:-1}
+RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-65536}
 LAZY_POLL=${LAZY_POLL:-N}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
 HERMIT_SWAPOUT_POLICY=${HERMIT_SWAPOUT_POLICY:-exclusive}
@@ -441,6 +443,39 @@ cgroup_current_bytes() {
   fi
 }
 
+cgroup_value() {
+  local file=$1
+  local path
+
+  [[ "$MODE" == cgroup-* ]] || {
+    printf '0'
+    return 0
+  }
+  path=$(cgroup_path)
+  if [ -r "$path/$file" ]; then
+    cat "$path/$file"
+  else
+    printf '0'
+  fi
+}
+
+cgroup_event_value() {
+  local key=$1
+  local path
+
+  [[ "$MODE" == cgroup-* ]] || {
+    printf '0'
+    return 0
+  }
+  path=$(cgroup_path)
+  if [ -r "$path/memory.events" ]; then
+    awk -v key="$key" '$1 == key { print $2; found=1 } END { if (!found) print 0 }' \
+      "$path/memory.events"
+  else
+    printf '0'
+  fi
+}
+
 apply_requested_cgroup_limit() {
   local cur limit_mb
 
@@ -513,6 +548,12 @@ read_hermit_counter() {
 detect_rswap_backend() {
   if sudo_test -d /sys/kernel/debug/rswap_rdma 2>/dev/null; then
     printf 'rdma'
+  elif [ -d /sys/module/rswap_client ] &&
+       [ -r /sys/module/rswap_client/parameters/sip ]; then
+    # The hardware OFED backend does not expose the optional rswap_rdma
+    # debugfs counters in every revision. A loaded module with live RDMA
+    # connection parameters is still an RDMA backend.
+    printf 'rdma'
   elif sudo_test -d /sys/kernel/debug/rswap_dram 2>/dev/null; then
     printf 'dram'
   else
@@ -536,7 +577,9 @@ configure_hermit_mode() {
   done
 
   set_debugfs_file /sys/kernel/debug/hermit/sthd_cnt "$STHD_CNT"
-  set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode 0
+  set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode "$RECLAIM_MODE"
+  set_debugfs_file /sys/kernel/debug/hermit/reclaim_headroom_pages \
+    "$RECLAIM_HEADROOM_PAGES"
 
   case "$MODE" in
     cgroup-hermit|hermit)
@@ -568,7 +611,9 @@ configure_hermit_mode() {
         rdma_die "Hermit benchmark requires rswap backend '$RSWAP_REQUIRED_BACKEND', found '$backend'. Load the RDMA client or set RSWAP_REQUIRED_BACKEND= to disable this check."
       fi
       set_debugfs_file /sys/kernel/debug/hermit/sthd_cnt "$STHD_CNT"
-      set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode 0
+      set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode "$RECLAIM_MODE"
+      set_debugfs_file /sys/kernel/debug/hermit/reclaim_headroom_pages \
+        "$RECLAIM_HEADROOM_PAGES"
       ;;
     cgroup-linux|linux|local)
       if sudo_test -d /sys/kernel/debug/rswap_rdma 2>/dev/null || \
@@ -674,10 +719,27 @@ read_activity_total() {
   printf '%s' "$total"
 }
 
+memcached_is_healthy() {
+  local pid
+
+  [ -s "$PID_FILE" ] || return 1
+  pid=$(cat "$PID_FILE")
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  memcached_stats | grep -q '^STAT '
+}
+
+require_memcached_healthy() {
+  if ! memcached_is_healthy; then
+    rdma_die "memcached is not alive or not responding (pid file: $PID_FILE)"
+  fi
+}
+
 wait_for_swap_stable() {
   local label=$1
   local wait_log=$2
   local start_ts now_ts elapsed start_total prev curr delta quiet samples status
+  local oom_start oom_now failed
 
   WAIT_LAST_STATUS=disabled
   WAIT_LAST_SECONDS=0
@@ -701,10 +763,24 @@ wait_for_swap_stable() {
   quiet=0
   samples=0
   status=timeout
+  failed=0
+  oom_start=$(cgroup_event_value oom_kill)
   now_ts=$start_ts
   elapsed=0
 
   while true; do
+    oom_now=$(cgroup_event_value oom_kill)
+    if [ "$oom_now" -gt "$oom_start" ]; then
+      status=oom-killed
+      failed=1
+      break
+    fi
+    if ! memcached_is_healthy; then
+      status=server-dead
+      failed=1
+      break
+    fi
+
     sleep "$SWAP_STABLE_INTERVAL_SEC"
     samples=$((samples + 1))
     curr=$(read_activity_total)
@@ -734,6 +810,11 @@ wait_for_swap_stable() {
   printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
     "$label" "$start_ts" "$now_ts" "$elapsed" "$status" "$samples" \
     "$start_total" "$curr" "$delta" "$WAIT_STABLE_KEYS" >> "$wait_log"
+
+  if [ "$failed" -ne 0 ]; then
+    rdma_log "swap wait failed: status=$status label=$label"
+    return 1
+  fi
 }
 
 memcached_stats() {
@@ -781,6 +862,11 @@ capture_counters() {
     printf 'pswpout=%s\n' "$(read_vmstat_key pswpout)"
     printf 'pgfault=%s\n' "$(read_vmstat_key pgfault)"
     printf 'pgmajfault=%s\n' "$(read_vmstat_key pgmajfault)"
+    printf 'cgroup_memory_current=%s\n' "$(cgroup_value memory.current)"
+    printf 'cgroup_memory_max=%s\n' "$(cgroup_value memory.max)"
+    printf 'cgroup_swap_current=%s\n' "$(cgroup_value memory.swap.current)"
+    printf 'cgroup_oom=%s\n' "$(cgroup_event_value oom)"
+    printf 'cgroup_oom_kill=%s\n' "$(cgroup_event_value oom_kill)"
     printf 'backend_loads=%s\n' "$(read_debug_counter loads)"
     printf 'backend_stores=%s\n' "$(read_debug_counter stores)"
     printf 'backend_load_misses=%s\n' "$(read_debug_counter load_misses)"
@@ -824,6 +910,8 @@ save_config() {
     printf 'mutilate_cores=%s\n' "${MUTILATE_CORES:-}"
     printf 'hermit_reserved_cores=%s\n' "${HERMIT_RESERVED_CORES:-}"
     printf 'sthd_cnt=%s\n' "$STHD_CNT"
+    printf 'reclaim_mode=%s\n' "$RECLAIM_MODE"
+    printf 'reclaim_headroom_pages=%s\n' "$RECLAIM_HEADROOM_PAGES"
     printf 'bypass_swapcache=%s\n' "$BYPASS_SWAPCACHE"
     printf 'lazy_poll=%s\n' "$LAZY_POLL"
     printf 'hermit_swapout_policy=%s\n' "$HERMIT_SWAPOUT_POLICY"

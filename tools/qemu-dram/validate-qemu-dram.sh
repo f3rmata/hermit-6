@@ -23,6 +23,10 @@ TMPFS_FILL_MB=${TMPFS_FILL_MB:-400}
 SKIP_BUILD=${SKIP_BUILD:-0}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
 LAZY_POLL=${LAZY_POLL:-N}
+RECLAIM_MODE=${RECLAIM_MODE:-1}
+RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-65536}
+REMOTE_ORDER_MASK=${REMOTE_ORDER_MASK:-0x1}
+THP_SIZE_KB=${THP_SIZE_KB:-0}
 MEMHOG_READY_TIMEOUT_SEC=${MEMHOG_READY_TIMEOUT_SEC:-180}
 
 default_sthd_cnt=$SMP
@@ -162,6 +166,24 @@ dump_rswap_dram_stats() {
     echo "RSWAP_DRAM_STATS: label=\$label stores=\$stores loads=\$loads load_misses=\$load_misses errors=\$errors"
 }
 
+dump_hermit_order_stats() {
+    label=\$1
+    stats=/sys/kernel/debug/hermit/order_stats
+
+    [ -r "\$stats" ] || return 0
+    while IFS= read -r line; do
+        echo "HERMIT_ORDER_STATS: label=\$label \$line"
+    done < "\$stats"
+}
+
+read_hermit_order_counter() {
+    size_bytes=\$1
+    column=\$2
+    awk -v size="\$size_bytes" -v field="\$column" \
+        '\$2 == size { print \$field }' \
+        /sys/kernel/debug/hermit/order_stats
+}
+
 read_vmstat_counter() {
     counter_name=\$1
     awk -v key="\$counter_name" '\$1 == key { print \$2; found = 1 } END { if (!found) print 0 }' /proc/vmstat
@@ -262,6 +284,61 @@ configure_hermit() {
     set_hermit_flag lazy_poll $LAZY_POLL
     set_hermit_flag apt_reclaim Y
     set_hermit_flag sthd_cnt $STHD_CNT
+    set_hermit_flag reclaim_mode $RECLAIM_MODE
+    set_hermit_flag reclaim_headroom_pages $RECLAIM_HEADROOM_PAGES
+    set_hermit_flag remote_order_mask $REMOTE_ORDER_MASK
+}
+
+verify_remote_order_mask() {
+    requested=$REMOTE_ORDER_MASK
+    probe=0x11
+    remote=/sys/kernel/debug/hermit/remote_order_mask
+    effective=/sys/kernel/debug/hermit/effective_order_mask
+
+    [ -r "\$remote" ] && [ -w "\$remote" ] && [ -r "\$effective" ] || {
+        echo "HERMIT_ORDER_MASK: status=unavailable"
+        return 1
+    }
+    if [ "\$requested" = "\$probe" ]; then
+        probe=0x1
+    fi
+
+    printf '%s' "\$probe" > "\$remote" || return 1
+    observed_probe=\$(cat "\$remote")
+    printf '%s' "\$requested" > "\$remote" || return 1
+    observed_remote=\$(cat "\$remote")
+    observed_effective=\$(cat "\$effective")
+    echo "HERMIT_ORDER_MASK: requested=\$requested probe=\$observed_probe remote=\$observed_remote effective=\$observed_effective status=checked"
+
+    [ \$((observed_probe)) -eq \$((probe)) ] &&
+        [ \$((observed_remote)) -eq \$((requested)) ] &&
+        [ \$((observed_effective)) -eq \$((requested)) ]
+}
+
+configure_thp() {
+    [ "$THP_SIZE_KB" -gt 0 ] || return 0
+
+    for enabled in /sys/kernel/mm/transparent_hugepage/hugepages-*kB/enabled; do
+        [ -w "\$enabled" ] && echo never > "\$enabled"
+    done
+    selected="/sys/kernel/mm/transparent_hugepage/hugepages-${THP_SIZE_KB}kB/enabled"
+    if [ ! -w "\$selected" ]; then
+        echo "THP_CONFIG: size_kb=$THP_SIZE_KB status=unavailable"
+        return 1
+    fi
+    echo always > "\$selected"
+    echo "THP_CONFIG: size_kb=$THP_SIZE_KB status=ok"
+}
+
+dump_thp_stats() {
+    label=\$1
+    [ "$THP_SIZE_KB" -gt 0 ] || return 0
+    stats="/sys/kernel/mm/transparent_hugepage/hugepages-${THP_SIZE_KB}kB/stats"
+    for counter in anon_fault_alloc nr_anon split split_failed swpout swpout_fallback; do
+        [ -r "\$stats/\$counter" ] || continue
+        value=\$(cat "\$stats/\$counter")
+        echo "THP_STATS: label=\$label size_kb=$THP_SIZE_KB counter=\$counter value=\$value"
+    done
 }
 
 ln -sf /proc/mounts /etc/mtab
@@ -289,6 +366,8 @@ run_step swapon_ramdisk swapon /dev/ram0
 
 run_step load_rswap_client insmod /rswap-client.ko rmsize=$RSWAP_MEM_GB $RSWAP_MODULE_ARGS
 run_step configure_hermit configure_hermit
+run_step verify_remote_order_mask verify_remote_order_mask
+run_step configure_thp configure_thp
 run_step reset_hermit_stats /bin/hermit_swap_stats reset boot
 dump_swap_vmstat boot
 PSWPIN_BOOT=\$(read_vmstat_counter pswpin)
@@ -308,6 +387,7 @@ if ! run_step wait_memhog_ready wait_for_memhog_ready "\$MEMHOG_PID" /tmp/memhog
     echo "VALIDATION: FAIL"
     poweroff -f
 fi
+dump_thp_stats after_memhog
 
 dd_start=\$(now_ms)
 dd if=/dev/zero of=/mnt/fill bs=1M count=$TMPFS_FILL_MB || true
@@ -321,11 +401,18 @@ run_step settle_after_pressure sleep 2
 RSWAP_STORES_BEFORE=\$(read_rswap_dram_counter stores)
 RSWAP_LOADS_BEFORE=\$(read_rswap_dram_counter loads)
 RSWAP_ERRORS_BEFORE=\$(read_rswap_dram_counter errors)
+if [ "$THP_SIZE_KB" -gt 0 ]; then
+    LARGE_STORES_BEFORE=\$(read_hermit_order_counter $((THP_SIZE_KB * 1024)) 3)
+else
+    LARGE_STORES_BEFORE=0
+fi
 PSWPIN_BEFORE=\$(read_vmstat_counter pswpin)
 PSWPOUT_BEFORE=\$(read_vmstat_counter pswpout)
 echo "VALIDATION_SNAPSHOT: label=before_reload stores=\$RSWAP_STORES_BEFORE loads=\$RSWAP_LOADS_BEFORE errors=\$RSWAP_ERRORS_BEFORE pswpin=\$PSWPIN_BEFORE pswpout=\$PSWPOUT_BEFORE"
 
 dump_rswap_dram_stats before_reload
+dump_thp_stats before_reload
+dump_hermit_order_stats before_reload
 dump_swap_vmstat before_reload
 /bin/hermit_swap_stats stats before_reload
 :> /tmp/dmesg.before.before_reload
@@ -349,6 +436,7 @@ memhog_wait_end=\$(now_ms)
 log_timing memhog_wait "\$memhog_wait_start" "\$memhog_wait_end" "pid=\$MEMHOG_PID rc=\$MEMHOG_RC"
 
 dump_rswap_dram_stats after_reload
+dump_hermit_order_stats after_reload
 dump_swap_vmstat after_reload
 /bin/hermit_swap_stats stats after_reload
 :> /tmp/dmesg.before.after_reload
@@ -358,6 +446,11 @@ emit_new_hermit_dmesg after_reload /tmp/dmesg.before.after_reload /tmp/dmesg.aft
 RSWAP_STORES_AFTER=\$(read_rswap_dram_counter stores)
 RSWAP_LOADS_AFTER=\$(read_rswap_dram_counter loads)
 RSWAP_ERRORS_AFTER=\$(read_rswap_dram_counter errors)
+if [ "$THP_SIZE_KB" -gt 0 ]; then
+    LARGE_LOADS_AFTER=\$(read_hermit_order_counter $((THP_SIZE_KB * 1024)) 4)
+else
+    LARGE_LOADS_AFTER=0
+fi
 PSWPIN_AFTER=\$(read_vmstat_counter pswpin)
 PSWPOUT_AFTER=\$(read_vmstat_counter pswpout)
 RAMDISK_WRITE_SECTORS_AFTER=\$(read_ramdisk_write_sectors)
@@ -387,6 +480,17 @@ if ! emit_validation_check memhog_rc_eq_0 "\$MEMHOG_RC" eq 0; then
 fi
 if ! emit_validation_check local_swap_write_sectors_unchanged "\$RAMDISK_WRITE_SECTORS_AFTER" eq "\$RAMDISK_WRITE_SECTORS_BOOT"; then
     VALIDATION_PASS=0
+fi
+if [ "$THP_SIZE_KB" -gt 0 ]; then
+    if ! emit_validation_check large_stores_before_gt_0 "\${LARGE_STORES_BEFORE:-0}" gt 0; then
+        VALIDATION_PASS=0
+    fi
+fi
+if [ "$THP_SIZE_KB" -gt 0 ] && [ "$THP_SIZE_KB" -lt 2048 ] &&
+   [ "$BYPASS_SWAPCACHE" = Y ]; then
+    if ! emit_validation_check large_loads_after_gt_0 "\${LARGE_LOADS_AFTER:-0}" gt 0; then
+        VALIDATION_PASS=0
+    fi
 fi
 
 if [ "\$VALIDATION_PASS" -eq 1 ]; then
@@ -427,7 +531,7 @@ run_qemu() {
 
 extract_summary() {
     if [ -f "$SERIAL_LOG" ]; then
-        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|RSWAP_DRAM_STATS|SWAP_VMSTAT|VALIDATION):' "$SERIAL_LOG" || true
+        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|VALIDATION):' "$SERIAL_LOG" || true
     fi
 }
 

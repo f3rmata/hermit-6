@@ -17,20 +17,22 @@ is split into control (`mm/hermit.c`), backend dispatch and remote-entry
 tracking (`mm/hermit_backend.c`), and stable statistics/ABI
 (`mm/hermit_stats.c`).
 
-Linux 6.18 folio APIs are used throughout. Backend I/O is limited to order-0
-folios; larger folios stay on the native swap path. The memcg reclaim call uses
-the 6.18 five-argument `try_to_free_mem_cgroup_pages()` interface.
+Linux 6.18 folio APIs are used throughout. Backend I/O accepts order 0 through
+`PMD_ORDER`; `CONFIG_HERMIT` selects `ARCH_WANTS_THP_SWAP` so THP swap support
+can be enabled. The memcg reclaim call uses the 6.18 five-argument
+`try_to_free_mem_cgroup_pages()` interface.
 
 ## Authoritative copy protocol
 
-Each swap entry has an XArray marker only after a backend store succeeds. The
-state transitions are:
+Each remote folio is represented by an XArray extent. All slots are reserved
+before I/O and become committed markers only after the complete backend store
+succeeds. The state transitions are:
 
 ```text
-new writeout -> clear old remote marker
-remote store succeeds -> install marker -> skip local swap BIO
-remote store fails -> no marker -> native swap write
-slot freed/reused -> erase marker
+new writeout -> reserve every slot in the folio extent
+remote store succeeds -> commit every marker -> skip local swap BIO
+remote store fails -> erase reservations -> native swap write
+slot freed/reused -> erase that marker (partial invalidation is supported)
 ```
 
 Zeromap, zswap, and native local writes start a new generation with the remote
@@ -41,21 +43,56 @@ written.
 ## Swapin
 
 The normal swapcache path calls the backend synchronously for remote entries.
-With `bypass_swapcache=Y`, an entry is eligible for direct swapin only when it
-is remote-marked, has a single swap reference, and can be represented by an
-order-0 folio.
+A large read is accepted only when the entire candidate range belongs to one
+committed extent. With `bypass_swapcache=Y`, an entry is eligible for direct
+swapin when it is remote-marked and has a single swap reference. Linux 6.18's
+PTE fault allocator can reconstruct mTHP orders 2–8; PMD-order THP swapout is
+supported, but the same PTE fault path deliberately excludes `PMD_ORDER`.
 
-With `speculative_io=Y`, the load is issued before fault metadata work. The
-saved CPU identifies the RDMA queue used for the later poll. With
-`lazy_poll=Y`, `peek_load()` first processes completions until the request is
-ready, then `poll_load()` drains the queue and returns any completion error.
+With `speculative_io=Y`, the load is issued before fault metadata work. A
+request-scoped `hermit_io` identifies the folio, transfer order, queue CPU,
+backend transaction and completion status. With `lazy_poll=Y`, non-blocking
+poll returns `-EAGAIN` until that specific transaction completes; blocking
+poll waits and returns its completion status.
+
+## Transfer order and RDMA fallback
+
+`/sys/kernel/debug/hermit/remote_order_mask` is writable at runtime. Bit 0 is
+4 KiB, bits 2 through 9 are 16 KiB through 2 MiB, and the default is `0x1`.
+Bit 0 is mandatory. `effective_order_mask` reports the intersection with the
+registered backend's `supported_order_mask`; `order_stats` reports per-order
+stores, loads, 4 KiB fallbacks and errors. This control affects transfer I/O
+only and does not change Linux THP/mTHP allocation policy.
+
+For an enabled large order the RDMA backend maps the contiguous folio and posts
+one variable-length WR. DMA-map, post, and work-completion failures are retried
+as one 4 KiB child WR per base page. Each child records its actual DMA length
+and direction, and the parent transaction owns the pending count and first
+error. Async polling therefore observes one logical request even when fallback
+creates many WRs.
 
 ## Memcg reclaim
 
 When `apt_reclaim=Y`, a non-root memcg with a finite `memory.max` schedules
-asynchronous reclaim when its margin falls below 2048 pages. `reclaim_mode=1`
-uses up to `sthd_cnt` work items; other modes use one. Work is cancelled before
-the memcg is freed.
+asynchronous reclaim before a charge reaches the hard limit. The target margin
+is controlled by `/sys/kernel/debug/hermit/reclaim_headroom_pages`; it defaults
+to 65536 pages (256 MiB on x86-64), and writing zero disables proactive
+reclaim without changing `apt_reclaim`.
+
+`reclaim_mode=1` uses up to `sthd_cnt` work items on the unbound workqueue;
+other modes use one. Concurrent workers divide the current margin deficit
+instead of each reclaiming the entire deficit. A worker that made progress
+requeues itself when the retry budget expires and the margin is still below
+the target. Work is cancelled before the memcg is freed.
+
+The RDMA benchmark defaults to the concurrent configuration below. Both values
+can be overridden per run:
+
+```bash
+export RECLAIM_MODE=1
+export RECLAIM_HEADROOM_PAGES=65536
+export STHD_CNT=16
+```
 
 ## Preserved ABI
 
@@ -80,12 +117,15 @@ built for this exact 6.18 kernel; enabling the kernel tree's in-tree
 | DRAM client | target kernel tree | `rswap-client.ko` links |
 | QEMU normal poll | TCG/KVM | checksum and all validation checks pass |
 | QEMU lazy poll | TCG/KVM | same checks with `LAZY_POLL=Y` |
+| QEMU 64 KiB mTHP | TCG/KVM | order-4 store/load, checksum and mask switch pass |
+| QEMU 2 MiB THP | TCG/KVM | order-9 store, checksum and no backend errors |
+| RDMA source object | target kernel RDMA headers | `rswap_rdma_ops.o` compiles |
 | RDMA client | matching OFED tree | modpost has no unresolved/CRC errors |
 | RDMA end to end | NIC + memory server | connect, pressure, reload checksum pass |
 
-The last two checks require an external OFED installation and, for end-to-end
-testing, actual RDMA hardware and a running server. They must not be inferred
-from the DRAM QEMU result.
+OFED modpost and RDMA end-to-end checks require an external OFED installation;
+end-to-end testing additionally needs actual RDMA hardware and a running
+server. They must not be inferred from the DRAM QEMU or source-object result.
 
 ## Known constraints
 

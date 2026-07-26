@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -93,6 +94,7 @@ int main(int argc, char **argv)
     size_t bytes;
     char *buf;
     int reload_on_signal = 0;
+    int ret;
     unsigned long delta_ms;
     unsigned long long expected_checksum;
 
@@ -117,11 +119,13 @@ int main(int argc, char **argv)
     }
 
     bytes = mib * 1024ULL * 1024ULL;
-    buf = malloc(bytes);
-    if (!buf) {
-        perror("malloc");
+    ret = posix_memalign((void **)&buf, 2ULL * 1024 * 1024, bytes);
+    if (ret != 0) {
+        fprintf(stderr, "posix_memalign: %s\n", strerror(ret));
         return 1;
     }
+    if (madvise(buf, bytes, MADV_HUGEPAGE) != 0)
+        perror("madvise MADV_HUGEPAGE");
 
     delta_ms = touch_buffer(buf, bytes, &expected_checksum);
     fprintf(stdout, "memhog touched %zu MiB\n", mib);

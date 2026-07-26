@@ -103,6 +103,9 @@ struct fs_rdma_req {
 	struct ib_rdma_wr rdma_wr;
 
 	struct rswap_rdma_queue *rdma_queue;
+	void *io_context;
+	size_t dma_len;
+	enum dma_data_direction dma_dir;
 };
 
 struct two_sided_rdma_send {
@@ -217,9 +220,6 @@ void two_sided_message_done(struct ib_cq *cq, struct ib_wc *wc);
 int handle_recv_wr(struct rswap_rdma_queue *rdma_queue, struct ib_wc *wc);
 int send_message_to_remote(struct rdma_session_context *rdma_session,
 			   int rdma_queue_ind, int messge_type, int chunk_num);
-
-int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
-		    enum rdma_queue_type type);
 
 void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue);
 void drain_all_rdma_queues(int target_mem_server);

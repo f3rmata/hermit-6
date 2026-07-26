@@ -1,5 +1,6 @@
 #include <linux/errno.h>
 #include <linux/hermit_backend.h>
+#include <linux/huge_mm.h>
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/swapops.h>
@@ -17,57 +18,47 @@ static size_t rswap_entry_offset(swp_entry_t entry)
 	return (size_t)swp_offset(entry) << PAGE_SHIFT;
 }
 
-static int rswap_hermit_store(swp_entry_t entry, struct page *page, int cpu,
-			      bool async)
+static int rswap_hermit_store(struct hermit_io *io)
 {
 	int ret;
 
-	(void)cpu;
-	(void)async;
 	if (force_local)
 		return -EOPNOTSUPP;
 
-	ret = rswap_dram_write(page, rswap_entry_offset(entry));
+	ret = rswap_dram_write_folio(io->folio, rswap_entry_offset(io->entry));
 	if (unlikely(ret))
 		pr_err_ratelimited("rswap_dram: store failed for entry 0x%lx: %d\n",
-				   entry.val, ret);
+				   io->entry.val, ret);
 
 	return ret;
 }
 
-static int rswap_hermit_load(swp_entry_t entry, struct page *page, int cpu,
-			     bool async)
+static int rswap_hermit_load(struct hermit_io *io, bool async)
 {
 	int ret;
 
-	(void)cpu;
 	(void)async;
 
-	ret = rswap_dram_read(page, rswap_entry_offset(entry));
+	ret = rswap_dram_read_folio(io->folio, rswap_entry_offset(io->entry));
 	if (unlikely(ret && ret != -ENOENT))
 		pr_err_ratelimited("rswap_dram: load failed for entry 0x%lx: %d\n",
-				   entry.val, ret);
+				   io->entry.val, ret);
 
 	return ret;
 }
 
-static int rswap_hermit_poll_load(int cpu)
+static int rswap_hermit_poll(struct hermit_io *io, bool wait)
 {
-	(void)cpu;
-	return 0;
-}
-
-static int rswap_hermit_peek_load(int cpu)
-{
-	(void)cpu;
+	(void)io;
+	(void)wait;
 	return 0;
 }
 
 static const struct hermit_backend_ops rswap_hermit_ops = {
+	.supported_order_mask = BIT(0) | GENMASK(PMD_ORDER, 2),
 	.load = rswap_hermit_load,
 	.store = rswap_hermit_store,
-	.poll_load = rswap_hermit_poll_load,
-	.peek_load = rswap_hermit_peek_load,
+	.poll = rswap_hermit_poll,
 };
 
 int rswap_register_backend(void)

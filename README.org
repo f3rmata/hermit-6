@@ -15,8 +15,10 @@ Linux 源码树内的 RDMA core。
 - Linux 6.18 的 Hermit Kconfig、debugfs 控制面、统计系统调用和 profiling；
 - remote-only swap slot 跟踪：远端 store 成功后跳过本地 swap BIO，失败时回落
   原生 swap；
-- order-0 folio 的 DRAM/RDMA store、同步 load、direct async load 和 lazy poll；
-- swap slot 释放或改写到其他后端时清理远端权威标记；
+- order 0–9 folio 的 DRAM/RDMA store、同步 load、direct async load 和 lazy poll；
+- 大 folio 可用一个可变长 RDMA WR 传输，失败时自动改用多个 4 KiB WR；
+- 远端 extent 在整个 folio 范围内事务化预留和提交，支持 partial invalidate；
+- 运行时 order 位图和逐 order store/load/fallback/error 统计；
 - memcg 接近 =memory.max= 时的定向异步回收；
 - QEMU DRAM checksum、vmstat、backend 计数和本地 swap 写扇区验证。
 
@@ -33,6 +35,9 @@ tools/qemu-dram/           本地 DRAM backend 构建与 QEMU 回归
 docs/migration-6.18.md     6.18 迁移说明和验证矩阵
 #+end_example
 
+dnet-58 作为 memory server、dnet-61 同机运行 Hermit、memcached 与
+mutilate 的部署和测试步骤见 =docs/dnet58-dnet61-memcached-rdma.md=。
+
 * 构建内核
 
 至少启用以下选项：
@@ -42,6 +47,8 @@ CONFIG_HERMIT=y
 CONFIG_SWAP=y
 CONFIG_MEMCG=y
 CONFIG_DEBUG_FS=y
+CONFIG_TRANSPARENT_HUGEPAGE=y
+CONFIG_THP_SWAP=y
 CONFIG_MODULES=y
 CONFIG_BLK_DEV_RAM=m
 #+end_example
@@ -85,6 +92,21 @@ QEMU_ACCEL=tcg QEMU_CPU=max SKIP_BUILD=1 TIMEOUT_SEC=360 \
   ./tools/qemu-dram/validate-qemu-dram.sh
 #+end_src
 
+64 KiB mTHP 双向大 folio 回归：
+
+#+begin_src sh
+QEMU_ACCEL=tcg QEMU_CPU=max SKIP_BUILD=1 TIMEOUT_SEC=360 \
+  GUEST_RAM_MB=2560 RSWAP_MEM_GB=1 SWAP_MB=1024 \
+  MEMHOG_MB=1200 TMPFS_FILL_MB=400 BYPASS_SWAPCACHE=Y LAZY_POLL=Y \
+  THP_SIZE_KB=64 REMOTE_ORDER_MASK=0x11 \
+  ./tools/qemu-dram/validate-qemu-dram.sh
+#+end_src
+
+2 MiB THP swapout 回归把最后一行改为
+=THP_SIZE_KB=2048 REMOTE_ORDER_MASK=0x201=。Linux 6.18 的 PTE swap fault
+只聚合 order 2–8 的 mTHP，因此这个用例验证 order-9 大 WR 写入；64 KiB 用例
+同时验证大粒度写入和回读。
+
 串口日志位于 =tools/qemu-dram/_work/guest-serial.log=。
 
 * RDMA 与外部 OFED
@@ -118,15 +140,37 @@ Hermit 控制项位于 =/sys/kernel/debug/hermit/=：
 
 | 文件 | 含义 |
 |-
-| =bypass_swapcache= | 对远端 order-0 entry 使用 direct swapin |
+| =bypass_swapcache= | 对远端 entry 使用 direct swapin |
 | =speculative_io= | 在 fault 元数据工作前发起异步 load |
-| =lazy_poll= | 先 peek completion，再 drain/poll |
+| =lazy_poll= | 对具体请求非阻塞 poll，未完成时继续等待 |
 | =batch_swapout= | 保留的 batch swapout 控制项 |
 | =batch_io= | 保留的 batch I/O 控制项 |
 | =vaddr_swapout= | 保留的定向回收控制项 |
 | =apt_reclaim= | 启用 memcg 异步回收 |
 | =reclaim_mode= | =1= 时使用多个回收 work |
 | =sthd_cnt= | 多 work 模式的 worker 数，最大 16 |
+| =remote_order_mask= | 可写的传输 order 位图，默认 =0x1= |
+| =effective_order_mask= | 只读的配置与 backend 能力交集 |
+| =order_stats= | 逐 order 的 store/load/4 KiB fallback/error 计数 |
+
+=remote_order_mask= 的 bit N 表示允许用 order N 的单个远端请求：bit 0 是
+4 KiB，bit 2 是 16 KiB，直到 bit 9 的 2 MiB。bit 0 必须始终置位，bit 1
+以及 bit 9 以上的位会被拒绝。例如只启用 4 KiB：
+
+#+begin_src sh
+echo 0x1 | sudo tee /sys/kernel/debug/hermit/remote_order_mask
+#+end_src
+
+启用 64 KiB 和 2 MiB，同时保留 4 KiB 回退：
+
+#+begin_src sh
+echo 0x211 | sudo tee /sys/kernel/debug/hermit/remote_order_mask
+cat /sys/kernel/debug/hermit/effective_order_mask
+cat /sys/kernel/debug/hermit/order_stats
+#+end_src
+
+该位图只选择 Hermit 的传输粒度，不修改 Linux 的
+=/sys/kernel/mm/transparent_hugepage/= 分配策略。
 
 保留的 x86-64 syscall ABI：
 
@@ -141,8 +185,8 @@ Hermit 控制项位于 =/sys/kernel/debug/hermit/=：
 
 * 当前边界
 
-- backend 仅接管 order-0 folio；大 folio、THP 和非远端 entry 保持 6.18 原生
-  路径；
+- Linux 6.18 的 PMD THP 可按 order 9 swapout；PTE swap fault 可聚合 order
+  2–8 mTHP，当前不会把 order-9 swap entry 直接恢复成 PMD THP；
 - DRAM backend 是功能验证工具，不模拟真实 RDMA 的时延、DMA 或设备错误；
 - 外部 OFED RDMA 客户端可编译路径与真实 NIC/server 端到端测试是两级验证，
   后者必须在对应硬件环境完成；

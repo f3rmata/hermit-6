@@ -16,5 +16,7 @@ int rswap_init_local_dram(int _mem_size);
 int rswap_remove_local_dram(void);
 int rswap_dram_read(struct page *page, size_t roffset);
 int rswap_dram_write(struct page *page, size_t roffset);
+int rswap_dram_read_folio(struct folio *folio, size_t roffset);
+int rswap_dram_write_folio(struct folio *folio, size_t roffset);
 
 #endif // __RSWAP_DRAM_H
