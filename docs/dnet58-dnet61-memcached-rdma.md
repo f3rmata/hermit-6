@@ -602,6 +602,36 @@ sudo ss -ltnp "sport = :11211"
 sudo kill <确认属于-memcached-的PID>
 ```
 
+### 6.5 自动完成 native 与 Hermit 两阶段对比
+
+若 `local` / `local-cgroup` 需要作为严格 native-swap 基线，使用
+`run_memcached_native_hermit_sweep.sh`。它先执行所有页大小的 native 两组，随后
+通过 `manage_rswap_client.sh install` 安装 RDMA client，再执行所有页大小的
+`hermit-cgroup` 组。模块只切换一次，而不是每个页大小切换一次。
+
+```bash
+cd ~/hermit-6
+
+export RSWAP_SERVER_IP=172.16.0.58
+export RSWAP_SERVER_PORT=9400
+export RSWAP_SWAP_FILE="$HOME/swapfile"
+export RSWAP_MEM_GB=48
+export PAGE_SIZES_KB='4 16 32 64 128 256 512 1024 2048'
+export LOCAL_RATIO_PCT=70
+export RECLAIM_MODE=1
+export STHD_CNT=16
+export RECLAIM_HEADROOM_PAGES=131072
+
+# 测试结束后保留 Hermit client；改为 unload 则会 swapoff、卸载模块并重新启用本地 swap。
+export FINAL_ACTION=leave-hermit
+tools/rdma/run_memcached_native_hermit_sweep.sh
+```
+
+该脚本会在开始前先 `swapoff` 当前 swapfile 并卸载 `rswap_client`，所以确保没有
+其他业务依赖该 swapfile。`manage_rswap_client.sh` 现支持
+`RSWAP_SERVER_IP`、`RSWAP_SERVER_PORT`、`RSWAP_SWAP_FILE` 与 `RSWAP_MEM_GB`
+环境变量；不要再依赖其历史默认值 `10.0.0.2`。
+
 ## 7. 监控与验收
 
 在 dnet-61 开三个终端：

@@ -2,8 +2,8 @@
 
 
 ### Macros ###
-mem_server_ip="10.0.0.2"
-mem_server_port="9400"
+mem_server_ip="${RSWAP_SERVER_IP:-10.0.0.2}"
+mem_server_port="${RSWAP_SERVER_PORT:-9400}"
 
 if [ -z "${HOME}" ]; then
 	echo "set home_dir first."
@@ -12,9 +12,9 @@ else
 	home_dir=${HOME}
 fi
 
-swap_file="${home_dir}/swapfile"
+swap_file="${RSWAP_SWAP_FILE:-${home_dir}/swapfile}"
 # The swap file/partition size should be equal to the whole size of remote memory
-SWAP_PARTITION_SIZE_GB="48"
+SWAP_PARTITION_SIZE_GB="${RSWAP_MEM_GB:-48}"
 
 echo " !! Warning, check the parameters below : "
 echo " Assigned memory server IP ${mem_server_ip} Port ${mem_server_port}"
@@ -34,8 +34,15 @@ if [[ -z "${action}" ]]; then
 fi
 
 function close_swap_partition() {
+	# Prefer the explicitly configured swap file. The legacy name matching below
+	# remains for existing deployments that did not pass RSWAP_SWAP_FILE.
+	swap_bd=$(swapon --noheadings --raw --output NAME 2>/dev/null | \
+		awk -v target="${swap_file}" '$0 == target { print; exit }')
+
 	# For ubuntu, usually a file is used as swap space
-	swap_bd=$(swapon -s | grep "swap.img" | cut -d " " -f 1)
+	if [ -z "${swap_bd}" ]; then
+		swap_bd=$(swapon -s | grep "swap.img" | cut -d " " -f 1)
+	fi
 	# the name can also be swapfile
 	if [ -z "${swap_bd}" ]; then
 		swap_bd=$(swapon -s | grep "swapfile" | cut -d " " -f 1)
