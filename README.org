@@ -40,18 +40,51 @@ mutilate 的部署和测试步骤见 =docs/dnet58-dnet61-memcached-rdma.md=。
 
 * 构建内核
 
-至少启用以下选项：
+Hermit 的 6.18 Kconfig 直接要求 =X86_64=、=MEMCG=、=SWAP= 和 =DEBUG_FS=；
+使用外部 rswap/DOCA OFED 模块还要求 =MODULES=。THP/mTHP 传输测试额外要求
+=TRANSPARENT_HUGEPAGE=，并由 Hermit 选择的 =ARCH_WANTS_THP_SWAP= 自动得到
+=THP_SWAP=：
 
 #+begin_example
 CONFIG_HERMIT=y
 CONFIG_SWAP=y
+CONFIG_CGROUPS=y
 CONFIG_MEMCG=y
 CONFIG_DEBUG_FS=y
 CONFIG_TRANSPARENT_HUGEPAGE=y
 CONFIG_THP_SWAP=y
 CONFIG_MODULES=y
+CONFIG_INFINIBAND=m
+CONFIG_INFINIBAND_USER_ACCESS=m
+CONFIG_INFINIBAND_USER_MAD=m
+CONFIG_INFINIBAND_ADDR_TRANS=y
+CONFIG_INFINIBAND_ADDR_TRANS_CONFIGFS=y
+CONFIG_MLX5_CORE=m
+CONFIG_MLX5_INFINIBAND=m
+#+end_example
+
+以下均是部署或实验策略，而非 Hermit 代码依赖：
+
+#+begin_example
+# 推荐为运行时 THP/mTHP 测试保留 madvise 默认策略
+CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y
+# CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS is not set
+# CONFIG_TRANSPARENT_HUGEPAGE_NEVER is not set
+# 防止压缩内存路径截获远端 swap I/O
+# CONFIG_ZSWAP is not set
+# CONFIG_ZRAM is not set
+# 若要与传统 LRU 基线对比才关闭；不是 Hermit 的 Kconfig 前提
+# CONFIG_LRU_GEN is not set
+# OFED DKMS 需要替换同名 RDMA/MLX5 模块，因此保持模块化
+CONFIG_INFINIBAND=m
+# 仅 tools/qemu-dram 回归需要
 CONFIG_BLK_DEV_RAM=m
 #+end_example
+
+=CONFIG_THP_SWAP= 是 =CONFIG_HERMIT= 选择 =ARCH_WANTS_THP_SWAP= 后由 6.18
+Kconfig 自动推导的；DOCA/OFED 的 provider 需要 =CONFIG_INFINIBAND=m=，从而
+由 =updates/dkms= 下的 OFED 模块替换同名 in-tree 模块。THP/mTHP 的具体大小在运行时经 THP sysfs 和
+=remote_order_mask= 选择；=BLK_DEV_RAM= 不是 dnet RDMA 测试要求。
 
 构建：
 
@@ -112,14 +145,15 @@ QEMU_ACCEL=tcg QEMU_CPU=max SKIP_BUILD=1 TIMEOUT_SEC=360 \
 * RDMA 与外部 OFED
 
 先为目标 =v6.18.38= Hermit 内核构建或安装 Mellanox OFED。=OFA_DIR= 必须
-同时包含匹配该内核的 =include/= 和 =Module.symvers=。默认位置是
-=/usr/src/ofa_kernel/default=。
+同时包含匹配该内核的 =include/= 和 =Module.symvers=。DOCA/OFED DKMS 的常见
+目录是 =/usr/src/ofa_kernel-dkms/x86_64/$(uname -r)=；只有在
+=/usr/src/ofa_kernel/default= 确实解析到当前内核目录时才能使用后者。
 
 #+begin_src sh
 make -C remoteswap/client \
   KDIR="$PWD/linux-stable" \
   BACKEND=RDMA \
-  OFA_DIR=/usr/src/ofa_kernel/default
+  OFA_DIR="/usr/src/ofa_kernel-dkms/x86_64/$(make -sC linux-stable kernelrelease)"
 #+end_src
 
 若 OFED 安装在其他目录，覆盖 =OFA_DIR=。不要用另一内核或另一版 OFED 的
@@ -148,6 +182,7 @@ Hermit 控制项位于 =/sys/kernel/debug/hermit/=：
 | =vaddr_swapout= | 保留的定向回收控制项 |
 | =apt_reclaim= | 启用 memcg 异步回收 |
 | =reclaim_mode= | =1= 时使用多个回收 work |
+| =reclaim_headroom_pages= | 距离 =memory.max= 的主动回收余量，默认 2048 页 |
 | =sthd_cnt= | 多 work 模式的 worker 数，最大 16 |
 | =remote_order_mask= | 可写的传输 order 位图，默认 =0x1= |
 | =effective_order_mask= | 只读的配置与 backend 能力交集 |
@@ -172,6 +207,16 @@ cat /sys/kernel/debug/hermit/order_stats
 该位图只选择 Hermit 的传输粒度，不修改 Linux 的
 =/sys/kernel/mm/transparent_hugepage/= 分配策略。
 
+RDMA 模块参数 =max_order= 决定单个 WR 支持的最大 order。它在模块加载时读取且
+为只读参数；需要修改时先 =swapoff=、卸载模块，再用
+=insmod rswap-client.ko ... max_order=N= 重新加载。异步 load context 使用预留
+mempool，所有数据 CQ 使用 direct polling 并由队列锁串行化；大 WR 或部分
+base-page submit 失败会在原请求完成后统一重试 4 KiB 路径。
+
+=tools/rdma= 的 benchmark 默认保留当前 =reclaim_mode= 和
+=reclaim_headroom_pages=，只有显式设置同名环境变量才会写入；结果目录中的
+=reclaim_*_requested= 与 =reclaim_*_actual= 用于记录请求值和实际值。
+
 保留的 x86-64 syscall ABI：
 
 #+begin_example
@@ -190,4 +235,6 @@ cat /sys/kernel/debug/hermit/order_stats
 - DRAM backend 是功能验证工具，不模拟真实 RDMA 的时延、DMA 或设备错误；
 - 外部 OFED RDMA 客户端可编译路径与真实 NIC/server 端到端测试是两级验证，
   后者必须在对应硬件环境完成；
-- backend 回调当前依赖 RCU 生命周期，活跃 swap 期间不支持卸载模块。
+- backend dispatch 使用 SRCU，RDMA client 还会等待 active I/O 和各队列已提交
+  WR 完成后再释放资源；但 remote-only entry 没有本地副本，因此仍必须先
+  =swapoff= 并确认成功，不能把该等待机制当成带活跃 swap 热卸载支持。

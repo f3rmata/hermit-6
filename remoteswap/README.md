@@ -19,12 +19,13 @@ kernel. `OFA_DIR` must contain both `include/` and `Module.symvers`:
 make -C client \
   KDIR="$PWD/../linux-stable" \
   BACKEND=RDMA \
-  OFA_DIR=/usr/src/ofa_kernel/default
+  OFA_DIR="/usr/src/ofa_kernel-dkms/x86_64/$(make -sC ../linux-stable kernelrelease)"
 ```
 
 The RDMA build does not use the in-tree Linux RDMA core. Build or install OFED
 against the Hermit `v6.18.38` kernel first. Do not mix headers or symbol CRCs
-from another kernel.
+from another kernel. `/usr/src/ofa_kernel/default` is usable only when its
+resolved target contains the `Module.symvers` generated for this exact kernel.
 
 ## Hardware
 
@@ -37,7 +38,8 @@ memory server must be configured consistently on both machines.
 Build and start the memory server before loading the client:
 
 ```bash
-make -C server OFA_DIR=/usr/src/ofa_kernel/default
+OFA_DIR="/usr/src/ofa_kernel-dkms/x86_64/$(uname -r)"
+make -C server OFA_DIR="$OFA_DIR"
 ./server/rswap-server <server-ip> <port> <pool-size-gib> <client-cpu-count>
 ```
 
@@ -82,7 +84,21 @@ WR for the physically contiguous folio. A DMA-map, post, or completion failure
 causes the request to be retried as one 4 KiB WR per base page. If the order is
 disabled, the backend uses those 4 KiB WRs directly. `max_order` limits the
 largest single WR supported by the RDMA client, and `effective_order_mask` is
-the intersection of that capability with the runtime mask.
+the intersection of that capability with the runtime mask. `max_order` is a
+read-only module parameter; change it by unloading and reloading the module
+after `swapoff`, for example `max_order=4` for at most 64 KiB per WR.
+
+All client CQs use `IB_POLL_DIRECT`, and polling a queue is serialized by that
+queue's CQ lock. Async load contexts come from a reserved mempool so the swap-in
+hot path is not dependent on a fresh `GFP_ATOMIC` slab allocation under memory
+pressure. Completion publication uses release/acquire ordering between the
+request status and pending count. Partial base-page submission is retained as
+one transaction and retried only after its already-posted WRs complete.
+
+The DRAM validation backend intentionally advertises only order 0 because it
+always copies a folio as base pages. Large-folio DRAM tests therefore increment
+the target order's fallback counter; they validate Hermit's folio accounting
+and fallback path, not a variable-size RDMA WR.
 
 The mask changes Hermit's transport only. THP/mTHP allocation remains under
 Linux's `/sys/kernel/mm/transparent_hugepage/` controls.
@@ -94,6 +110,12 @@ remote entries or outstanding RDMA requests remain:
 sudo swapoff <swap-device-or-file>
 sudo rmmod rswap_client
 ```
+
+Unregister first rejects new RDMA transactions, lets already-issued async
+transactions finish through their normal poll callback, and then waits for all
+posted WR counters before CQ/QP/cache destruction. This protects resource
+lifetime but does not make remote-only swap entries recoverable after a live
+unload; a successful `swapoff` remains mandatory.
 
 ## Validation
 

@@ -71,13 +71,22 @@ and direction, and the parent transaction owns the pending count and first
 error. Async polling therefore observes one logical request even when fallback
 creates many WRs.
 
+Async transaction objects are allocated from a slab-backed mempool with a
+queue-scaled reserve. All RDMA CQs use direct polling, serialized per CQ, so a
+completion cannot be consumed concurrently by a softirq and a fault-side
+poller. Completion writes status before a release decrement of `pending`; the
+reader observes `pending` with acquire semantics. Queue slots are reserved with
+atomic compare-and-exchange and rolled back exactly once when `ib_post_send()`
+fails. `max_order` is a read-only load-time module parameter, preventing the
+advertised capability mask from diverging after registration.
+
 ## Memcg reclaim
 
 When `apt_reclaim=Y`, a non-root memcg with a finite `memory.max` schedules
 asynchronous reclaim before a charge reaches the hard limit. The target margin
 is controlled by `/sys/kernel/debug/hermit/reclaim_headroom_pages`; it defaults
-to 65536 pages (256 MiB on x86-64), and writing zero disables proactive
-reclaim without changing `apt_reclaim`.
+to the legacy value of 2048 pages (8 MiB on x86-64), and writing zero disables
+proactive reclaim without changing `apt_reclaim`.
 
 `reclaim_mode=1` uses up to `sthd_cnt` work items on the unbound workqueue;
 other modes use one. Concurrent workers divide the current margin deficit
@@ -85,8 +94,9 @@ instead of each reclaiming the entire deficit. A worker that made progress
 requeues itself when the retry budget expires and the margin is still below
 the target. Work is cancelled before the memcg is freed.
 
-The RDMA benchmark defaults to the concurrent configuration below. Both values
-can be overridden per run:
+The benchmark scripts leave both controls untouched unless the corresponding
+environment variables are explicitly set. Use the tuned concurrent profile
+below for the 70% hard-limit experiment:
 
 ```bash
 export RECLAIM_MODE=1
@@ -117,8 +127,8 @@ built for this exact 6.18 kernel; enabling the kernel tree's in-tree
 | DRAM client | target kernel tree | `rswap-client.ko` links |
 | QEMU normal poll | TCG/KVM | checksum and all validation checks pass |
 | QEMU lazy poll | TCG/KVM | same checks with `LAZY_POLL=Y` |
-| QEMU 64 KiB mTHP | TCG/KVM | order-4 store/load, checksum and mask switch pass |
-| QEMU 2 MiB THP | TCG/KVM | order-9 store, checksum and no backend errors |
+| QEMU 64 KiB mTHP | TCG/KVM | order-4 store/load accounting, base-page fallback, checksum and mask switch pass |
+| QEMU 2 MiB THP | TCG/KVM | order-9 store accounting, base-page fallback, checksum and no backend errors |
 | RDMA source object | target kernel RDMA headers | `rswap_rdma_ops.o` compiles |
 | RDMA client | matching OFED tree | modpost has no unresolved/CRC errors |
 | RDMA end to end | NIC + memory server | connect, pressure, reload checksum pass |
@@ -129,9 +139,12 @@ server. They must not be inferred from the DRAM QEMU or source-object result.
 
 ## Known constraints
 
-- Backend calls currently use a regular RCU read-side critical section. The
-  present DRAM memcpy and RDMA busy-poll callbacks do not sleep.
-- An async issue and its later poll are separate backend calls. Do not unload
-  the backend while swap is active or requests are outstanding.
+- Backend dispatch uses SRCU because synchronous RDMA context allocation may
+  sleep with `GFP_NOIO`. RDMA unregister stops new allocations while leaving
+  poll available to already-issued async requests, waits for active contexts,
+  unregisters the backend, and drains posted WRs before destroying resources.
+- This lifetime protection is not a live migration mechanism. Remote-only swap
+  entries have no local copy, so `swapoff` must complete successfully before
+  unloading the client or stopping the memory server.
 - The DRAM backend consumes guest RAM and is therefore a functional mock, not
   a capacity or latency model of disaggregated memory.

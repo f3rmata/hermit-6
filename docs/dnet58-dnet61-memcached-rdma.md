@@ -147,7 +147,146 @@ grep -E 'QUERY|REQUEST_CHUNKS|Send available Regions' \
 
 ## 4. dnet-61：RDMA client 准备
 
-### 4.1 网络和内核预检
+### 4.1 编译、安装 Hermit 6.18 内核
+
+先安装常规构建依赖，并以当前能启动的 Ubuntu 配置作为基础：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential bc bison flex libssl-dev libelf-dev \
+  dwarves pahole cpio kmod rsync
+
+cd ~/hermit-6/linux-stable
+cp "/boot/config-$(uname -r)" .config
+```
+
+`CONFIG_HERMIT` 在 6.18 中直接依赖 `X86_64 && MEMCG && SWAP && DEBUG_FS`。
+因此下列四项及其隐含依赖（`X86_64`、`CGROUPS`、`BLOCK`）是 Hermit 的代码
+前提；`MODULES` 是 DOCA/OFED 和 `rswap-client.ko` 的部署前提。
+
+```bash
+scripts/config --enable HERMIT
+scripts/config --enable SWAP
+scripts/config --enable DEBUG_FS
+scripts/config --enable CGROUPS
+scripts/config --enable MEMCG
+scripts/config --enable MODULES
+```
+
+RDMA core 和 mlx5 provider 必须保持为模块，让 OFED DKMS 的 `updates/dkms`
+版本能够替换同名内核模块。使用 `--enable INFINIBAND` 会生成 `y`，导致
+`ib_core` 同时存在内置版和 OFED 外部版，正是 dnet-61 当前 `Unknown symbol`
+的来源；这里必须使用 `--module`：
+
+```bash
+scripts/config --module INFINIBAND
+scripts/config --module INFINIBAND_USER_ACCESS
+scripts/config --module INFINIBAND_USER_MAD
+scripts/config --enable INFINIBAND_ADDR_TRANS
+scripts/config --enable INFINIBAND_ADDR_TRANS_CONFIGFS
+scripts/config --module MLX5_CORE
+scripts/config --module MLX5_INFINIBAND
+```
+
+THP/mTHP 传输测试额外要求 `TRANSPARENT_HUGEPAGE=y`。选择 `madvise` 只是推荐的
+默认运行策略：它保留测试能力，并让每一组测试在运行时明确选择 4 KiB、64 KiB
+mTHP 或 2 MiB THP。它不是 Hermit 的 Kconfig 依赖：
+
+```bash
+scripts/config --enable TRANSPARENT_HUGEPAGE
+scripts/config --disable TRANSPARENT_HUGEPAGE_ALWAYS
+scripts/config --enable TRANSPARENT_HUGEPAGE_MADVISE
+scripts/config --disable TRANSPARENT_HUGEPAGE_NEVER
+```
+
+`CONFIG_THP_SWAP` 也不应通过 `scripts/config` 强设：它在 6.18 中由
+`TRANSPARENT_HUGEPAGE && ARCH_WANTS_THP_SWAP && SWAP && 64BIT` 自动推导，而
+`CONFIG_HERMIT` 选择 `ARCH_WANTS_THP_SWAP`。`make olddefconfig` 后必须验证
+`CONFIG_THP_SWAP=y`，否则大 folio 会在 swap 路径被拆分，不能作为 THP/mTHP
+远端传输结果。
+
+下列是**实验隔离策略**，不是 Hermit 的代码依赖。关闭 zswap 可避免其在 Hermit
+之前截获 swap I/O；关闭 zram 可避免误用内存 swap 设备。`LRU_GEN` 不属于
+Hermit 的 Kconfig 前提，是否关闭应作为实验变量记录；若希望和旧基线一致可关闭：
+
+```bash
+scripts/config --disable ZSWAP
+scripts/config --disable ZRAM
+# 可选：与 dnet-60 的传统 LRU 回收基线一致
+scripts/config --disable LRU_GEN
+```
+
+不要沿用 dnet-60 中禁用 `TRANSPARENT_HUGEPAGE` 的命令。4 KiB、64 KiB mTHP
+和 2 MiB THP 的对比应通过启动后的 THP sysfs policy 与 `remote_order_mask`
+控制，而不是通过重新裁剪内核能力。
+
+`CONFIG_BLK_DEV_RAM=m` 仅为 `tools/qemu-dram` 回归需要；dnet-61 的 RDMA
+memcached 测试不需要它。如需运行 QEMU 验证，再额外执行：
+
+```bash
+scripts/config --module BLK_DEV_RAM
+```
+
+设置稳定的内核后缀（这也让 DOCA/OFED 的 DKMS 按明确的 kernel release 构建），
+然后配置、编译并安装：
+
+```bash
+scripts/config --set-str LOCALVERSION '-hermit'
+scripts/config --disable LOCALVERSION_AUTO
+make LOCALVERSION= olddefconfig
+
+make LOCALVERSION= -j"$(nproc)" bzImage modules
+kernel_release=$(make -s LOCALVERSION= kernelrelease)
+printf 'kernel_release=%s\n' "$kernel_release"
+
+sudo make LOCALVERSION= modules_install
+sudo make LOCALVERSION= install
+sudo dkms autoinstall -k "$kernel_release"
+sudo update-grub
+sudo grub-reboot "Advanced options for Ubuntu>Ubuntu, with Linux 6.18.38-hermit"
+```
+
+`kernel_release` 应为类似 `6.18.38-hermit` 的值。安装前验证代码/部署所需项、
+THP 测试派生项和 OFED 所需的内核 RDMA core；`LRU_GEN` 只在选择传统 LRU
+实验时检查：
+
+```bash
+grep -E '^(CONFIG_HERMIT|CONFIG_SWAP|CONFIG_CGROUPS|CONFIG_MEMCG|CONFIG_DEBUG_FS|CONFIG_MODULES|CONFIG_INFINIBAND|CONFIG_INFINIBAND_USER_ACCESS|CONFIG_INFINIBAND_USER_MAD|CONFIG_INFINIBAND_ADDR_TRANS|CONFIG_INFINIBAND_ADDR_TRANS_CONFIGFS|CONFIG_MLX5_CORE|CONFIG_MLX5_INFINIBAND|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_THP_SWAP)=' .config
+grep -E '^# CONFIG_(ZSWAP|ZRAM) is not set' .config
+grep -E '^(CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y|# CONFIG_TRANSPARENT_HUGEPAGE_(ALWAYS|NEVER) is not set)' .config
+# 若上面选择关闭 LRU_GEN：
+grep '^# CONFIG_LRU_GEN is not set' .config
+```
+
+`make install` 通常会安装内核并生成 GRUB 条目。重启前检查实际菜单名，再在
+`/etc/default/grub` 中保留已有启动参数的前提下设置它：
+
+```bash
+grep -E "^menuentry .*${kernel_release}" /boot/grub/grub.cfg
+sudoedit /etc/default/grub
+# 例如：
+# GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux ${kernel_release}"
+# GRUB_CMDLINE_LINUX_DEFAULT="... transparent_hugepage=madvise"
+sudo update-grub
+sudo reboot
+```
+
+重启后，先确认内核和 DKMS 模块完全匹配，再继续编译/加载 RDMA client：
+
+```bash
+cd ~/hermit-6/linux-stable
+kernel_release=$(make -s LOCALVERSION= kernelrelease)
+uname -r
+test "$(uname -r)" = "$kernel_release"
+sudo dkms status
+ofed_info -s
+```
+
+如果 `dkms status` 没有列出新 `uname -r` 的 `mlnx-ofed-kernel`，不要加载旧
+`rswap-client.ko`；先修复 DKMS 编译，再执行下一节的 client 构建。
+
+### 4.2 网络和内核预检
 
 ```bash
 uname -r
@@ -159,7 +298,7 @@ sudo ip link set ibp59s0f0 up
 ping -c 3 172.16.0.58
 ```
 
-### 4.2 使用正确的 OFED 构建目录
+### 4.3 使用正确的 OFED 构建目录
 
 `/usr/src/ofa_kernel/default` 仍错误指向 5.14，不能用来构建 6.18 模块。正确目录是：
 
@@ -175,6 +314,8 @@ cd ~/hermit-6
 OFA_DIR="/usr/src/ofa_kernel-dkms/x86_64/$(uname -r)"
 test -f "$OFA_DIR/Module.symvers"
 test -f "$OFA_DIR/include/rdma/ib_verbs.h"
+readlink -f /usr/src/ofa_kernel/default
+grep -q 'ib_process_cq_direct' "$OFA_DIR/Module.symvers"
 
 make -C remoteswap/client clean \
   KDIR="/lib/modules/$(uname -r)/build"
@@ -188,25 +329,19 @@ modinfo remoteswap/client/rswap-client.ko |
   grep -E '^(filename|vermagic|parm):'
 ```
 
-### 4.3 加载 client 并检查连接
+最终 modpost 必须使用上面的 DOCA/OFED `Module.symvers`。不能把本仓库
+`linux-stable/Module.symvers` 当作替代品：本地内核树未启用同一套外部 OFED
+符号时，可能出现 exported twice、undefined symbol 或错误 CRC，即使单个
+`rswap_rdma*.o` 已能通过编译。
+
+### 4.4 加载 client 并检查连接
 
 先启动 dnet-58 server，再执行：
 
 ```bash
-cd ~/hermit-6
+cd ~/hermit-6/remoteswap/client
 
-sudo insmod remoteswap/client/rswap-client.ko \
-  sip=172.16.0.58 sport=9400 rmsize=48
-
-lsmod | grep rswap
-for file in /sys/module/rswap_client/parameters/*; do
-  printf '%s=' "$file"
-  cat "$file"
-done
-
-sudo dmesg --color=never |
-  grep -E 'All 192 rdma queues|Got .*chunks|Hermit RDMA backend registered' |
-  tail
+./manage_rswap_client.sh install
 ```
 
 验收必须包含：
@@ -217,7 +352,18 @@ Got 6 chunks from memory server
 rswap: Hermit RDMA backend registered
 ```
 
-### 4.4 准备 48 GiB swap slot
+新版本日志会在注册行显示 async I/O reserve 数量。所有 CQ 均为 direct poll，
+同一 CQ 的 fault-side poll 由队列锁串行化；async context 使用预留 mempool。
+`max_order` 是只读加载参数，若需限制最大单 WR 粒度，例如 64 KiB，应在
+`swapoff` 后重新加载：
+
+```bash
+sudo insmod rswap-client.ko \
+  sip=172.16.0.58 sport=9400 rmsize=48 max_order=4
+cat /sys/module/rswap_client/parameters/max_order
+```
+
+### 4.5 准备 48 GiB swap slot
 
 先确认 swap 未被使用、磁盘至少有 48 GiB 可用：
 
@@ -242,11 +388,11 @@ swapon --show
 
 RDMA NIC 位于 NUMA 0。只使用每个 core 的第一个硬件线程，布局为：
 
-| 组件 | CPU | NUMA | 线程数 |
-|---|---:|---:|---:|
-| memcached | 0-7 | 0 | 8 |
-| mutilate | 8-15 | 0 | 8 |
-| SMT/系统与 Hermit 余量 | 32-47 | 0 | 不绑定负载 |
+| 组件                   |   CPU | NUMA |     线程数 |
+| ---------------------- | ----: | ---: | ---------: |
+| memcached              |   0-7 |    0 |          8 |
+| mutilate               |  8-15 |    0 |          8 |
+| SMT/系统与 Hermit 余量 | 32-47 |    0 | 不绑定负载 |
 
 不要同时使用互为 SMT sibling 的 `0-15` 和 `32-47` 做两个负载。
 
@@ -320,6 +466,14 @@ tools/rdma/memcached_load.sh \
 tools/rdma/memcached_bench.sh \
   --mode "$MODE" --kernel "$KERNEL_TAG" \
   --result-dir "$RESULT_DIR" --port "$PORT"
+```
+
+脚本只有在 `RECLAIM_MODE` 或 `RECLAIM_HEADROOM_PAGES` 非空时才写对应
+debugfs 文件；不导出它们即可保留运维手工配置。每次运行后核对：
+
+```bash
+grep -E '^reclaim_(mode|headroom_pages)_(requested|actual)=' \
+  "$RESULT_DIR/config.txt"
 ```
 
 低负载验证完成后可改为原主脚本的高负载范围：

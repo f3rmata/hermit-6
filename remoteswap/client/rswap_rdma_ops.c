@@ -1,43 +1,53 @@
 #include <linux/hermit_backend.h>
 #include <linux/huge_mm.h>
+#include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/swapops.h>
+#include <linux/wait.h>
 
 #include "rswap_rdma.h"
 #include "rswap_ops.h"
 
-/**
- * Wait for the finish of ALL the outstanding rdma_request
- */
-void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
-{
-	int nr_pending = atomic_read(&rdma_queue->rdma_post_counter);
-	int nr_done = 0;
-
-	preempt_disable();
-	while (atomic_read(&rdma_queue->rdma_post_counter) > 0) {
-		int nr_completed;
-		// IB_POLL_BATCH is 16 by default
-		nr_completed = ib_process_cq_direct(rdma_queue->cq, 4);
-		nr_done += nr_completed;
-		if (nr_done >= nr_pending)
-			break;
-		cpu_relax();
-	}
-	preempt_enable();
-}
-
 struct rswap_io_context {
 	struct rswap_rdma_queue *queue;
+	enum rdma_queue_type type;
 	atomic_t pending;
 	atomic_t status;
 	bool fallback_attempted;
 };
 
+static struct kmem_cache *rswap_io_ctx_cache;
+static mempool_t *rswap_io_ctx_pool;
+static atomic_t rswap_active_io;
+static DECLARE_WAIT_QUEUE_HEAD(rswap_active_io_wait);
+static DEFINE_SPINLOCK(rswap_io_lifecycle_lock);
+static bool rswap_stopping = true;
+
 static unsigned int max_order = PMD_ORDER;
-module_param(max_order, uint, 0644);
+module_param(max_order, uint, 0444);
 MODULE_PARM_DESC(max_order, "maximum folio order for one RDMA WR");
+
+static int rswap_process_cq(struct rswap_rdma_queue *rdma_queue, int budget)
+{
+	int completed;
+
+	mutex_lock(&rdma_queue->cq_lock);
+	completed = ib_process_cq_direct(rdma_queue->cq, budget);
+	mutex_unlock(&rdma_queue->cq_lock);
+	return completed;
+}
+
+/**
+ * Wait for all requests that have actually been posted to this queue.
+ */
+void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
+{
+	while (atomic_read_acquire(&rdma_queue->rdma_post_counter) > 0) {
+		if (!rswap_process_cq(rdma_queue, 16))
+			cpu_relax();
+	}
+}
 
 /**
  * Drain all the outstanding messages for a specific memory server.
@@ -69,52 +79,52 @@ static void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 		atomic_cmpxchg(&io->status, 0, -EIO);
 	}
 
-	atomic_dec(&rdma_queue->rdma_post_counter);
 	ib_dma_unmap_page(ibdev, rdma_req->dma_addr, rdma_req->dma_len,
 			  rdma_req->dma_dir);
-	atomic_dec(&io->pending);
+	atomic_dec_return_release(&rdma_queue->rdma_post_counter);
+	atomic_dec_return_release(&io->pending);
 	kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
 }
 
-static int fs_enqueue_send_wr(struct rdma_session_context *rdma_session,
-		       struct rswap_rdma_queue *rdma_queue,
+static bool rswap_reserve_send_slot(struct rswap_rdma_queue *rdma_queue)
+{
+	int old;
+
+	for (;;) {
+		old = atomic_read(&rdma_queue->rdma_post_counter);
+		if (old >= RDMA_SEND_QUEUE_DEPTH - 16)
+			return false;
+		if (atomic_cmpxchg(&rdma_queue->rdma_post_counter, old,
+				   old + 1) == old)
+			return true;
+		cpu_relax();
+	}
+}
+
+static int fs_enqueue_send_wr(struct rswap_rdma_queue *rdma_queue,
 		       struct fs_rdma_req *rdma_req)
 {
-	int ret = 0;
 	const struct ib_send_wr *bad_wr;
-	int test;
+	int ret;
 
 	rdma_req->rdma_queue = rdma_queue;
 
-	while (1) {
-		test = atomic_inc_return(&rdma_queue->rdma_post_counter);
-		if (test < RDMA_SEND_QUEUE_DEPTH - 16) {
-			ret = ib_post_send(
-				rdma_queue->qp,
-				(struct ib_send_wr *)&rdma_req->rdma_wr,
-				&bad_wr);
-			if (unlikely(ret)) {
-				pr_err("%s, post 1-sided RDMA send wr failed, "
-				       "return value :%d. counter %d \n",
-				       __func__, ret, test);
-				atomic_dec(&rdma_queue->rdma_post_counter);
-				ret = -EIO;
-				goto err;
-			}
-
-			return ret;
-		} else { // RDMA send queue is full, wait for next turn.
-			test = atomic_dec_return(
-				&rdma_queue->rdma_post_counter);
-			cpu_relax();
-
-			drain_rdma_queue(rdma_queue);
-			pr_err("%s, back pressure...\n", __func__);
-		}
+	while (!rswap_reserve_send_slot(rdma_queue)) {
+		drain_rdma_queue(rdma_queue);
+		pr_warn_ratelimited("%s: RDMA send queue back pressure\n",
+				    __func__);
 	}
-err:
-	pr_err(" Error in %s \n", __func__);
-	return ret;
+
+	ret = ib_post_send(rdma_queue->qp,
+			   (struct ib_send_wr *)&rdma_req->rdma_wr, &bad_wr);
+	if (unlikely(ret)) {
+		atomic_dec_return_release(&rdma_queue->rdma_post_counter);
+		pr_err_ratelimited("%s: ib_post_send failed: %d\n",
+				   __func__, ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 /**
@@ -228,12 +238,12 @@ static int rswap_rdma_send(struct rswap_io_context *io, int cpu,
 	}
 
 	atomic_inc(&io->pending);
-	ret = fs_enqueue_send_wr(&rdma_session_global, rdma_queue, rdma_req);
+	ret = fs_enqueue_send_wr(rdma_queue, rdma_req);
 	if (unlikely(ret)) {
 		pr_err("%s, enqueue rdma_wr failed.\n", __func__);
 		ib_dma_unmap_page(rdma_session_global.rdma_dev->dev,
 				  rdma_req->dma_addr, len, rdma_req->dma_dir);
-		atomic_dec(&io->pending);
+		atomic_dec_return_release(&io->pending);
 		goto free_req;
 	}
 
@@ -244,30 +254,55 @@ free_req:
 	return ret;
 }
 
+static void rswap_active_io_put(void)
+{
+	if (atomic_dec_and_test(&rswap_active_io))
+		wake_up_all(&rswap_active_io_wait);
+}
+
 static struct rswap_io_context *rswap_io_alloc(int cpu,
-				       enum rdma_queue_type type)
+				       enum rdma_queue_type type, gfp_t gfp)
 {
 	struct rswap_io_context *ctx;
+	unsigned long flags;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
-	if (!ctx)
-		return NULL;
+	spin_lock_irqsave(&rswap_io_lifecycle_lock, flags);
+	if (rswap_stopping || !rswap_io_ctx_pool) {
+		spin_unlock_irqrestore(&rswap_io_lifecycle_lock, flags);
+		return ERR_PTR(-ESHUTDOWN);
+	}
+	atomic_inc(&rswap_active_io);
+	spin_unlock_irqrestore(&rswap_io_lifecycle_lock, flags);
+
+	ctx = mempool_alloc(rswap_io_ctx_pool, gfp);
+	if (!ctx) {
+		rswap_active_io_put();
+		return ERR_PTR(-ENOMEM);
+	}
+	memset(ctx, 0, sizeof(*ctx));
 	ctx->queue = get_rdma_queue(&rdma_session_global, cpu, type);
+	ctx->type = type;
 	atomic_set(&ctx->pending, 0);
 	atomic_set(&ctx->status, 0);
 	return ctx;
 }
 
+static void rswap_io_free(struct rswap_io_context *ctx)
+{
+	mempool_free(ctx, rswap_io_ctx_pool);
+	rswap_active_io_put();
+}
+
 static int rswap_io_poll(struct rswap_io_context *ctx, bool wait)
 {
 	do {
-		if (!atomic_read(&ctx->pending))
+		if (!atomic_read_acquire(&ctx->pending))
 			return atomic_read(&ctx->status);
-		ib_process_cq_direct(ctx->queue->cq, 16);
-		if (!wait && atomic_read(&ctx->pending))
+		rswap_process_cq(ctx->queue, 16);
+		if (!wait && atomic_read_acquire(&ctx->pending))
 			return -EAGAIN;
 		cpu_relax();
-	} while (atomic_read(&ctx->pending));
+	} while (atomic_read_acquire(&ctx->pending));
 	return atomic_read(&ctx->status);
 }
 
@@ -280,9 +315,12 @@ static int rswap_submit_folio(struct hermit_io *io,
 
 	if (!base_pages && io->transfer_order == io->folio_order &&
 	    io->folio_order) {
-		return rswap_rdma_send(ctx, io->cpu, swp_offset(io->entry),
-				       &io->folio->page, folio_size(io->folio),
-				       type);
+		ret = rswap_rdma_send(ctx, io->cpu, swp_offset(io->entry),
+				      &io->folio->page, folio_size(io->folio),
+				      type);
+		if (ret)
+			atomic_cmpxchg(&ctx->status, 0, ret);
+		return ret;
 	}
 
 	for (i = 0; i < nr_pages; i++) {
@@ -301,7 +339,12 @@ static int rswap_retry_base(struct hermit_io *io,
 			    struct rswap_io_context *ctx,
 			    enum rdma_queue_type type)
 {
-	io->fallback = true;
+	if (WARN_ON_ONCE(atomic_read_acquire(&ctx->pending)))
+		return -EBUSY;
+	if (WARN_ON_ONCE(type != ctx->type))
+		return -EINVAL;
+
+	io->fallback = io->folio_order > 0;
 	ctx->fallback_attempted = true;
 	atomic_set(&ctx->status, 0);
 	return rswap_submit_folio(io, ctx, type, true);
@@ -312,20 +355,19 @@ static int rswap_backend_store(struct hermit_io *io)
 	struct rswap_io_context *ctx;
 	int ret;
 
-	ctx = rswap_io_alloc(io->cpu, QP_STORE);
-	if (!ctx)
-		return -ENOMEM;
-	ctx->fallback_attempted = io->transfer_order == 0;
+	ctx = rswap_io_alloc(io->cpu, QP_STORE, GFP_NOIO);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
 	io->fallback = io->folio_order && io->transfer_order == 0;
 	ret = rswap_submit_folio(io, ctx, QP_STORE, false);
-	if (!ret || atomic_read(&ctx->pending))
+	if (!ret || atomic_read_acquire(&ctx->pending))
 		ret = rswap_io_poll(ctx, true);
 	if (ret && !ctx->fallback_attempted) {
 		ret = rswap_retry_base(io, ctx, QP_STORE);
-		if (!ret || atomic_read(&ctx->pending))
+		if (!ret || atomic_read_acquire(&ctx->pending))
 			ret = rswap_io_poll(ctx, true);
 	}
-	kfree(ctx);
+	rswap_io_free(ctx);
 	return ret;
 }
 
@@ -335,16 +377,16 @@ static int rswap_backend_load(struct hermit_io *io, bool async)
 	enum rdma_queue_type type = async ? QP_LOAD_ASYNC : QP_LOAD_SYNC;
 	int ret;
 
-	ctx = rswap_io_alloc(io->cpu, type);
-	if (!ctx)
-		return -ENOMEM;
-	ctx->fallback_attempted = io->transfer_order == 0;
+	ctx = rswap_io_alloc(io->cpu, type, async ? GFP_ATOMIC : GFP_NOIO);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
 	io->fallback = io->folio_order && io->transfer_order == 0;
 	ret = rswap_submit_folio(io, ctx, type, false);
-	if (ret && !atomic_read(&ctx->pending) && !ctx->fallback_attempted)
+	if (ret && !atomic_read_acquire(&ctx->pending) &&
+	    !ctx->fallback_attempted)
 		ret = rswap_retry_base(io, ctx, type);
-	if (ret && !atomic_read(&ctx->pending)) {
-		kfree(ctx);
+	if (ret && !atomic_read_acquire(&ctx->pending)) {
+		rswap_io_free(ctx);
 		return ret;
 	}
 	io->private = ctx;
@@ -352,11 +394,16 @@ static int rswap_backend_load(struct hermit_io *io, bool async)
 		return 0;
 	ret = rswap_io_poll(ctx, true);
 	if (ret && !ctx->fallback_attempted) {
-		rswap_retry_base(io, ctx, type);
-		ret = rswap_io_poll(ctx, true);
+		int retry_ret;
+
+		retry_ret = rswap_retry_base(io, ctx, type);
+		if (retry_ret)
+			ret = retry_ret;
+		else
+			ret = rswap_io_poll(ctx, true);
 	}
 	io->private = NULL;
-	kfree(ctx);
+	rswap_io_free(ctx);
 	return ret;
 }
 
@@ -371,8 +418,8 @@ static int rswap_backend_poll(struct hermit_io *io, bool wait)
 	if (ret == -EAGAIN)
 		return ret;
 	if (ret && !ctx->fallback_attempted) {
-		ret = rswap_retry_base(io, ctx, QP_LOAD_ASYNC);
-		if (ret && !atomic_read(&ctx->pending))
+		ret = rswap_retry_base(io, ctx, ctx->type);
+		if (ret && !atomic_read_acquire(&ctx->pending))
 			goto done;
 		ret = rswap_io_poll(ctx, wait);
 		if (ret == -EAGAIN)
@@ -380,7 +427,7 @@ static int rswap_backend_poll(struct hermit_io *io, bool wait)
 	}
 done:
 	io->private = NULL;
-	kfree(ctx);
+	rswap_io_free(ctx);
 	return ret;
 }
 
@@ -392,22 +439,62 @@ static struct hermit_backend_ops rswap_backend_ops = {
 
 int rswap_register_backend(void)
 {
+	unsigned int pool_min = max_t(unsigned int, 64, num_queues);
+	unsigned long flags;
 	int ret;
+
+	rswap_io_ctx_cache = kmem_cache_create("rswap_io_context",
+					       sizeof(struct rswap_io_context), 0,
+					       SLAB_HWCACHE_ALIGN, NULL);
+	if (!rswap_io_ctx_cache)
+		return -ENOMEM;
+	rswap_io_ctx_pool = mempool_create_slab_pool(pool_min,
+						 rswap_io_ctx_cache);
+	if (!rswap_io_ctx_pool) {
+		kmem_cache_destroy(rswap_io_ctx_cache);
+		rswap_io_ctx_cache = NULL;
+		return -ENOMEM;
+	}
+	atomic_set(&rswap_active_io, 0);
+	spin_lock_irqsave(&rswap_io_lifecycle_lock, flags);
+	rswap_stopping = false;
+	spin_unlock_irqrestore(&rswap_io_lifecycle_lock, flags);
 
 	max_order = min_t(unsigned int, max_order, PMD_ORDER);
 	rswap_backend_ops.supported_order_mask = BIT(0);
 	if (max_order >= 2)
 		rswap_backend_ops.supported_order_mask |= GENMASK(max_order, 2);
 	ret = hermit_register_backend(&rswap_backend_ops);
+	if (ret) {
+		spin_lock_irqsave(&rswap_io_lifecycle_lock, flags);
+		rswap_stopping = true;
+		spin_unlock_irqrestore(&rswap_io_lifecycle_lock, flags);
+		mempool_destroy(rswap_io_ctx_pool);
+		kmem_cache_destroy(rswap_io_ctx_cache);
+		rswap_io_ctx_pool = NULL;
+		rswap_io_ctx_cache = NULL;
+		return ret;
+	}
 
-	if (!ret)
-		pr_info("rswap: Hermit RDMA backend registered\n");
+	pr_info("rswap: Hermit RDMA backend registered (io reserve=%u)\n",
+		pool_min);
 	return ret;
 }
 
 void rswap_unregister_backend(void)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&rswap_io_lifecycle_lock, flags);
+	rswap_stopping = true;
+	spin_unlock_irqrestore(&rswap_io_lifecycle_lock, flags);
+	wait_event(rswap_active_io_wait, !atomic_read(&rswap_active_io));
 	hermit_unregister_backend(&rswap_backend_ops);
+	drain_all_rdma_queues(0);
+	mempool_destroy(rswap_io_ctx_pool);
+	kmem_cache_destroy(rswap_io_ctx_cache);
+	rswap_io_ctx_pool = NULL;
+	rswap_io_ctx_cache = NULL;
 	pr_info("rswap: Hermit RDMA backend unregistered\n");
 }
 

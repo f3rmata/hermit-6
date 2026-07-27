@@ -23,8 +23,8 @@ TMPFS_FILL_MB=${TMPFS_FILL_MB:-400}
 SKIP_BUILD=${SKIP_BUILD:-0}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
 LAZY_POLL=${LAZY_POLL:-N}
-RECLAIM_MODE=${RECLAIM_MODE:-1}
-RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-65536}
+RECLAIM_MODE=${RECLAIM_MODE:-}
+RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-}
 REMOTE_ORDER_MASK=${REMOTE_ORDER_MASK:-0x1}
 THP_SIZE_KB=${THP_SIZE_KB:-0}
 MEMHOG_READY_TIMEOUT_SEC=${MEMHOG_READY_TIMEOUT_SEC:-180}
@@ -284,8 +284,12 @@ configure_hermit() {
     set_hermit_flag lazy_poll $LAZY_POLL
     set_hermit_flag apt_reclaim Y
     set_hermit_flag sthd_cnt $STHD_CNT
-    set_hermit_flag reclaim_mode $RECLAIM_MODE
-    set_hermit_flag reclaim_headroom_pages $RECLAIM_HEADROOM_PAGES
+    if [ -n "$RECLAIM_MODE" ]; then
+        set_hermit_flag reclaim_mode $RECLAIM_MODE
+    fi
+    if [ -n "$RECLAIM_HEADROOM_PAGES" ]; then
+        set_hermit_flag reclaim_headroom_pages $RECLAIM_HEADROOM_PAGES
+    fi
     set_hermit_flag remote_order_mask $REMOTE_ORDER_MASK
 }
 
@@ -403,8 +407,10 @@ RSWAP_LOADS_BEFORE=\$(read_rswap_dram_counter loads)
 RSWAP_ERRORS_BEFORE=\$(read_rswap_dram_counter errors)
 if [ "$THP_SIZE_KB" -gt 0 ]; then
     LARGE_STORES_BEFORE=\$(read_hermit_order_counter $((THP_SIZE_KB * 1024)) 3)
+    LARGE_FALLBACKS_BEFORE=\$(read_hermit_order_counter $((THP_SIZE_KB * 1024)) 5)
 else
     LARGE_STORES_BEFORE=0
+    LARGE_FALLBACKS_BEFORE=0
 fi
 PSWPIN_BEFORE=\$(read_vmstat_counter pswpin)
 PSWPOUT_BEFORE=\$(read_vmstat_counter pswpout)
@@ -483,6 +489,9 @@ if ! emit_validation_check local_swap_write_sectors_unchanged "\$RAMDISK_WRITE_S
 fi
 if [ "$THP_SIZE_KB" -gt 0 ]; then
     if ! emit_validation_check large_stores_before_gt_0 "\${LARGE_STORES_BEFORE:-0}" gt 0; then
+        VALIDATION_PASS=0
+    fi
+    if ! emit_validation_check large_fallbacks_before_gt_0 "\${LARGE_FALLBACKS_BEFORE:-0}" gt 0; then
         VALIDATION_PASS=0
     fi
 fi

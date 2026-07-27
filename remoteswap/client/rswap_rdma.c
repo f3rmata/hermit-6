@@ -147,8 +147,8 @@ void two_sided_message_done(struct ib_cq *cq, struct ib_wc *wc)
 		       __LINE__, wc->opcode);
 		goto out;
 	}
-	atomic_dec(&rdma_queue->rdma_post_counter);
 out:
+	atomic_dec_return_release(&rdma_queue->rdma_post_counter);
 	return;
 }
 
@@ -441,15 +441,8 @@ int rswap_create_rdma_queue(struct rdma_session_context *rdma_session,
 
 	cq_num_cqes =
 		rdma_session->send_queue_depth + rdma_session->recv_queue_depth;
-	if (rdma_queue->type == QP_LOAD_ASYNC) {
-		rdma_queue->cq =
-			ib_alloc_cq(cm_id->device, rdma_queue, cq_num_cqes,
-				    comp_vector, IB_POLL_SOFTIRQ);
-	} else {
-		rdma_queue->cq =
-			ib_alloc_cq(cm_id->device, rdma_queue, cq_num_cqes,
-				    comp_vector, IB_POLL_DIRECT);
-	}
+	rdma_queue->cq = ib_alloc_cq(cm_id->device, rdma_queue, cq_num_cqes,
+				      comp_vector, IB_POLL_DIRECT);
 
 	if (IS_ERR(rdma_queue->cq)) {
 		pr_err("%s, ib_create_cq failed\n", __func__);
@@ -728,9 +721,8 @@ int rswap_init_rdma_queue(struct rdma_session_context *rdma_session, int idx)
 
 	rdma_queue->state = IDLE;
 	init_waitqueue_head(&rdma_queue->sem);
-	spin_lock_init(&(rdma_queue->cq_lock));
+	mutex_init(&rdma_queue->cq_lock);
 	atomic_set(&(rdma_queue->rdma_post_counter), 0);
-	atomic_set(&rdma_queue->rdma_error, 0);
 	rdma_queue->fs_rdma_req_cache =
 		kmem_cache_create("fs_rdma_req_cache",
 				  sizeof(struct fs_rdma_req), 0,
@@ -861,6 +853,11 @@ void rswap_free_rdma_structure(struct rdma_session_context *rdma_session)
 			print_debug("%s, free rdma_queue[%d] ib_cq  done. \n",
 				    __func__, i);
 		}
+
+		if (rdma_queue->fs_rdma_req_cache != NULL) {
+			kmem_cache_destroy(rdma_queue->fs_rdma_req_cache);
+			rdma_queue->fs_rdma_req_cache = NULL;
+		}
 	}
 
 	if (rdma_session->rdma_dev->pd != NULL) {
@@ -904,6 +901,7 @@ int rswap_disconnect_and_collect_resource(
 			__func__, i);
 	}
 	for (i = 0; i < num_queues; i++) {
+		rdma_queue = &(rdma_session->rdma_queues[i]);
 		wait_event_interruptible(rdma_queue->sem,
 					 rdma_queue->state == CM_DISCONNECT);
 	}

@@ -183,8 +183,8 @@ LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-}
 MEMCACHED_MEM_MB=${MEMCACHED_MEM_MB:-16384}
 MEMCACHED_MAX_CONN=${MEMCACHED_MAX_CONN:-32768}
 STHD_CNT=${STHD_CNT:-16}
-RECLAIM_MODE=${RECLAIM_MODE:-1}
-RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-65536}
+RECLAIM_MODE=${RECLAIM_MODE:-}
+RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-}
 LAZY_POLL=${LAZY_POLL:-N}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
 HERMIT_SWAPOUT_POLICY=${HERMIT_SWAPOUT_POLICY:-exclusive}
@@ -577,9 +577,6 @@ configure_hermit_mode() {
   done
 
   set_debugfs_file /sys/kernel/debug/hermit/sthd_cnt "$STHD_CNT"
-  set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode "$RECLAIM_MODE"
-  set_debugfs_file /sys/kernel/debug/hermit/reclaim_headroom_pages \
-    "$RECLAIM_HEADROOM_PAGES"
 
   case "$MODE" in
     cgroup-hermit|hermit)
@@ -611,9 +608,14 @@ configure_hermit_mode() {
         rdma_die "Hermit benchmark requires rswap backend '$RSWAP_REQUIRED_BACKEND', found '$backend'. Load the RDMA client or set RSWAP_REQUIRED_BACKEND= to disable this check."
       fi
       set_debugfs_file /sys/kernel/debug/hermit/sthd_cnt "$STHD_CNT"
-      set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode "$RECLAIM_MODE"
-      set_debugfs_file /sys/kernel/debug/hermit/reclaim_headroom_pages \
-        "$RECLAIM_HEADROOM_PAGES"
+      if [ -n "$RECLAIM_MODE" ]; then
+        set_debugfs_file /sys/kernel/debug/hermit/reclaim_mode \
+          "$RECLAIM_MODE"
+      fi
+      if [ -n "$RECLAIM_HEADROOM_PAGES" ]; then
+        set_debugfs_file /sys/kernel/debug/hermit/reclaim_headroom_pages \
+          "$RECLAIM_HEADROOM_PAGES"
+      fi
       ;;
     cgroup-linux|linux|local)
       if sudo_test -d /sys/kernel/debug/rswap_rdma 2>/dev/null || \
@@ -910,8 +912,12 @@ save_config() {
     printf 'mutilate_cores=%s\n' "${MUTILATE_CORES:-}"
     printf 'hermit_reserved_cores=%s\n' "${HERMIT_RESERVED_CORES:-}"
     printf 'sthd_cnt=%s\n' "$STHD_CNT"
-    printf 'reclaim_mode=%s\n' "$RECLAIM_MODE"
-    printf 'reclaim_headroom_pages=%s\n' "$RECLAIM_HEADROOM_PAGES"
+    printf 'reclaim_mode_requested=%s\n' "$RECLAIM_MODE"
+    printf 'reclaim_mode_actual=%s\n' "$(read_hermit_counter reclaim_mode)"
+    printf 'reclaim_headroom_pages_requested=%s\n' \
+      "$RECLAIM_HEADROOM_PAGES"
+    printf 'reclaim_headroom_pages_actual=%s\n' \
+      "$(read_hermit_counter reclaim_headroom_pages)"
     printf 'bypass_swapcache=%s\n' "$BYPASS_SWAPCACHE"
     printf 'lazy_poll=%s\n' "$LAZY_POLL"
     printf 'hermit_swapout_policy=%s\n' "$HERMIT_SWAPOUT_POLICY"

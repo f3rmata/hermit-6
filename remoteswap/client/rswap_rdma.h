@@ -31,6 +31,7 @@
 #include <linux/delay.h>
 #include <linux/page-flags.h>
 #include <linux/smp.h>
+#include <linux/mutex.h>
 
 #include "constants.h"
 #include "utils.h"
@@ -139,10 +140,9 @@ struct rswap_rdma_queue {
 
 	enum rdma_queue_state state;
 	wait_queue_head_t sem;
-	spinlock_t cq_lock;
+	struct mutex cq_lock;
 	uint8_t freed;
 	atomic_t rdma_post_counter;
-	atomic_t rdma_error;
 
 	int q_index;
 	enum rdma_queue_type type;
