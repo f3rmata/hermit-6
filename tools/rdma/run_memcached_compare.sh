@@ -41,23 +41,44 @@ fi
 
 MODES=${MODES:-"local cgroup-linux cgroup-hermit"}
 BASE_RUN_ID=${BASE_RUN_ID:-"$(date +%Y%m%d-%H%M%S)-${KERNEL_TAG}"}
+current_mode=
+current_result_dir=
+
+cleanup() {
+  local ret=$?
+
+  if [ -n "$current_result_dir" ]; then
+    env MODE="$current_mode" KERNEL_TAG="$KERNEL_TAG" RESULT_DIR="$current_result_dir" \
+      PID_FILE="$current_result_dir/memcached.pid" \
+      "$SCRIPT_DIR/memcached.sh" stop || true
+  fi
+  exit "$ret"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for mode in $MODES; do
   mode=$(normalize_mode "$mode")
   run_id="${BASE_RUN_ID}-${mode}"
   result_dir="$RESULT_ROOT/$run_id"
+  current_mode=$mode
+  current_result_dir=$result_dir
   rdma_log "=== kernel=$KERNEL_TAG mode=$mode result=$result_dir ==="
 
-  MODE=$mode KERNEL_TAG=$KERNEL_TAG RESULT_DIR=$result_dir PID_FILE="$result_dir/memcached.pid" \
+  env MODE="$mode" KERNEL_TAG="$KERNEL_TAG" RESULT_DIR="$result_dir" PID_FILE="$result_dir/memcached.pid" \
     "$SCRIPT_DIR/memcached_load.sh" --mode "$mode" --kernel "$KERNEL_TAG" --result-dir "$result_dir" --port "$PORT"
 
-  MODE=$mode KERNEL_TAG=$KERNEL_TAG RESULT_DIR=$result_dir PID_FILE="$result_dir/memcached.pid" \
+  env MODE="$mode" KERNEL_TAG="$KERNEL_TAG" RESULT_DIR="$result_dir" PID_FILE="$result_dir/memcached.pid" \
     "$SCRIPT_DIR/memcached_bench.sh" --mode "$mode" --kernel "$KERNEL_TAG" --result-dir "$result_dir" --port "$PORT"
 
-  MODE=$mode KERNEL_TAG=$KERNEL_TAG RESULT_DIR=$result_dir PID_FILE="$result_dir/memcached.pid" \
+  env MODE="$mode" KERNEL_TAG="$KERNEL_TAG" RESULT_DIR="$result_dir" PID_FILE="$result_dir/memcached.pid" \
     "$SCRIPT_DIR/memcached.sh" stop || true
+  current_result_dir=
 
   sleep "${BETWEEN_MODE_SLEEP_SEC:-10}"
 done
 
+trap - EXIT INT TERM
 rdma_log "aggregate CSV: $AGGREGATE_CSV"

@@ -548,6 +548,53 @@ grep -E '^(AnonHugePages|SwapTotal|SwapFree):' /proc/meminfo
 
 不要使用 `memcached -L` 代替 THP；`-L` 请求的是显式 HugeTLB，语义不同。
 
+### 6.4 一键采集 4 KiB 到 2 MiB 结果
+
+`tools/rdma/run_memcached_page_sweep.sh` 会对 4、16、32、64、128、256、512、
+1024 和 2048 KiB 分别设置 THP/mTHP policy 与 `remote_order_mask`，每种粒度都
+重启 memcached、重新 load，并独立运行 mutilate。不存在的 THP size 或未被当前
+RDMA `max_order` 支持的 order 会在索引中标为 `skipped-*`，不会伪造结果。
+
+```bash
+cd ~/hermit-6
+
+export MODE=cgroup-hermit
+export SERVER_ADDR=127.0.0.1
+export PORT=11211
+export MEMCACHED_BIN="$HOME/memcached/memcached"
+export MUTILATE_BIN="$HOME/mutilate/mutilate"
+export MEMCACHED_CORES=0-7
+export MUTILATE_CORES=8-15
+export MEMCACHED_THREADS=8
+export MUTILATE_THREADS=8
+export RECORDS=32000000
+export MEMCACHED_MEM_MB=16384
+export LOCAL_RATIO_PCT=85
+export RECLAIM_MODE=1
+export STHD_CNT=16
+export RECLAIM_HEADROOM_PAGES=131072
+export LOADS='100000 250000 500000'
+export BENCH_REPEATS=3
+
+tools/rdma/run_memcached_page_sweep.sh
+```
+
+结果根目录打印在结束日志中，包含：
+
+- `page-sweep.csv`：每个页大小的 requested/effective mask、状态与结果目录；
+- `page-sweep-summary.csv`：带 `page_kb` 和 order 列的各 QPS 中位数；
+- `<size>/page-state-before.txt`、`page-state-after.txt`：实际 THP/mTHP 统计、
+  `AnonHugePages` 和 Hermit `order_stats` 快照。
+
+该脚本及 `run_memcached_compare.sh` 都用 `EXIT/INT/TERM` trap 停止本次启动的
+memcached，因此正常结束、错误和 Ctrl-C 不会遗留本次 PID 或端口。对旧版本遗留
+进程，先确认监听者再按其 PID 停止，避免误杀其他服务：
+
+```bash
+sudo ss -ltnp "sport = :11211"
+sudo kill <确认属于-memcached-的PID>
+```
+
 ## 7. 监控与验收
 
 在 dnet-61 开三个终端：
