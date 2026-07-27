@@ -30,8 +30,8 @@ bool_to_yn() {
 
 normalize_mode() {
   case "${1:-local}" in
-    cgroup_linux) printf 'cgroup-linux' ;;
-    cgroup_hermit) printf 'cgroup-hermit' ;;
+    cgroup_linux|local-cgroup|cgroup-local) printf 'cgroup-linux' ;;
+    cgroup_hermit|hermit-cgroup) printf 'cgroup-hermit' ;;
     *) printf '%s' "${1:-local}" ;;
   esac
 }

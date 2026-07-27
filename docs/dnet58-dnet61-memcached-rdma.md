@@ -550,15 +550,22 @@ grep -E '^(AnonHugePages|SwapTotal|SwapFree):' /proc/meminfo
 
 ### 6.4 一键采集 4 KiB 到 2 MiB 结果
 
-`tools/rdma/run_memcached_page_sweep.sh` 会对 4、16、32、64、128、256、512、
-1024 和 2048 KiB 分别设置 THP/mTHP policy 与 `remote_order_mask`，每种粒度都
-重启 memcached、重新 load，并独立运行 mutilate。不存在的 THP size 或未被当前
-RDMA `max_order` 支持的 order 会在索引中标为 `skipped-*`，不会伪造结果。
+`tools/rdma/run_memcached_page_sweep.sh` 会以页大小为外层循环，对 4、16、32、
+64、128、256、512、1024 和 2048 KiB 依次运行 `local`、`local-cgroup` 与
+`hermit-cgroup`。三个模式共用该页大小的 THP/mTHP policy；只有 Hermit 组会设置
+`remote_order_mask` 并校验 backend capability。每个页大小/模式组合都会重启
+memcached、重新 load，并独立运行 mutilate。
+
+若 `local` / `local-cgroup` 的定义是**原生 Linux 基线**，必须在运行它们前卸载
+`rswap_client`；已加载的 remote backend 会继续接管 swapout，因而不能当作纯本地
+基线。脚本不会自动 `swapoff` 或装卸模块，避免在仍有 remote-only entry 时丢失数据。
+在同一轮脚本中保留已加载 backend 时，前两组只代表“不启用 Hermit benchmark
+控制项”的对照，而不是 native-swap 基线。
 
 ```bash
 cd ~/hermit-6
 
-export MODE=cgroup-hermit
+export MODES='local local-cgroup hermit-cgroup'
 export SERVER_ADDR=127.0.0.1
 export PORT=11211
 export MEMCACHED_BIN="$HOME/memcached/memcached"
@@ -581,9 +588,9 @@ tools/rdma/run_memcached_page_sweep.sh
 
 结果根目录打印在结束日志中，包含：
 
-- `page-sweep.csv`：每个页大小的 requested/effective mask、状态与结果目录；
-- `page-sweep-summary.csv`：带 `page_kb` 和 order 列的各 QPS 中位数；
-- `<size>/page-state-before.txt`、`page-state-after.txt`：实际 THP/mTHP 统计、
+- `page-sweep.csv`：每个页大小/模式的 mask、状态与结果目录；
+- `page-sweep-summary.csv`：带 `page_kb`、order 和 mode 列的各 QPS 中位数；
+- `<size>/<mode>/page-state-before.txt`、`page-state-after.txt`：实际 THP/mTHP 统计、
   `AnonHugePages` 和 Hermit `order_stats` 快照。
 
 该脚本及 `run_memcached_compare.sh` 都用 `EXIT/INT/TERM` trap 停止本次启动的
