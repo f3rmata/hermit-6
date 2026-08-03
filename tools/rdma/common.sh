@@ -545,6 +545,25 @@ read_hermit_counter() {
   printf '0'
 }
 
+read_hermit_order_stat() {
+  # order_stats lines are "order size_bytes stores loads fallback_4k errors".
+  # Sum the named column across all orders.  The 6.18 Hermit port does not
+  # expose the swapout_* debugfs counters the older branches had, so the
+  # benchmark derives the Hermit-side swapout numbers from order_stats.
+  local col
+  case "$1" in
+    stores)      col=3 ;;
+    loads)       col=4 ;;
+    fallback_4k) col=5 ;;
+    errors)      col=6 ;;
+    *) printf '0'; return ;;
+  esac
+  sudo_test -r /sys/kernel/debug/hermit/order_stats 2>/dev/null ||
+    { printf '0'; return; }
+  sudo_cat /sys/kernel/debug/hermit/order_stats 2>/dev/null | \
+    awk -v c="$col" 'NR > 1 { s += $c } END { printf "%d", s }'
+}
+
 detect_rswap_backend() {
   if sudo_test -d /sys/kernel/debug/rswap_rdma 2>/dev/null; then
     printf 'rdma'
@@ -694,15 +713,6 @@ read_activity_counter() {
       ;;
     backend_errors)
       read_debug_counter errors
-      ;;
-    hermit_swapout_native_fallbacks)
-      read_hermit_counter swapout_native_fallbacks
-      ;;
-    hermit_swapout_exclusive_completions)
-      read_hermit_counter swapout_exclusive_completions
-      ;;
-    hermit_swapout_writethrough_completions)
-      read_hermit_counter swapout_writethrough_completions
       ;;
     *)
       printf '0'
@@ -875,13 +885,12 @@ capture_counters() {
     printf 'backend_post_errors=%s\n' "$(read_debug_counter post_errors)"
     printf 'backend_wc_errors=%s\n' "$(read_debug_counter wc_errors)"
     printf 'backend_errors=%s\n' "$(read_debug_counter errors)"
-    printf 'hermit_swapout_backend_stores=%s\n' "$(read_hermit_counter swapout_backend_stores)"
-    printf 'hermit_swapout_backend_store_errors=%s\n' "$(read_hermit_counter swapout_backend_store_errors)"
-    printf 'hermit_swapout_backend_poll_errors=%s\n' "$(read_hermit_counter swapout_backend_poll_errors)"
-    printf 'hermit_swapout_native_fallbacks=%s\n' "$(read_hermit_counter swapout_native_fallbacks)"
-    printf 'hermit_swapout_exclusive_completions=%s\n' "$(read_hermit_counter swapout_exclusive_completions)"
-    printf 'hermit_swapout_writethrough_completions=%s\n' "$(read_hermit_counter swapout_writethrough_completions)"
-    printf 'hermit_swapout_large_folio_fallbacks=%s\n' "$(read_hermit_counter swapout_large_folio_fallbacks)"
+    # Hermit-side swapout numbers come from order_stats (see
+    # read_hermit_order_stat); the swapout_* debugfs counters do not exist in
+    # the 6.18 Hermit port and always read as zero.
+    printf 'hermit_swapout_backend_stores=%s\n' "$(read_hermit_order_stat stores)"
+    printf 'hermit_swapout_backend_store_errors=%s\n' "$(read_hermit_order_stat errors)"
+    printf 'hermit_swapout_large_folio_fallbacks=%s\n' "$(read_hermit_order_stat fallback_4k)"
     printf 'memcached_curr_items=%s\n' "$(stat_from_file "$stats_file" curr_items)"
     printf 'memcached_evictions=%s\n' "$(stat_from_file "$stats_file" evictions)"
     printf 'memcached_bytes=%s\n' "$(stat_from_file "$stats_file" bytes)"

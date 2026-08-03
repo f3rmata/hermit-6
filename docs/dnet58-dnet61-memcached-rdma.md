@@ -627,10 +627,27 @@ export FINAL_ACTION=leave-hermit
 tools/rdma/run_memcached_native_hermit_sweep.sh
 ```
 
+> **页大小限制**：`/swapfile` 是 swap 文件（`S_ISREG`），内核 swap 槽位分配器
+> （`cluster_alloc_swap_entry`）不为它分配 order>0 槽位，所有 folio 都被拆成
+> 4 KiB，`remote_order_mask` 的 bit 2–9 实际不生效。要启用 >4 KiB 的远端传输，
+> 把 swap 放到**块设备**上：
+>
+> ```bash
+> # 方式一：裸分区
+> export RSWAP_SWAP_DEV=/dev/<空闲分区>
+> # 方式二：回环设备（无需分区）
+> RSWAP_SWAP_FILE="$HOME/swapfile" RSWAP_MEM_GB=48 \
+>   ./remoteswap/client/manage_rswap_client.sh loop
+> export RSWAP_SWAP_DEV=/dev/loopN   # 上一步打印的设备
+> ```
+>
+> 之后再运行 `run_memcached_native_hermit_sweep.sh`。`get_swap_stats` 的签名已
+> 从 `int*` 改为 `long*`。
+
 该脚本会在开始前先 `swapoff` 当前 swapfile 并卸载 `rswap_client`，所以确保没有
 其他业务依赖该 swapfile。`manage_rswap_client.sh` 现支持
-`RSWAP_SERVER_IP`、`RSWAP_SERVER_PORT`、`RSWAP_SWAP_FILE` 与 `RSWAP_MEM_GB`
-环境变量；不要再依赖其历史默认值 `10.0.0.2`。
+`RSWAP_SERVER_IP`、`RSWAP_SERVER_PORT`、`RSWAP_SWAP_FILE`、`RSWAP_SWAP_DEV` 与
+`RSWAP_MEM_GB` 环境变量；不要再依赖其历史默认值 `10.0.0.2`。
 
 ## 7. 监控与验收
 

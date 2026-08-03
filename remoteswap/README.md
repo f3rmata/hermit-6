@@ -68,6 +68,35 @@ store is authoritative and skips the local swap BIO; a failed store falls back
 to the native swap path. Direct asynchronous swapin and lazy polling are
 controlled through `/sys/kernel/debug/hermit/`.
 
+### Swap device
+
+The kernel swap slot allocator only hands out order>0 (larger than 4 KiB) slots
+when the swap device sets `SWP_BLKDEV`, which happens only for block devices
+(raw partitions or loop devices). A swap *file* is always broken down to 4 KiB
+by the swap subsystem, so `remote_order_mask` bits above bit 0 never take effect
+and every remote transfer is a 4 KiB store/load.
+
+`manage_rswap_client.sh` accepts either kind of swap target:
+
+```bash
+# Swap file (default, order-0 only).
+RSWAP_SWAP_FILE="$HOME/swapfile" RSWAP_MEM_GB=48 ./manage_rswap_client.sh install
+
+# Raw partition or existing loop device (order>0 supported).
+RSWAP_SWAP_DEV=/dev/nvme0n1p5 RSWAP_MEM_GB=48 ./manage_rswap_client.sh install
+
+# Bind a swap file to a loop device, then install against it.
+RSWAP_SWAP_FILE="$HOME/swapfile" RSWAP_MEM_GB=48 ./manage_rswap_client.sh loop
+# -> prints RSWAP_SWAP_DEV=/dev/loopN; then:
+RSWAP_SWAP_DEV=/dev/loopN ./manage_rswap_client.sh install
+```
+
+For a block device, `rmsize` is taken from `RSWAP_MEM_GB` when set, otherwise
+derived from `blockdev --getsize64` (GiB). `uninstall` detaches a `/dev/loop*`
+target after swapping it off. Keep `RSWAP_MEM_GB` consistent with the actual
+device size so the remote pool and the swap slots line up. Note that
+`bypass_swapcache` direct swap-in is only legal on a synchronous swap device.
+
 The transfer size is selected with `remote_order_mask`. Bit 0 is 4 KiB, bit 2
 is 16 KiB, and bit 9 is 2 MiB; bit 1 is not valid. The default is `0x1`, and
 bit 0 is mandatory so every configuration has a base-page path. For example:

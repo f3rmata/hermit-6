@@ -1,1 +1,5 @@
 docs/blowfish-paper-analysis.md
+tools/rdma/plot_page_sweep.py
+tools/rdma/plot_page_size_throughput_prediction.py
+tools/rdma/plot_measured_peak_by_page.py
+tools/rdma/plot_measured_hermit_page_sweep.py

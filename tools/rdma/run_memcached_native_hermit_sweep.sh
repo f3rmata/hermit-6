@@ -26,6 +26,7 @@ Required environment:
 Optional environment:
   RSWAP_SERVER_PORT=9400
   RSWAP_SWAP_FILE=$HOME/swapfile
+  RSWAP_SWAP_DEV=/dev/loopN      (optional block device; required for order>0)
   RSWAP_MEM_GB=48
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
   BASE_RUN_ID=<timestamp>-native-hermit
@@ -41,6 +42,11 @@ fi
 : "${RSWAP_SERVER_IP:?set RSWAP_SERVER_IP to the dnet-58 RDMA address}"
 RSWAP_SERVER_PORT=${RSWAP_SERVER_PORT:-9400}
 RSWAP_SWAP_FILE=${RSWAP_SWAP_FILE:-"$HOME/swapfile"}
+# Optional block device (raw partition or loop device).  A block device is
+# required for Hermit to receive order>0 (larger than 4 KiB) folios; a swap
+# file is always split to 4 KiB by the kernel's swap allocator.
+RSWAP_SWAP_DEV=${RSWAP_SWAP_DEV:-}
+SWAP_TARGET=${RSWAP_SWAP_DEV:-$RSWAP_SWAP_FILE}
 RSWAP_MEM_GB=${RSWAP_MEM_GB:-48}
 FINAL_ACTION=${FINAL_ACTION:-leave-hermit}
 BASE_RUN_ID=${BASE_RUN_ID:-"$(date +%Y%m%d-%H%M%S)-${KERNEL_TAG}-native-hermit"}
@@ -55,7 +61,11 @@ case "$FINAL_ACTION" in
 esac
 
 test -x "$MANAGE_SCRIPT" || rdma_die "missing executable $MANAGE_SCRIPT"
-test -f "$RSWAP_SWAP_FILE" || rdma_die "swap file does not exist: $RSWAP_SWAP_FILE"
+if [ -n "$RSWAP_SWAP_DEV" ]; then
+  test -b "$SWAP_TARGET" || rdma_die "block device does not exist: $SWAP_TARGET"
+else
+  test -f "$SWAP_TARGET" || rdma_die "swap file does not exist: $SWAP_TARGET"
+fi
 sudo -v
 
 client_loaded() {
@@ -63,17 +73,20 @@ client_loaded() {
 }
 
 swap_is_active() {
-  swapon --noheadings --raw --output NAME | grep -Fxq "$RSWAP_SWAP_FILE"
+  # /proc/swaps and swapon -s escape spaces as \040; decode for a literal match.
+  swapon -s | awk -v target="$SWAP_TARGET" \
+    '{ path = $1; gsub(/\\040/, " ", path);
+       if (path == target) { found = 1 } } END { exit !found }'
 }
 
 activate_native_swap() {
   if swap_is_active; then
-    sudo swapoff "$RSWAP_SWAP_FILE"
+    sudo swapoff "$SWAP_TARGET"
   fi
   if client_loaded; then
     sudo rmmod rswap_client
   fi
-  sudo swapon "$RSWAP_SWAP_FILE"
+  sudo swapon "$SWAP_TARGET"
 }
 
 install_hermit_client() {
@@ -81,6 +94,7 @@ install_hermit_client() {
     cd "$CLIENT_DIR"
     RSWAP_SERVER_IP="$RSWAP_SERVER_IP" \
       RSWAP_SERVER_PORT="$RSWAP_SERVER_PORT" \
+      RSWAP_SWAP_DEV="$RSWAP_SWAP_DEV" \
       RSWAP_SWAP_FILE="$RSWAP_SWAP_FILE" \
       RSWAP_MEM_GB="$RSWAP_MEM_GB" \
       ./manage_rswap_client.sh install
@@ -92,12 +106,12 @@ install_hermit_client() {
 
 unload_hermit_client() {
   if swap_is_active; then
-    sudo swapoff "$RSWAP_SWAP_FILE"
+    sudo swapoff "$SWAP_TARGET"
   fi
   if client_loaded; then
     sudo rmmod rswap_client
   fi
-  sudo swapon "$RSWAP_SWAP_FILE"
+  sudo swapon "$SWAP_TARGET"
 }
 
 rdma_log "phase=native: unloading rswap_client and enabling local swap"

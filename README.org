@@ -168,6 +168,13 @@ rswap: Hermit RDMA backend registered
 卸载 backend 前必须先停止使用相应 swap 设备并确保没有远端 entry 或未完成的
 RDMA 请求。
 
+=4KiB= 以上的远端传输要求 swap 落在**块设备**上（裸分区或 =losetup= 回环设备）：
+内核 swap 槽位分配器（=cluster_alloc_swap_entry=）只在 =SWP_BLKDEV= 置位时分配
+order>0 的连续槽位，swapfile（=S_ISREG=）不满足，所有 folio 都会被拆成 4 KiB，
+=remote_order_mask= 的 bit 2–9 因此永不生效。使用 =RSWAP_SWAP_DEV= 指定块设备，
+或用 =manage_rswap_client.sh loop= 把 swap 文件绑定成回环设备；详见
+=remoteswap/README.md=。注意 =bypass_swapcache= 直读只在同步 swap 设备上合法。
+
 * 控制面与 ABI
 
 Hermit 控制项位于 =/sys/kernel/debug/hermit/=：
@@ -221,12 +228,13 @@ base-page submit 失败会在原请求完成后统一重试 4 KiB 路径。
 
 #+begin_example
 471 reset_swap_stats(void)
-472 get_swap_stats(int *ondemand, int *prefetch, int *hit_on_cache)
+472 get_swap_stats(long *ondemand, long *prefetch, long *hit_on_cache)
 #+end_example
 
-=get_swap_stats= 同时向 dmesg 输出原有字段名，包括 =Demand=、=Prefetch=、
-=TotalSwapOut=、=TotalReclaim=、=major swap duration=、=RDMA read latency= 和
-=Poll wait=。
+=get_swap_stats= 只返回三个 =long= 计数，不在调用时向 dmesg 输出（避免日志刷屏）；
+完整的字段名与各时延统计由 =hermit_stats_report()= 保留用于显式报告，包括
+=Demand=、=Prefetch=、=HitOnCache=、=TotalSwapOut=、=TotalReclaim=、
+=major swap duration=、=RDMA read latency= 和 =Poll wait=。
 
 * 当前边界
 

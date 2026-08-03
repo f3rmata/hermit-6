@@ -306,12 +306,41 @@ static int rswap_io_poll(struct rswap_io_context *ctx, bool wait)
 	return atomic_read(&ctx->status);
 }
 
+/*
+ * Verify the whole extent maps inside the remote pool before posting any WR,
+ * mirroring the per-page checks in rswap_rdma_send().  Without this, a
+ * mapping error partway through the base-page loop would leave the already
+ * posted pages in flight when the error is returned.
+ */
+static bool rswap_extent_in_pool(pgoff_t offset, unsigned int nr_pages)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_pages; i++) {
+		size_t page_addr = pgoff2addr(offset + i);
+		size_t chunk_idx = page_addr >> CHUNK_SHIFT;
+		size_t within = page_addr & CHUNK_MASK;
+		struct remote_chunk *chunk;
+
+		if (chunk_idx >= rdma_session_global.remote_mem_pool.chunk_num)
+			return false;
+		chunk = &rdma_session_global.remote_mem_pool.chunks[chunk_idx];
+		if (within >= chunk->mapped_size ||
+		    PAGE_SIZE > chunk->mapped_size - within)
+			return false;
+	}
+	return true;
+}
+
 static int rswap_submit_folio(struct hermit_io *io,
 			      struct rswap_io_context *ctx,
 			      enum rdma_queue_type type, bool base_pages)
 {
 	unsigned int i, nr_pages = folio_nr_pages(io->folio);
 	int ret;
+
+	if (!rswap_extent_in_pool(swp_offset(io->entry), nr_pages))
+		return -ERANGE;
 
 	if (!base_pages && io->transfer_order == io->folio_order &&
 	    io->folio_order) {
@@ -328,6 +357,13 @@ static int rswap_submit_folio(struct hermit_io *io,
 				      swp_offset(io->entry) + i,
 				      folio_page(io->folio, i), PAGE_SIZE, type);
 		if (ret) {
+			/*
+			 * Some earlier WRs may already be posted; drain them
+			 * so the caller can retry with a clean pending count
+			 * instead of tripping the WARN in rswap_retry_base().
+			 */
+			if (atomic_read_acquire(&ctx->pending))
+				rswap_io_poll(ctx, true);
 			atomic_cmpxchg(&ctx->status, 0, ret);
 			return ret;
 		}
