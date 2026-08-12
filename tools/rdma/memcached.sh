@@ -54,6 +54,15 @@ start_memcached() {
     return 0
   fi
 
+  # An orphaned memcached from an aborted run can hold $PORT and make the new
+  # instance fail with "Address already in use".  The PID_FILE-tracked process
+  # was handled above, so this only targets untracked strays of the same binary.
+  if pgrep -f "$bin" >/dev/null 2>&1; then
+    rdma_log "killing stale memcached holding port $PORT"
+    pkill -f "$bin" 2>/dev/null || true
+    sleep 1
+  fi
+
   rdma_log "starting memcached on cores $MEMCACHED_CORES, threads $MEMCACHED_THREADS"
   if [ "$(id -u)" -eq 0 ]; then
     "${BENCH_CMD_PREFIX[@]}" taskset -c "$MEMCACHED_CORES" "$bin" -u "${MEMCACHED_USER:-root}" \

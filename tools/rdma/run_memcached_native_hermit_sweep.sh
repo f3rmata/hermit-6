@@ -61,16 +61,62 @@ case "$FINAL_ACTION" in
 esac
 
 test -x "$MANAGE_SCRIPT" || rdma_die "missing executable $MANAGE_SCRIPT"
-if [ -n "$RSWAP_SWAP_DEV" ]; then
-  test -b "$SWAP_TARGET" || rdma_die "block device does not exist: $SWAP_TARGET"
-else
-  test -f "$SWAP_TARGET" || rdma_die "swap file does not exist: $SWAP_TARGET"
-fi
 sudo -v
 
 client_loaded() {
   [ -d /sys/module/rswap_client ]
 }
+
+ensure_loop_bound() {
+  # Make the loop swap self-healing after a reboot or cleanup:
+  #  - a loop bound to a deleted backing file is detached and re-bound;
+  #  - a missing backing file is recreated (fallocate + mkswap) so the
+  #    native phase's swapon works without manual setup.
+  local name backing
+  case "$RSWAP_SWAP_DEV" in
+    /dev/loop*) ;;
+    *) return 0 ;;
+  esac
+  name=${RSWAP_SWAP_DEV#/dev/}
+  backing=$(sudo_cat "/sys/block/$name/loop/backing_file" 2>/dev/null || true)
+  if [ -n "$backing" ]; then
+    case "$backing" in
+      *" (deleted)")
+        rdma_log "loop device $RSWAP_SWAP_DEV bound to deleted file; re-binding"
+        sudo losetup -d "$RSWAP_SWAP_DEV" || \
+          rdma_die "losetup -d $RSWAP_SWAP_DEV failed"
+        ;;
+      *)
+        rdma_log "loop device $RSWAP_SWAP_DEV already bound to $backing"
+        return 0
+        ;;
+    esac
+  fi
+  [ -n "$RSWAP_SWAP_FILE" ] || \
+    rdma_die "RSWAP_SWAP_FILE is required to bind $RSWAP_SWAP_DEV"
+  if [ ! -f "$RSWAP_SWAP_FILE" ]; then
+    [ -n "$RSWAP_MEM_GB" ] || \
+      rdma_die "RSWAP_MEM_GB required to recreate $RSWAP_SWAP_FILE"
+    rdma_log "creating swap backing file $RSWAP_SWAP_FILE ($RSWAP_MEM_GB GiB)"
+    sudo fallocate -l "${RSWAP_MEM_GB}G" "$RSWAP_SWAP_FILE" || \
+      rdma_die "fallocate $RSWAP_SWAP_FILE failed"
+    sudo chmod 600 "$RSWAP_SWAP_FILE"
+    sudo mkswap "$RSWAP_SWAP_FILE" >/dev/null 2>&1 || \
+      rdma_die "mkswap $RSWAP_SWAP_FILE failed"
+  fi
+  rdma_log "binding $RSWAP_SWAP_DEV to $RSWAP_SWAP_FILE"
+  sudo losetup "$RSWAP_SWAP_DEV" "$RSWAP_SWAP_FILE" || \
+    rdma_die "losetup $RSWAP_SWAP_DEV $RSWAP_SWAP_FILE failed"
+  sudo_test -b "$RSWAP_SWAP_DEV" || \
+    rdma_die "loop device not usable after bind: $RSWAP_SWAP_DEV"
+}
+
+ensure_loop_bound
+if [ -n "$RSWAP_SWAP_DEV" ]; then
+  test -b "$SWAP_TARGET" || rdma_die "block device does not exist: $SWAP_TARGET"
+else
+  test -f "$SWAP_TARGET" || rdma_die "swap file does not exist: $SWAP_TARGET"
+fi
 
 swap_is_active() {
   # /proc/swaps and swapon -s escape spaces as \040; decode for a literal match.
