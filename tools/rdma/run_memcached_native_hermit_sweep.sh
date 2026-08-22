@@ -25,8 +25,10 @@ Required environment:
 
 Optional environment:
   RSWAP_SERVER_PORT=9400
-  RSWAP_SWAP_FILE=$HOME/swapfile
-  RSWAP_SWAP_DEV=/dev/loopN      (optional block device; required for order>0)
+  RSWAP_SWAP_DEV=/dev/sdb6       (default; block device required for order>0)
+  RSWAP_SWAP_DEV=                (explicit empty value selects swapfile mode)
+  RSWAP_SWAP_FILE=$HOME/swapfile (only used with an explicit loop device)
+  RSWAP_SWAP_PRIORITY=10
   RSWAP_MEM_GB=48
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
   BASE_RUN_ID=<timestamp>-native-hermit
@@ -42,12 +44,12 @@ fi
 : "${RSWAP_SERVER_IP:?set RSWAP_SERVER_IP to the dnet-58 RDMA address}"
 RSWAP_SERVER_PORT=${RSWAP_SERVER_PORT:-9400}
 RSWAP_SWAP_FILE=${RSWAP_SWAP_FILE:-"$HOME/swapfile"}
-# Optional block device (raw partition or loop device).  A block device is
-# required for Hermit to receive order>0 (larger than 4 KiB) folios; a swap
-# file is always split to 4 KiB by the kernel's swap allocator.
-RSWAP_SWAP_DEV=${RSWAP_SWAP_DEV:-}
+# A block device is required for Hermit to receive order>0 (larger than 4 KiB)
+# folios; a swap file is always split to 4 KiB by the swap allocator.
+RSWAP_SWAP_DEV=${RSWAP_SWAP_DEV-/dev/sdb6}
 SWAP_TARGET=${RSWAP_SWAP_DEV:-$RSWAP_SWAP_FILE}
 RSWAP_MEM_GB=${RSWAP_MEM_GB:-48}
+RSWAP_SWAP_PRIORITY=${RSWAP_SWAP_PRIORITY:-10}
 FINAL_ACTION=${FINAL_ACTION:-leave-hermit}
 BASE_RUN_ID=${BASE_RUN_ID:-"$(date +%Y%m%d-%H%M%S)-${KERNEL_TAG}-native-hermit"}
 NATIVE_SWEEP_DIR="$RESULT_ROOT/$BASE_RUN_ID/native"
@@ -125,6 +127,18 @@ swap_is_active() {
        if (path == target) { found = 1 } } END { exit !found }'
 }
 
+deactivate_other_swaps() {
+  local active_swaps=() active
+
+  mapfile -t active_swaps < <(awk -v target="$SWAP_TARGET" \
+    'NR > 1 { path = $1; gsub(/\\040/, " ", path);
+       if (path != target) print path }' /proc/swaps)
+  for active in "${active_swaps[@]}"; do
+    rdma_log "disabling non-target swap device $active"
+    sudo swapoff "$active" || rdma_die "swapoff $active failed"
+  done
+}
+
 activate_native_swap() {
   if swap_is_active; then
     sudo swapoff "$SWAP_TARGET"
@@ -132,7 +146,8 @@ activate_native_swap() {
   if client_loaded; then
     sudo rmmod rswap_client
   fi
-  sudo swapon "$SWAP_TARGET"
+  deactivate_other_swaps
+  sudo swapon -p "$RSWAP_SWAP_PRIORITY" "$SWAP_TARGET"
 }
 
 install_hermit_client() {
@@ -143,6 +158,7 @@ install_hermit_client() {
       RSWAP_SWAP_DEV="$RSWAP_SWAP_DEV" \
       RSWAP_SWAP_FILE="$RSWAP_SWAP_FILE" \
       RSWAP_MEM_GB="$RSWAP_MEM_GB" \
+      RSWAP_SWAP_PRIORITY="$RSWAP_SWAP_PRIORITY" \
       ./manage_rswap_client.sh install
   )
   client_loaded || rdma_die "rswap_client did not load"
@@ -157,7 +173,8 @@ unload_hermit_client() {
   if client_loaded; then
     sudo rmmod rswap_client
   fi
-  sudo swapon "$SWAP_TARGET"
+  deactivate_other_swaps
+  sudo swapon -p "$RSWAP_SWAP_PRIORITY" "$SWAP_TARGET"
 }
 
 rdma_log "phase=native: unloading rswap_client and enabling local swap"
@@ -174,7 +191,7 @@ if [ "$FINAL_ACTION" = "unload" ]; then
   rdma_log "final action: unloading rswap_client and restoring local swap"
   unload_hermit_client
 else
-  rdma_log "final action: leaving Hermit client and its swapfile active"
+  rdma_log "final action: leaving Hermit client and $SWAP_TARGET active"
 fi
 
 rdma_log "native results: $NATIVE_SWEEP_DIR/page-sweep-summary.csv"

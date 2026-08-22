@@ -2,7 +2,7 @@
 
 
 ### Macros ###
-mem_server_ip="${RSWAP_SERVER_IP:-10.0.0.2}"
+mem_server_ip="${RSWAP_SERVER_IP:-172.16.0.58}"
 mem_server_port="${RSWAP_SERVER_PORT:-9400}"
 
 if [ -z "${HOME}" ]; then
@@ -13,12 +13,15 @@ else
 fi
 
 swap_file="${RSWAP_SWAP_FILE:-${home_dir}/swapfile}"
-swap_dev="${RSWAP_SWAP_DEV:-}"
+# Unset defaults to the raw partition.  An explicitly empty value keeps the
+# legacy regular-file mode available: RSWAP_SWAP_DEV= RSWAP_SWAP_FILE=...
+swap_dev="${RSWAP_SWAP_DEV-/dev/sdb6}"
 # The swap target may be a block device (raw partition or loop device) or a
 # regular swap file.  The kernel only allocates order>0 (larger than 4 KiB)
 # swap slots when SWP_BLKDEV is set, which requires a block device; a swap
 # file is always broken down to 4 KiB by the swap subsystem.
 swap_target="${swap_dev:-${swap_file}}"
+swap_priority="${RSWAP_SWAP_PRIORITY:-10}"
 # The swap file/partition size should be equal to the whole size of remote memory
 SWAP_PARTITION_SIZE_GB="${RSWAP_MEM_GB:-48}"
 
@@ -49,7 +52,7 @@ ensure_backing_file() {
 		echo "Reusing existing backing file ${swap_file}"
 	else
 		echo "Create backing file ${swap_file} with size ${SWAP_PARTITION_SIZE_GB}G"
-		sudo fallocate -l ${SWAP_PARTITION_SIZE_GB}G "${swap_file}"
+		sudo fallocate -l "${SWAP_PARTITION_SIZE_GB}G" "${swap_file}"
 		sudo chmod 600 "${swap_file}"
 	fi
 }
@@ -68,7 +71,7 @@ if [[ -z "${action}" ]]; then
 	echo ""
 	echo "Please select what to do: [install | replace | uninstall | create_swap | loop]"
 
-	read action
+	read -r action
 fi
 
 function close_swap_partition() {
@@ -93,6 +96,21 @@ function close_swap_partition() {
 	swapon -s
 }
 
+function close_other_swap_partitions() {
+	local active_swaps=() active
+
+	mapfile -t active_swaps < <(awk -v target="${swap_target}" \
+		'NR > 1 { path = $1; gsub(/\\040/, " ", path);
+			  if (path != target) print path }' /proc/swaps)
+	for active in "${active_swaps[@]}"; do
+		echo "Disable non-target swap device ${active}"
+		if ! sudo swapoff "${active}"; then
+			echo "Failed to swapoff ${active}; aborting."
+			return 1
+		fi
+	done
+}
+
 function create_swap_file() {
 	if swap_is_block; then
 		if [ ! -b "${swap_target}" ]; then
@@ -100,9 +118,18 @@ function create_swap_file() {
 			return 1
 		fi
 		sleep 1
-		echo "Prepare ${swap_target} (block device) as swap device"
-		sudo mkswap -f "${swap_target}"
-		sudo swapon "${swap_target}"
+		if sudo blkid -p -s TYPE -o value "${swap_target}" 2>/dev/null | \
+			grep -Fxq swap; then
+			echo "Reuse existing swap signature on ${swap_target}"
+		elif [[ "${RSWAP_FORMAT_SWAP:-0}" == "1" ]]; then
+			echo "Format ${swap_target} after explicit RSWAP_FORMAT_SWAP=1"
+			sudo mkswap -f "${swap_target}" || return 1
+		else
+			echo "Refusing to format ${swap_target}: no swap signature found."
+			echo "Verify the device, then set RSWAP_FORMAT_SWAP=1 if formatting is intended."
+			return 1
+		fi
+		sudo swapon -p "${swap_priority}" "${swap_target}"
 		swapon -s
 		return 0
 	fi
@@ -120,7 +147,7 @@ function create_swap_file() {
 			sudo rm -- "${swap_file}"
 
 			echo "Create a file, ~/swapfile, with size ${SWAP_PARTITION_SIZE_GB}G as swap device."
-			sudo fallocate -l ${SWAP_PARTITION_SIZE_GB}G "${swap_file}"
+			sudo fallocate -l "${SWAP_PARTITION_SIZE_GB}G" "${swap_file}"
 			sudo chmod 600 "${swap_file}"
 		else
 			echo "Existing swapfile ${swap_file} has the expected ${SWAP_PARTITION_SIZE_GB} GiB size. Reuse it."
@@ -128,39 +155,42 @@ function create_swap_file() {
 	else
 		# does not exist, create a swapfile
 		echo "Create a file, ~/swapfile, with size ${SWAP_PARTITION_SIZE_GB}G as swap device."
-		sudo fallocate -l ${SWAP_PARTITION_SIZE_GB}G "${swap_file}"
+		sudo fallocate -l "${SWAP_PARTITION_SIZE_GB}G" "${swap_file}"
 		sudo chmod 600 "${swap_file}"
-		du -sh ${swap_file}
+		du -sh "${swap_file}"
 	fi
 
 	sleep 1
 	echo "Mount the ${swap_file} as swap device"
 	sudo mkswap -f "${swap_file}"
-	sudo swapon "${swap_file}"
+	sudo swapon -p "${swap_priority}" "${swap_file}"
 
 	# Check
 	swapon -s
 }
 
 if [[ "${action}" = "install" ]]; then
-	echo "Close current swap partition && Create swap file"
+	echo "Close current swap target and disable all non-target swap devices"
 	close_swap_partition || exit 1
+	close_other_swap_partitions || exit 1
 
 	create_swap_file || exit 1
 
 	rmsize=$(swap_size_gb) || exit 1
 	echo "insmod ./rswap-client.ko sip=${mem_server_ip} sport=${mem_server_port} rmsize=${rmsize}"
-	sudo insmod ./rswap-client.ko sip=${mem_server_ip} sport=${mem_server_port} rmsize=${rmsize}
+	sudo insmod ./rswap-client.ko sip="${mem_server_ip}" \
+		sport="${mem_server_port}" rmsize="${rmsize}"
 
 elif [[ "${action}" = "replace" ]]; then
 	echo "rmmod rswap-client"
 	sudo rmmod rswap-client
 	echo "Please restart rswap-server on mem server. Press <Enter> to continue..."
 
-	read
+	read -r
 	rmsize=$(swap_size_gb) || exit 1
 	echo "insmod ./rswap-client.ko sip=${mem_server_ip} sport=${mem_server_port} rmsize=${rmsize}"
-	sudo insmod ./rswap-client.ko sip=${mem_server_ip} sport=${mem_server_port} rmsize=${rmsize}
+	sudo insmod ./rswap-client.ko sip="${mem_server_ip}" \
+		sport="${mem_server_port}" rmsize="${rmsize}"
 
 elif [[ "${action}" = "uninstall" ]]; then
 	echo "Close current swap partition"
@@ -177,6 +207,7 @@ elif [[ "${action}" = "uninstall" ]]; then
 elif [[ "${action}" = "create_swap" ]]; then
 	echo "Check the existing swap target"
 	close_swap_partition || exit 1
+	close_other_swap_partitions || exit 1
 
 	echo "Create swap"
 	create_swap_file || exit 1

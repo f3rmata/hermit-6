@@ -649,6 +649,90 @@ tools/rdma/run_memcached_native_hermit_sweep.sh
 `RSWAP_SERVER_IP`、`RSWAP_SERVER_PORT`、`RSWAP_SWAP_FILE`、`RSWAP_SWAP_DEV` 与
 `RSWAP_MEM_GB` 环境变量；不要再依赖其历史默认值 `10.0.0.2`。
 
+### 6.6 匿名内存 sparse/random swap-out/swap-in microbenchmark
+
+`run_anon_swapout_sweep.sh` 排除 memcached 命中率和 mutilate 调度的影响。它先完整
+fault-in 一块匿名内存，再把专用 cgroup 的 `memory.max` 从 `max` 降到指定值，直接
+测量 4 KiB 到 2 MiB folio 的 Hermit RDMA swap-out。换出稳定后，脚本将
+`memory.max` 恢复为 `max`，再按配置访问每个 folio 中的一部分 4 KiB 基页以测量
+swap-in，并校验数据 checksum；恢复上限可以避免换入过程中再次触发 cgroup
+swap-out。4 KiB 组使用
+`MADV_NOHUGEPAGE`；其余组只启用对应的 THP/mTHP policy，并把
+`remote_order_mask` 设为 bit 0 加目标 order。
+
+访问模式由两个正交维度组成：`ACCESS_ORDERS` 决定 folio 按地址顺序还是按固定种子
+生成的伪随机排列遍历；`ACCESS_LOCALITIES` 决定 folio 内访问连续基页（`high`）还是
+用互质 stride 分散访问（`low`）。默认对 100%、50%、25%、6.25% 和每 folio 1 页
+（`1p`）做完整笛卡尔积。populate 始终访问全部基页，只有 swap-in 扫描是稀疏的，
+因此各模式的 folio 形成和 swap-out 压力保持可比。
+
+运行前必须启动 dnet-58 的 rswap server，并在 dnet-61 装好、连通
+`rswap_client`。swap 必须是裸分区或 loop 块设备，不能是普通 swapfile：
+
+```bash
+cd ~/hermit-6
+sudo -v
+
+MODE=cgroup-hermit \
+PAGE_SIZES_KB='4 16 32 64 128 256 512 1024 2048' \
+ACCESS_RATIOS='100 50 25 6.25 1p' \
+ACCESS_ORDERS='sequential random' \
+ACCESS_LOCALITIES='high low' \
+ACCESS_SEED=1 \
+WORKSET_MB=16384 \
+LOCAL_RATIO_PCT=70 \
+BENCH_REPEATS=3 \
+BENCH_CPU=0 \
+tools/rdma/run_anon_swapout_sweep.sh
+```
+
+上述完整配置共有 `9 × 5 × 2 × 2 × 3 = 540` 轮，正式运行前建议先做单页大小
+smoke test：
+
+```bash
+MODE=cgroup-hermit PAGE_SIZES_KB='64' WORKSET_MB=1024 \
+BENCH_REPEATS=1 tools/rdma/run_anon_swapout_sweep.sh
+```
+
+脚本在每轮开始时顺序写每个 4 KiB 基页，使工作集完全驻留；将限制降到 70% 时，
+约 30% 的工作集需要 swap-out。它会验证 RDMA backend、可用 swap、zswap、目标
+order capability 和 OOM 状态，并在退出时终止工作集、恢复 THP policy 与
+`remote_order_mask`，不会遗留 benchmark 进程或 cgroup。
+
+结果位于 `tools/rdma/results/<时间>-anon-sparse-swapio/`：
+
+- `swapio-summary.csv`：除原有 swap-out/store 与 swap-in/load 指标外，还记录请求与
+  实际访问比例、顺序、局部性、seed、有效访问页/字节、有效访问吞吐，以及
+  `load_to_accessed_ratio` 和归一化后的 `measured_read_amplification`；
+- `<页大小>/<比例>/<顺序>-<局部性>/r<次数>/smaps-rollup-before.txt`：实际
+  `AnonHugePages`，用于确认大页确实形成；
+- 每轮的 `order-before.txt`、`order-after.txt`、`memory.stat` 和
+  `memory.events` 快照。
+
+画出四种访问组合下各访问比例的 load 吞吐、有效访问吞吐和读放大：
+
+```bash
+RESULT_DIR=tools/rdma/results/<时间>-anon-sparse-swapio
+python3 tools/rdma/plot_anon_swapout_sweep.py \
+  "$RESULT_DIR/swapio-summary.csv" \
+  --output "$RESULT_DIR/anon-sparse-swapio-by-page.png"
+```
+
+判断协议收益时，以 4 KiB 的 `protocol_gib_per_sec`（store）和
+`load_protocol_gib_per_sec`（load）为基线；目标页大小还应同时满足目标 order 的
+store/load 均非 0、large byte share 较高、fallback/error 为 0，且
+`checksum_errors=0`。稀疏扫描应优先看 `accessed_scan_gib_per_sec` 和
+`measured_read_amplification`：前者只以真正访问的基页字节数为分子；后者先计算后端
+load 字节与有效访问字节之比，再除以本轮实际换出字节占完整 workset 的比例，消除
+70% cgroup 上限造成的约 30% 换出比例影响。`expected_read_amplification=100 /
+actual_access_pct` 是完整 folio 换入时的理论值，可与实测值对照。
+`workset_scan_gib_per_sec` 为兼容旧结果而保留，在稀疏模式下不代表有效吞吐。
+
+请求比例受 4 KiB 基页粒度约束。例如 64 KiB folio 的 6.25% 与 `1p` 都是 1 页，
+4 KiB folio 下所有比例的实际值都是 100%。分析时使用 `actual_access_pct`，不要只按
+`access_ratio` 标签比较。访问 100% 基页时高/低局部性的覆盖集合相同，`1p` 时两种
+局部性也退化为同一个访问集合；这些端点主要用于基线校验。
+
 ## 7. 监控与验收
 
 在 dnet-61 开三个终端：
