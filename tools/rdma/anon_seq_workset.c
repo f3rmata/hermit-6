@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +46,22 @@ struct access_config {
 	const char *locality_name;
 };
 
+enum worker_action {
+	WORKER_POPULATE,
+	WORKER_SCAN,
+};
+
+struct worker_context {
+	volatile unsigned char *buf;
+	const struct access_config *config;
+	size_t page_size;
+	size_t first_folio;
+	size_t last_folio;
+	uint64_t checksum;
+	uint64_t expected_checksum;
+	enum worker_action action;
+};
+
 static double elapsed_seconds(const struct timespec *start,
 			      const struct timespec *end)
 {
@@ -81,7 +98,7 @@ static void usage(const char *name)
 	fprintf(stderr,
 		"usage: %s <MiB> <huge|base> <folio-KiB> "
 		"<100|50|25|6.25|1p> <sequential|random> <high|low> "
-		"[seed]\n",
+		"[seed] [threads]\n",
 		name);
 }
 
@@ -154,22 +171,33 @@ static size_t folio_at(const struct access_config *config, size_t ordinal)
 	return value;
 }
 
-static int scan_workset(volatile unsigned char *buf, size_t page_size,
-			const struct access_config *config, double *seconds,
-			uint64_t *checksum, uint64_t *expected_checksum)
+static void *workset_worker(void *opaque)
 {
-	struct timespec start, end;
+	struct worker_context *worker = opaque;
+	const struct access_config *config = worker->config;
 	size_t folio_ordinal, page_ordinal;
 
-	*checksum = 0;
-	*expected_checksum = 0;
-	if (clock_gettime(CLOCK_MONOTONIC, &start))
-		return -1;
-	for (folio_ordinal = 0; folio_ordinal < config->folio_count;
+	worker->checksum = 0;
+	worker->expected_checksum = 0;
+	for (folio_ordinal = worker->first_folio;
+	     folio_ordinal < worker->last_folio;
 	     folio_ordinal++) {
 		size_t folio = folio_at(config, folio_ordinal);
+		size_t first_page = folio * config->pages_per_folio;
 		uint64_t hash = mix64(config->seed ^ (uint64_t)folio);
 		size_t start, stride = 1;
+
+		if (worker->action == WORKER_POPULATE) {
+			for (page_ordinal = 0;
+			     page_ordinal < config->pages_per_folio;
+			     page_ordinal++) {
+				size_t page = first_page + page_ordinal;
+
+				worker->buf[page * worker->page_size] =
+					page_value(page);
+			}
+			continue;
+		}
 
 		if (config->locality == LOCALITY_HIGH) {
 			size_t starts = config->pages_per_folio -
@@ -196,15 +224,82 @@ static int scan_workset(volatile unsigned char *buf, size_t page_size,
 				page_in_folio =
 					(start + page_ordinal * stride) %
 					config->pages_per_folio;
-			page = folio * config->pages_per_folio + page_in_folio;
+			page = first_page + page_in_folio;
 
-			*checksum += buf[page * page_size];
-			*expected_checksum += page_value(page);
+			worker->checksum += worker->buf[page * worker->page_size];
+			worker->expected_checksum += page_value(page);
 		}
 	}
-	if (clock_gettime(CLOCK_MONOTONIC, &end))
+	return NULL;
+}
+
+static int run_workers(volatile unsigned char *buf, size_t page_size,
+		       const struct access_config *config, unsigned int threads,
+		       enum worker_action action, double *seconds,
+		       uint64_t *checksum, uint64_t *expected_checksum)
+{
+	struct worker_context *workers;
+	pthread_t *thread_ids;
+	struct timespec start, end;
+	unsigned int created = 0, index;
+	int error = 0;
+
+	workers = calloc(threads, sizeof(*workers));
+	thread_ids = calloc(threads, sizeof(*thread_ids));
+	if (!workers || !thread_ids) {
+		free(workers);
+		free(thread_ids);
+		errno = ENOMEM;
 		return -1;
-	*seconds = elapsed_seconds(&start, &end);
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &start)) {
+		free(workers);
+		free(thread_ids);
+		return -1;
+	}
+	for (index = 0; index < threads; index++) {
+		size_t folios_per_thread = config->folio_count / threads;
+		size_t remainder = config->folio_count % threads;
+		size_t extra_before = index < remainder ? index : remainder;
+
+		workers[index].buf = buf;
+		workers[index].config = config;
+		workers[index].page_size = page_size;
+		workers[index].first_folio =
+			folios_per_thread * index + extra_before;
+		workers[index].last_folio =
+			workers[index].first_folio + folios_per_thread +
+			(index < remainder);
+		workers[index].action = action;
+		error = pthread_create(&thread_ids[index], NULL, workset_worker,
+				       &workers[index]);
+		if (error)
+			break;
+		created++;
+	}
+	for (index = 0; index < created; index++) {
+		int join_error = pthread_join(thread_ids[index], NULL);
+
+		if (!error && join_error)
+			error = join_error;
+	}
+	if (!error && clock_gettime(CLOCK_MONOTONIC, &end))
+		error = errno;
+	if (!error) {
+		*checksum = 0;
+		*expected_checksum = 0;
+		for (index = 0; index < threads; index++) {
+			*checksum += workers[index].checksum;
+			*expected_checksum += workers[index].expected_checksum;
+		}
+		*seconds = elapsed_seconds(&start, &end);
+	}
+	free(workers);
+	free(thread_ids);
+	if (error) {
+		errno = error;
+		return -1;
+	}
 	return 0;
 }
 
@@ -212,17 +307,18 @@ int main(int argc, char **argv)
 {
 	const long system_page_size = sysconf(_SC_PAGESIZE);
 	unsigned long long mib, folio_kib;
+	uint64_t parsed_threads;
 	size_t bytes, offset, page_size;
 	volatile unsigned char *buf;
 	struct access_config config = { 0 };
-	struct timespec start, end;
 	sigset_t signals;
 	char *tail;
 	int advice, signal_number;
 	uint64_t checksum, expected_checksum;
-	double scan_seconds;
+	double populate_seconds, scan_seconds;
+	unsigned int threads = 1;
 
-	if ((argc != 7 && argc != 8) || system_page_size <= 0) {
+	if ((argc < 7 || argc > 9) || system_page_size <= 0) {
 		usage(argv[0]);
 		return 2;
 	}
@@ -273,9 +369,17 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	config.seed = UINT64_C(1);
-	if (argc == 8 && parse_u64(argv[7], &config.seed)) {
+	if (argc >= 8 && parse_u64(argv[7], &config.seed)) {
 		fprintf(stderr, "invalid seed: %s\n", argv[7]);
 		return 2;
+	}
+	if (argc == 9) {
+		if (parse_u64(argv[8], &parsed_threads) || !parsed_threads ||
+		    parsed_threads > UINT32_MAX) {
+			fprintf(stderr, "invalid thread count: %s\n", argv[8]);
+			return 2;
+		}
+		threads = (unsigned int)parsed_threads;
 	}
 	bytes = (size_t)mib * 1024 * 1024;
 	config.folio_bytes = (size_t)folio_kib * 1024;
@@ -286,6 +390,12 @@ int main(int argc, char **argv)
 	}
 	config.pages_per_folio = config.folio_bytes / page_size;
 	config.folio_count = bytes / config.folio_bytes;
+	if (threads > config.folio_count) {
+		fprintf(stderr,
+			"thread count %u exceeds folio count %zu\n",
+			threads, config.folio_count);
+		return 2;
+	}
 	if (config.one_page_per_folio) {
 		config.pages_to_access = 1;
 	} else {
@@ -323,9 +433,10 @@ int main(int argc, char **argv)
 	}
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	printf("WAITING pid=%ld bytes=%zu folio_bytes=%zu ratio=%s "
+	printf("WAITING pid=%ld bytes=%zu folio_bytes=%zu threads=%u ratio=%s "
 	       "order=%s locality=%s seed=%" PRIu64 "\n",
-	       (long)getpid(), bytes, config.folio_bytes, config.ratio_name,
+	       (long)getpid(), bytes, config.folio_bytes, threads,
+	       config.ratio_name,
 	       config.order_name, config.locality_name, config.seed);
 	do {
 		if (sigwait(&signals, &signal_number)) {
@@ -349,14 +460,16 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	clock_gettime(CLOCK_MONOTONIC, &start);
-	for (offset = 0; offset < bytes; offset += page_size)
-		buf[offset] = page_value(offset / page_size);
-	clock_gettime(CLOCK_MONOTONIC, &end);
-	printf("READY pid=%ld bytes=%zu populate_sec=%.6f "
+	if (run_workers(buf, page_size, &config, threads, WORKER_POPULATE,
+			&populate_seconds, &checksum, &expected_checksum)) {
+		perror("populate_workset");
+		munmap((void *)buf, bytes);
+		return 1;
+	}
+	printf("READY pid=%ld bytes=%zu threads=%u populate_sec=%.6f "
 	       "pages_per_folio=%zu accessed_pages=%zu accessed_bytes=%zu "
 	       "actual_access_pct=%.6f\n",
-	       (long)getpid(), bytes, elapsed_seconds(&start, &end),
+	       (long)getpid(), bytes, threads, populate_seconds,
 	       config.pages_per_folio, config.accessed_pages,
 	       config.accessed_pages * page_size,
 	       100.0 * config.pages_to_access / config.pages_per_folio);
@@ -370,15 +483,15 @@ int main(int argc, char **argv)
 			break;
 		if (signal_number != SIGUSR2)
 			continue;
-		if (scan_workset(buf, page_size, &config, &scan_seconds,
-				 &checksum, &expected_checksum)) {
+		if (run_workers(buf, page_size, &config, threads, WORKER_SCAN,
+				&scan_seconds, &checksum, &expected_checksum)) {
 			perror("scan_workset");
 			break;
 		}
-		printf("SCAN bytes=%zu accessed_pages=%zu accessed_bytes=%zu "
+		printf("SCAN bytes=%zu threads=%u accessed_pages=%zu accessed_bytes=%zu "
 		       "actual_access_pct=%.6f sec=%.6f checksum=%" PRIu64
 		       " expected=%" PRIu64 " checksum_errors=%u\n",
-		       bytes, config.accessed_pages,
+		       bytes, threads, config.accessed_pages,
 		       config.accessed_pages * page_size,
 		       100.0 * config.pages_to_access / config.pages_per_folio,
 		       scan_seconds, checksum, expected_checksum,

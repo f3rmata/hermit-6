@@ -24,11 +24,17 @@ Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
   REDIS_WORKSET_MB=16384            (total value bytes to load)
   REDIS_VALUE_SIZE=2097152          (bytes per value; default 2 MiB)
+  REDIS_ACTIVE_RATIOS="100"          (percent of keys read per run)
+  REDIS_ACCESS_ORDER=sequential     (sequential or random)
+  REDIS_ACCESS_SEED=1
+  REDIS_CLIENTS=1                   (concurrent GET connections)
+  REDIS_CHECKSUM=Y                  (Y: full CRC32; N: length-only fast path)
   REDIS_PORT=6391
   REDIS_SERVER_BIN=/path/to/redis-server
   LOCAL_RATIO_PCT=70                (limit = resident MiB * ratio / 100)
   BENCH_REPEATS=3
-  BENCH_CPU=0                       (Python harness CPU)
+  BENCH_CPUS=0                      (Python harness CPU set, e.g. 8-15)
+  BENCH_CPU=0                       (legacy alias if BENCH_CPUS is unset)
   REDIS_SERVER_CPU=0                (redis-server CPU)
   QUIET_INTERVAL_SEC=1
   QUIET_SAMPLES=3
@@ -54,11 +60,17 @@ MODE=$(normalize_mode "${requested_mode:-cgroup-hermit}")
 PAGE_SIZES_KB=${PAGE_SIZES_KB:-"4 16 32 64 128 256 512 1024 2048"}
 REDIS_WORKSET_MB=${REDIS_WORKSET_MB:-16384}
 REDIS_VALUE_SIZE=${REDIS_VALUE_SIZE:-2097152}
+REDIS_ACTIVE_RATIOS=${REDIS_ACTIVE_RATIOS:-100}
+REDIS_ACCESS_ORDER=${REDIS_ACCESS_ORDER:-sequential}
+REDIS_ACCESS_SEED=${REDIS_ACCESS_SEED:-1}
+REDIS_CLIENTS=${REDIS_CLIENTS:-1}
+REDIS_CHECKSUM=${REDIS_CHECKSUM:-Y}
 REDIS_PORT=${REDIS_PORT:-6391}
 REDIS_SERVER_BIN=${REDIS_SERVER_BIN:-}
 LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-70}
 BENCH_REPEATS=${BENCH_REPEATS:-3}
 BENCH_CPU=${BENCH_CPU:-0}
+BENCH_CPUS=${BENCH_CPUS:-$BENCH_CPU}
 REDIS_SERVER_CPU=${REDIS_SERVER_CPU:-0}
 QUIET_INTERVAL_SEC=${QUIET_INTERVAL_SEC:-1}
 QUIET_SAMPLES=${QUIET_SAMPLES:-3}
@@ -249,8 +261,39 @@ wait_for_log() {
   done
 }
 
+log_field() {
+  local record=$1 key=$2 log=$3
+  awk -v record="$record" -v key="$key" '
+    $1 == record {
+      for (i = 2; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == key)
+          value = pair[2]
+      }
+    }
+    END { print value }
+  ' "$log"
+}
+
+[[ "$REDIS_CLIENTS" =~ ^[0-9]+$ ]] && [ "$REDIS_CLIENTS" -gt 0 ] || \
+  rdma_die "REDIS_CLIENTS must be a positive integer"
+[[ "$REDIS_ACCESS_SEED" =~ ^[0-9]+$ ]] || \
+  rdma_die "REDIS_ACCESS_SEED must be an unsigned integer"
+[[ "$REDIS_ACTIVE_RATIOS" =~ [^[:space:]] ]] || \
+  rdma_die "REDIS_ACTIVE_RATIOS must not be empty"
+case "$REDIS_ACCESS_ORDER" in
+  sequential|random) ;;
+  *) rdma_die "REDIS_ACCESS_ORDER must be sequential or random" ;;
+esac
+for active_ratio in $REDIS_ACTIVE_RATIOS; do
+  awk -v ratio="$active_ratio" 'BEGIN { exit !(ratio > 0 && ratio <= 100) }' || \
+    rdma_die "REDIS_ACTIVE_RATIOS entries must be in (0, 100]: $active_ratio"
+done
+
 [ -x "$WORKER" ] || rdma_die "missing executable worker: $WORKER"
 command -v python3 >/dev/null 2>&1 || rdma_die "python3 is required"
+taskset -c "$BENCH_CPUS" true >/dev/null 2>&1 || \
+  rdma_die "invalid or unavailable BENCH_CPUS CPU list: $BENCH_CPUS"
 [ -r /sys/fs/cgroup/cgroup.controllers ] || rdma_die "cgroup v2 is required"
 mount_debugfs_if_needed
 sudo_test -r /sys/kernel/debug/hermit/order_stats || rdma_die "Hermit order_stats is unavailable"
@@ -286,17 +329,22 @@ mkdir -p "$RESULT_DIR"
   printf 'kernel=%s\n' "$(uname -r)"
   printf 'mode=%s\nlocal_ratio_pct=%s\n' "$MODE" "$LOCAL_RATIO_PCT"
   printf 'page_sizes_kb=%s\nrepeats=%s\n' "$PAGE_SIZES_KB" "$BENCH_REPEATS"
-  printf 'bench_cpu=%s\nredis_server_cpu=%s\n' "$BENCH_CPU" "$REDIS_SERVER_CPU"
+  printf 'bench_cpus=%s\nredis_server_cpu=%s\n' "$BENCH_CPUS" "$REDIS_SERVER_CPU"
   printf 'redis_workset_mb=%s\nredis_value_size=%s\nredis_port=%s\n' \
     "$REDIS_WORKSET_MB" "$REDIS_VALUE_SIZE" "$REDIS_PORT"
+  printf 'redis_active_ratios=%s\nredis_access_order=%s\nredis_access_seed=%s\nredis_clients=%s\n' \
+    "$REDIS_ACTIVE_RATIOS" "$REDIS_ACCESS_ORDER" "$REDIS_ACCESS_SEED" \
+    "$REDIS_CLIENTS"
+  printf 'redis_checksum=%s\n' "$REDIS_CHECKSUM"
   printf 'redis_server_bin=%s\n' "$(find_redis_server_bin)"
   printf 'backend=%s\n' "$(detect_rswap_backend)"
   printf 'swap:\n'
   sed 's/^/  /' /proc/swaps
 } > "$RESULT_DIR/environment.txt"
-printf 'page_kb,order,repeat,mode,resident_mb,limit_mb,value_size,keys,populate_sec,bench_sec,checksum_errors,pswpout_delta,target_stores_delta,target_loads_delta,target_fallback_delta,target_errors_delta,total_store_bytes,large_store_bytes,large_store_pct,swapout_gib,protocol_gib,protocol_gib_per_sec,pswpin_delta,bench_pswpout_delta,total_load_bytes,large_load_bytes,large_load_pct,swapin_gib,load_protocol_gib,load_protocol_gib_per_sec\n' > "$CSV"
+printf 'page_kb,order,repeat,mode,active_ratio_requested,actual_access_pct,access_order,access_seed,clients,resident_mb,limit_mb,value_size,keys,active_keys,useful_bytes,populate_sec,bench_sec,get_qps,useful_gib_per_sec,checksum_errors,pswpout_delta,target_stores_delta,target_loads_delta,target_fallback_delta,target_errors_delta,total_store_bytes,large_store_bytes,large_store_pct,swapout_gib,protocol_gib,protocol_gib_per_sec,pswpin_delta,bench_pswpout_delta,backend_loads_delta,total_load_bytes,large_load_bytes,large_load_pct,swapin_gib,load_protocol_gib,load_protocol_gib_per_sec,remote_bytes_per_useful_byte,normalized_read_amplification,backend_loads_per_get\n' > "$CSV"
 
-export REDIS_WORKSET_MB REDIS_VALUE_SIZE REDIS_PORT
+export REDIS_WORKSET_MB REDIS_VALUE_SIZE REDIS_PORT REDIS_ACCESS_ORDER
+export REDIS_ACCESS_SEED REDIS_CLIENTS REDIS_ACTIVE_RATIO REDIS_CHECKSUM
 
 for kb in $PAGE_SIZES_KB; do
   order=$(page_order "$kb") || rdma_die "unsupported page size: ${kb} KiB"
@@ -304,8 +352,11 @@ for kb in $PAGE_SIZES_KB; do
   effective=$(sudo_cat "$EFFECTIVE_MASK_FILE")
   (( (effective & (1 << order)) != 0 )) || rdma_die "effective mask $effective lacks order $order"
 
-  for repeat in $(seq 1 "$BENCH_REPEATS"); do
-    run_dir="$RESULT_DIR/${kb}k/r${repeat}"
+  for active_ratio in $REDIS_ACTIVE_RATIOS; do
+    REDIS_ACTIVE_RATIO=$active_ratio
+    ratio_label=${active_ratio//./p}
+    for repeat in $(seq 1 "$BENCH_REPEATS"); do
+    run_dir="$RESULT_DIR/${kb}k/${ratio_label}/r${repeat}"
     redis_log="$run_dir/redis.log"
     worker_log="$run_dir/redis-bench.log"
     before="$run_dir/order-before.txt"
@@ -316,9 +367,8 @@ for kb in $PAGE_SIZES_KB; do
     start_redis_server "$redis_log"
     wait_for_redis_ready "$redis_log"
 
-    taskset -c "$BENCH_CPU" python3 "$WORKER" > "$worker_log" 2>&1 &
+    taskset -c "$BENCH_CPUS" python3 "$WORKER" > "$worker_log" 2>&1 &
     current_worker_pid=$!
-    sudo_write "$current_worker_pid" "$CGROUP/cgroup.procs"
     wait_for_log '^WAITING ' "$worker_log" "$READY_TIMEOUT_SEC"
     kill -USR1 "$current_worker_pid"
     wait_for_log '^READY ' "$worker_log" "$READY_TIMEOUT_SEC"
@@ -347,7 +397,6 @@ for kb in $PAGE_SIZES_KB; do
     oom_before=$(memory_event oom_kill)
     start_ns=$(date +%s%N)
     sudo_write "$((limit_mb * 1024 * 1024))" "$CGROUP/memory.max"
-    last_change_ns=$start_ns
     previous=$(order_total_stores)
     quiet=0
     quiet_start=$(date +%s)
@@ -357,7 +406,6 @@ for kb in $PAGE_SIZES_KB; do
       if [ "$current" -ne "$previous" ]; then
         previous=$current
         quiet=0
-        last_change_ns=$(date +%s%N)
       else
         quiet=$((quiet + 1))
       fi
@@ -410,22 +458,29 @@ for kb in $PAGE_SIZES_KB; do
     snapshot_order_stats > "$load_before"
     pswpin_before=$(read_vmstat_key pswpin)
     bench_pswpout_before=$(read_vmstat_key pswpout)
-    bench_start_ns=$(date +%s%N)
     kill -USR2 "$current_worker_pid"
     wait_for_log '^BENCH ' "$worker_log" "$BENCH_TIMEOUT_SEC" 1
-    bench_end_ns=$(date +%s%N)
     snapshot_order_stats > "$load_after"
     pswpin_after=$(read_vmstat_key pswpin)
     bench_pswpout_after=$(read_vmstat_key pswpout)
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-after-swapin.txt"
     sudo_cat "$CGROUP/memory.events" > "$run_dir/memory-events-after-swapin.txt"
 
-    bench_sec=$(awk -F'sec=' '/^BENCH / { print $2; exit }' "$worker_log" | awk '{ print $1 }')
-    checksum_errors=$(awk -F'checksum_errors=' '/^BENCH / { print $2; exit }' "$worker_log" | awk '{ print $1 }')
-    [ -n "$bench_sec" ] || rdma_die "missing BENCH metrics; see $worker_log"
+    bench_sec=$(log_field BENCH sec "$worker_log")
+    active_keys=$(log_field BENCH active_keys "$worker_log")
+    useful_bytes=$(log_field BENCH bytes "$worker_log")
+    actual_access_pct=$(log_field BENCH actual_access_pct "$worker_log")
+    actual_clients=$(log_field BENCH clients "$worker_log")
+    get_qps=$(log_field BENCH get_qps "$worker_log")
+    useful_gib_per_sec=$(log_field BENCH useful_gib_per_sec "$worker_log")
+    checksum_errors=$(log_field BENCH checksum_errors "$worker_log")
+    [ -n "$bench_sec" ] && [ -n "$active_keys" ] && \
+      [ -n "$useful_bytes" ] && [ -n "$actual_access_pct" ] && \
+      [ -n "$actual_clients" ] && [ -n "$get_qps" ] && \
+      [ -n "$useful_gib_per_sec" ] || \
+      rdma_die "missing BENCH metrics; see $worker_log"
     [ "${checksum_errors:-1}" -eq 0 ] || rdma_die "redis GET checksum mismatch; see $worker_log"
 
-    swapin_wall_ms=$(( (bench_end_ns - bench_start_ns) / 1000000 ))
     pswpin_delta=$((pswpin_after - pswpin_before))
     bench_pswpout_delta=$((bench_pswpout_after - bench_pswpout_before))
     target_loads=$(( $(order_field "$load_after" "$order" 4) - $(order_field "$load_before" "$order" 4) ))
@@ -437,12 +492,13 @@ for kb in $PAGE_SIZES_KB; do
       FILENAME == after && FNR > 1 {
         d=$4-b[$1]; f=$5-fb[$1];
         if (f < 0) f=0; if (f > d) f=d;
-        total += d*$2; if ($1 > 0) large += (d-f)*$2
+        requests += d; total += d*$2; if ($1 > 0) large += (d-f)*$2
       }
       END {
         pct=total ? 100*large/total : 0;
-        printf "%.0f,%.0f,%.3f,%.6f", total, large, pct,
+        printf "%.0f,%.0f,%.3f,%.6f,%.0f", total, large, pct,
                (sec > 0 ? total / 1073741824 / sec : 0)
+               , requests
       }' "$load_before" "$load_after"); then
       rdma_die "failed to summarize Hermit swap-in counters; see $run_dir"
     fi
@@ -451,9 +507,24 @@ for kb in $PAGE_SIZES_KB; do
     total_load_bytes=${load_metrics%%,*}
     rest=${load_metrics#*,}; large_load_bytes=${rest%%,*}
     rest=${rest#*,}; large_load_pct=${rest%%,*}
-    load_protocol_gib_per_sec=${rest#*,}
+    rest=${rest#*,}; load_protocol_gib_per_sec=${rest%%,*}
+    backend_loads_delta=${rest#*,}
     swapin_gib=$(awk -v p="$pswpin_delta" 'BEGIN { printf "%.6f", p*4096/1073741824 }')
     load_protocol_gib=$(awk -v b="$total_load_bytes" 'BEGIN { printf "%.6f", b/1073741824 }')
+    remote_bytes_per_useful_byte=$(awk -v remote="$total_load_bytes" \
+      -v useful="$useful_bytes" \
+      'BEGIN { printf "%.6f", (useful > 0 ? remote / useful : 0) }')
+    normalized_read_amplification=$(awk -v remote="$total_load_bytes" \
+      -v useful="$useful_bytes" -v stored="$total_store_bytes" \
+      -v keys="$keys" -v value_size="$value_size" '
+      BEGIN {
+        dataset = keys * value_size
+        printf "%.6f", (useful > 0 && stored > 0 ?
+                         remote * dataset / (useful * stored) : 0)
+      }')
+    backend_loads_per_get=$(awk -v loads="$backend_loads_delta" \
+      -v gets="$active_keys" \
+      'BEGIN { printf "%.6f", (gets > 0 ? loads / gets : 0) }')
     oom_after_swapin=$(memory_event oom_kill)
     [ "$oom_after_swapin" -eq "$oom_before" ] || rdma_die "cgroup OOM during GET scan; see $run_dir"
     [ "$pswpin_delta" -gt 0 ] || rdma_die "GET scan caused no swap-ins; see $run_dir"
@@ -462,17 +533,23 @@ for kb in $PAGE_SIZES_KB; do
     [ "$bench_pswpout_delta" -eq 0 ] || \
       rdma_die "GET scan caused $bench_pswpout_delta new swap-outs; results are not isolated"
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-      "$kb" "$order" "$repeat" "$MODE" "$resident_mb" "$limit_mb" \
-      "$value_size" "$keys" "$populate_sec" "$bench_sec" "$checksum_errors" \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$kb" "$order" "$repeat" "$MODE" "$active_ratio" \
+      "$actual_access_pct" "$REDIS_ACCESS_ORDER" "$REDIS_ACCESS_SEED" \
+      "$actual_clients" "$resident_mb" "$limit_mb" "$value_size" "$keys" \
+      "$active_keys" "$useful_bytes" "$populate_sec" "$bench_sec" "$get_qps" \
+      "$useful_gib_per_sec" "$checksum_errors" \
       "$pswpout_delta" "$target_stores" "$target_loads" "$target_fallback" \
       "$target_errors" "$total_store_bytes" "$large_store_bytes" \
       "$large_store_pct" "$swapout_gib" "$protocol_gib" \
       "$protocol_gib_per_sec" "$pswpin_delta" "$bench_pswpout_delta" \
-      "$total_load_bytes" "$large_load_bytes" "$large_load_pct" \
-      "$swapin_gib" "$load_protocol_gib" "$load_protocol_gib_per_sec" >> "$CSV"
-    rdma_log "page=${kb}k repeat=$repeat stores=$stores_delta store_large=${large_store_pct}% swapout=${protocol_gib_per_sec}GiB/s loads=$target_loads load_large=${large_load_pct}% bench_sec=$bench_sec checksum_errors=$checksum_errors"
+      "$backend_loads_delta" "$total_load_bytes" "$large_load_bytes" "$large_load_pct" \
+      "$swapin_gib" "$load_protocol_gib" "$load_protocol_gib_per_sec" \
+      "$remote_bytes_per_useful_byte" "$normalized_read_amplification" \
+      "$backend_loads_per_get" >> "$CSV"
+    rdma_log "page=${kb}k ratio=$active_ratio repeat=$repeat clients=$actual_clients stores=$stores_delta store_large=${large_store_pct}% swapout=${protocol_gib_per_sec}GiB/s loads=$backend_loads_delta load_large=${large_load_pct}% useful=${useful_gib_per_sec}GiB/s read_amp=${normalized_read_amplification} bench_sec=$bench_sec checksum_errors=$checksum_errors"
     cleanup_processes
+    done
   done
 done
 

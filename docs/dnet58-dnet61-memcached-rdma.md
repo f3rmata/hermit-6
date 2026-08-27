@@ -682,7 +682,32 @@ ACCESS_SEED=1 \
 WORKSET_MB=16384 \
 LOCAL_RATIO_PCT=70 \
 BENCH_REPEATS=3 \
-BENCH_CPU=0 \
+BENCH_THREADS=8 \
+BENCH_CPUS=0-7 \
+tools/rdma/run_anon_swapout_sweep.sh
+```
+
+`BENCH_THREADS` 个 pthread 会按目标 folio 边界平分工作集，并发完成 populate 和
+swap-in fault；`BENCH_CPUS` 是传给 `taskset -c` 的 CPU 列表。默认仍为单线程和 CPU
+0，`BENCH_CPU` 作为旧配置的兼容别名保留。默认的
+`SWAPOUT_TRIGGER=memory-max` 在 populate 完成后由单个 `memory.max` 写入者触发回收，
+用于和历史数据对比；测量多线程写压力时设置
+`SWAPOUT_TRIGGER=parallel-fault`，脚本会先施加 cgroup 上限，再由 worker 并发
+fault/dirty 匿名页，使多个分配路径同时进入直接回收。
+两种 trigger 的 `completion_ms` 起点不同（降限开始与并发 fault 开始），因此只在
+相同 trigger 内比较吞吐，不要把 `parallel-fault` 数值直接拼入旧的
+`memory-max` 曲线。
+
+写压力测试可从 `1/2/4/8/16` 线程逐级增加，CPU 尽量选 NIC 所在 NUMA node 的物理
+核，并在 `protocol_gib_per_sec` 不再增长处停止，避免用超线程争用掩盖协议收益。
+为了避免重复相同的 swap-out 阶段，可把只影响 swap-in 的访问组合缩成一组：
+
+```bash
+MODE=cgroup-hermit \
+PAGE_SIZES_KB='4 16 32 64 128 256 512 1024 2048' \
+ACCESS_RATIOS='100' ACCESS_ORDERS='sequential' ACCESS_LOCALITIES='high' \
+WORKSET_MB=16384 LOCAL_RATIO_PCT=70 BENCH_REPEATS=3 \
+BENCH_THREADS=8 BENCH_CPUS=0-7 SWAPOUT_TRIGGER=parallel-fault \
 tools/rdma/run_anon_swapout_sweep.sh
 ```
 
@@ -703,7 +728,10 @@ order capability 和 OOM 状态，并在退出时终止工作集、恢复 THP po
 
 - `swapio-summary.csv`：除原有 swap-out/store 与 swap-in/load 指标外，还记录请求与
   实际访问比例、顺序、局部性、seed、有效访问页/字节、有效访问吞吐，以及
-  `load_to_accessed_ratio` 和归一化后的 `measured_read_amplification`；
+  `bench_threads`、`swapout_trigger`、`measured_write_amplification`、
+  `load_to_accessed_ratio` 和归一化
+  后的 `measured_read_amplification`；其中写放大等于 Hermit RDMA store 字节数除以
+  `pswpout` 对应的逻辑换出字节数；
 - `<页大小>/<比例>/<顺序>-<局部性>/r<次数>/smaps-rollup-before.txt`：实际
   `AnonHugePages`，用于确认大页确实形成；
 - 每轮的 `order-before.txt`、`order-after.txt`、`memory.stat` 和

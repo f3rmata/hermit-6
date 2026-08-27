@@ -30,7 +30,10 @@ Important environment:
   LOCAL_RATIO_PCT=70                 (or set LIMIT_MB explicitly)
   LIMIT_MB=                          (overrides LOCAL_RATIO_PCT)
   BENCH_REPEATS=3
-  BENCH_CPU=0
+  BENCH_THREADS=1                    (parallel populate and swap-in faults)
+  BENCH_CPUS=0                       (taskset CPU list, e.g. 0-7)
+  BENCH_CPU=0                        (legacy alias used if BENCH_CPUS is unset)
+  SWAPOUT_TRIGGER=memory-max         (memory-max or parallel-fault)
   QUIET_INTERVAL_SEC=1
   QUIET_SAMPLES=3
   QUIET_TIMEOUT_SEC=120
@@ -61,6 +64,9 @@ LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-70}
 LIMIT_MB=${LIMIT_MB:-$((WORKSET_MB * LOCAL_RATIO_PCT / 100))}
 BENCH_REPEATS=${BENCH_REPEATS:-3}
 BENCH_CPU=${BENCH_CPU:-0}
+BENCH_CPUS=${BENCH_CPUS:-$BENCH_CPU}
+BENCH_THREADS=${BENCH_THREADS:-1}
+SWAPOUT_TRIGGER=${SWAPOUT_TRIGGER:-memory-max}
 QUIET_INTERVAL_SEC=${QUIET_INTERVAL_SEC:-1}
 QUIET_SAMPLES=${QUIET_SAMPLES:-3}
 QUIET_TIMEOUT_SEC=${QUIET_TIMEOUT_SEC:-120}
@@ -210,6 +216,15 @@ log_field() {
 [[ "$WORKSET_MB" =~ ^[0-9]+$ ]] && [ "$WORKSET_MB" -gt 0 ] || rdma_die "invalid WORKSET_MB"
 [[ "$LIMIT_MB" =~ ^[0-9]+$ ]] && [ "$LIMIT_MB" -gt 0 ] && [ "$LIMIT_MB" -lt "$WORKSET_MB" ] || rdma_die "LIMIT_MB must be between 1 and WORKSET_MB-1"
 [[ "$ACCESS_SEED" =~ ^[0-9]+$ ]] || rdma_die "ACCESS_SEED must be an unsigned integer"
+[[ "$BENCH_THREADS" =~ ^[0-9]+$ ]] && [ "$BENCH_THREADS" -gt 0 ] || \
+  rdma_die "BENCH_THREADS must be a positive integer"
+command -v taskset >/dev/null 2>&1 || rdma_die "taskset is required"
+taskset -c "$BENCH_CPUS" true >/dev/null 2>&1 || \
+  rdma_die "invalid or unavailable BENCH_CPUS CPU list: $BENCH_CPUS"
+case "$SWAPOUT_TRIGGER" in
+  memory-max|parallel-fault) ;;
+  *) rdma_die "SWAPOUT_TRIGGER must be memory-max or parallel-fault" ;;
+esac
 for access_ratio in $ACCESS_RATIOS; do
   [[ "$access_ratio" =~ ^([0-9]+([.][0-9]+)?|1p)$ ]] || \
     rdma_die "invalid access ratio: $access_ratio"
@@ -245,7 +260,7 @@ free_swap_mb=$(awk 'NR > 1 { free += $3 - $4 } END { printf "%d", free / 1024 }'
 
 if [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ]; then
   rdma_log "building $BIN"
-  "${CC:-cc}" -O2 -Wall -Wextra -Werror -std=c11 -o "$BIN" "$SRC"
+  "${CC:-cc}" -O2 -Wall -Wextra -Werror -std=c11 -pthread -o "$BIN" "$SRC"
 fi
 
 trap cleanup EXIT
@@ -268,20 +283,21 @@ mkdir -p "$RESULT_DIR"
   printf 'date=%s\n' "$(date --iso-8601=seconds)"
   printf 'kernel=%s\n' "$(uname -r)"
   printf 'mode=%s\nworkset_mb=%s\nlimit_mb=%s\n' "$MODE" "$WORKSET_MB" "$LIMIT_MB"
-  printf 'page_sizes_kb=%s\nrepeats=%s\nbench_cpu=%s\n' \
-    "$PAGE_SIZES_KB" "$BENCH_REPEATS" "$BENCH_CPU"
+  printf 'page_sizes_kb=%s\nrepeats=%s\nbench_threads=%s\nbench_cpus=%s\nswapout_trigger=%s\n' \
+    "$PAGE_SIZES_KB" "$BENCH_REPEATS" "$BENCH_THREADS" "$BENCH_CPUS" \
+    "$SWAPOUT_TRIGGER"
   printf 'access_ratios=%s\naccess_orders=%s\naccess_localities=%s\naccess_seed=%s\n' \
     "$ACCESS_RATIOS" "$ACCESS_ORDERS" "$ACCESS_LOCALITIES" "$ACCESS_SEED"
   printf 'backend=%s\n' "$(detect_rswap_backend)"
   printf 'swap:\n'
   sed 's/^/  /' /proc/swaps
 } > "$RESULT_DIR/environment.txt"
-printf 'page_kb,order,repeat,access_ratio,actual_access_pct,access_order,access_locality,access_seed,pages_per_folio,accessed_pages,accessed_bytes,workset_mb,limit_mb,populate_sec,anon_huge_kb,memory_max_write_ms,completion_ms,pswpout_delta,target_stores_delta,target_loads_delta,target_fallback_delta,target_errors_delta,total_store_bytes,large_store_bytes,large_store_pct,swapout_gib,protocol_gib,protocol_gib_per_sec,swapin_scan_sec,swapin_wall_ms,swapin_pswpin_delta,swapin_pswpout_delta,swapin_target_loads_delta,swapin_target_fallback_delta,swapin_target_errors_delta,total_load_bytes,large_load_bytes,large_load_pct,swapin_gib,load_protocol_gib,load_protocol_gib_per_sec,workset_scan_gib_per_sec,accessed_scan_gib_per_sec,load_to_accessed_ratio,expected_read_amplification,measured_read_amplification,checksum_errors\n' > "$CSV"
+printf 'page_kb,order,repeat,bench_threads,swapout_trigger,access_ratio,actual_access_pct,access_order,access_locality,access_seed,pages_per_folio,accessed_pages,accessed_bytes,workset_mb,limit_mb,populate_sec,anon_huge_kb,memory_max_write_ms,completion_ms,pswpout_delta,target_stores_delta,target_loads_delta,target_fallback_delta,target_errors_delta,total_store_bytes,large_store_bytes,large_store_pct,swapout_gib,protocol_gib,protocol_gib_per_sec,measured_write_amplification,swapin_scan_sec,swapin_wall_ms,swapin_pswpin_delta,swapin_pswpout_delta,swapin_target_loads_delta,swapin_target_fallback_delta,swapin_target_errors_delta,total_load_bytes,large_load_bytes,large_load_pct,swapin_gib,load_protocol_gib,load_protocol_gib_per_sec,workset_scan_gib_per_sec,accessed_scan_gib_per_sec,load_to_accessed_ratio,expected_read_amplification,measured_read_amplification,checksum_errors\n' > "$CSV"
 page_count=$(awk '{ print NF }' <<< "$PAGE_SIZES_KB")
 ratio_count=$(awk '{ print NF }' <<< "$ACCESS_RATIOS")
 order_count=$(awk '{ print NF }' <<< "$ACCESS_ORDERS")
 locality_count=$(awk '{ print NF }' <<< "$ACCESS_LOCALITIES")
-rdma_log "planned runs: $((page_count * ratio_count * order_count * locality_count * BENCH_REPEATS))"
+rdma_log "planned runs: $((page_count * ratio_count * order_count * locality_count * BENCH_REPEATS)); threads=$BENCH_THREADS cpus=$BENCH_CPUS swapout_trigger=$SWAPOUT_TRIGGER"
 
 for kb in $PAGE_SIZES_KB; do
   order=$(page_order "$kb") || rdma_die "unsupported page size: ${kb} KiB"
@@ -304,36 +320,69 @@ for kb in $PAGE_SIZES_KB; do
     advice=huge
     [ "$kb" != 4 ] || advice=base
 
-    taskset -c "$BENCH_CPU" "$BIN" "$WORKSET_MB" "$advice" "$kb" \
-      "$access_ratio" "$access_order" "$access_locality" "$access_seed" > "$log" 2>&1 &
+    taskset -c "$BENCH_CPUS" "$BIN" "$WORKSET_MB" "$advice" "$kb" \
+      "$access_ratio" "$access_order" "$access_locality" "$access_seed" \
+      "$BENCH_THREADS" > "$log" 2>&1 &
     current_pid=$!
     sudo_write "$current_pid" "$CGROUP/cgroup.procs"
+
+    if [ "$SWAPOUT_TRIGGER" = parallel-fault ]; then
+      # Put the cgroup under its final limit before the worker threads fault
+      # the mapping. Their concurrent allocations then enter direct reclaim
+      # and submit stores in parallel instead of leaving reclaim to the one
+      # task which writes memory.max.
+      limit_write_start_ns=$(date +%s%N)
+      sudo_write "$((LIMIT_MB * 1024 * 1024))" "$CGROUP/memory.max"
+      write_end_ns=$(date +%s%N)
+      wait_for_stores_quiet
+      snapshot_order_stats > "$before"
+      pswpout_before=$(read_vmstat_key pswpout)
+      stores_before=$(order_total_stores)
+      oom_before=$(memory_event oom_kill)
+      sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-before.txt"
+      start_ns=$(date +%s%N)
+    fi
+
     kill -USR1 "$current_pid"
-    wait_for_log '^READY ' "$log" "$READY_TIMEOUT_SEC"
+    wait_for_log '^READY ' "$log" "$READY_TIMEOUT_SEC" 0.01
+    ready_ns=$(date +%s%N)
     populate_sec=$(log_field READY populate_sec "$log")
+    actual_threads=$(log_field READY threads "$log")
     pages_per_folio=$(log_field READY pages_per_folio "$log")
     accessed_pages=$(log_field READY accessed_pages "$log")
     accessed_bytes=$(log_field READY accessed_bytes "$log")
     actual_access_pct=$(log_field READY actual_access_pct "$log")
-    [ -n "$populate_sec" ] && [ -n "$pages_per_folio" ] && \
+    [ "$actual_threads" = "$BENCH_THREADS" ] && [ -n "$populate_sec" ] && \
+      [ -n "$pages_per_folio" ] && \
       [ -n "$accessed_pages" ] && [ -n "$accessed_bytes" ] && \
       [ -n "$actual_access_pct" ] || rdma_die "missing READY metrics; see $log"
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-before.txt"
-    sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-before.txt"
     anon_huge_kb=$(awk '/^AnonHugePages:/ { print $2 }' "$run_dir/smaps-rollup-before.txt")
     resident_bytes=$(sudo_cat "$CGROUP/memory.current")
-    minimum_resident_bytes=$((WORKSET_MB * 1024 * 1024 * 9 / 10))
+
+    if [ "$SWAPOUT_TRIGGER" = parallel-fault ]; then
+      minimum_resident_bytes=$((LIMIT_MB * 1024 * 1024 * 8 / 10))
+      last_change_ns=$ready_ns
+    else
+      sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-before.txt"
+      minimum_resident_bytes=$((WORKSET_MB * 1024 * 1024 * 9 / 10))
+    fi
     [ "$resident_bytes" -ge "$minimum_resident_bytes" ] || \
-      rdma_die "only $((resident_bytes / 1024 / 1024)) MiB became resident for a ${WORKSET_MB} MiB workset"
-    wait_for_stores_quiet
-    snapshot_order_stats > "$before"
-    pswpout_before=$(read_vmstat_key pswpout)
-    stores_before=$(order_total_stores)
-    oom_before=$(memory_event oom_kill)
-    start_ns=$(date +%s%N)
-    sudo_write "$((LIMIT_MB * 1024 * 1024))" "$CGROUP/memory.max"
-    write_end_ns=$(date +%s%N)
-    last_change_ns=$write_end_ns
+      rdma_die "only $((resident_bytes / 1024 / 1024)) MiB is resident; expected at least $((minimum_resident_bytes / 1024 / 1024)) MiB"
+
+    if [ "$SWAPOUT_TRIGGER" = memory-max ]; then
+      wait_for_stores_quiet
+      snapshot_order_stats > "$before"
+      pswpout_before=$(read_vmstat_key pswpout)
+      stores_before=$(order_total_stores)
+      oom_before=$(memory_event oom_kill)
+      start_ns=$(date +%s%N)
+      limit_write_start_ns=$start_ns
+      sudo_write "$((LIMIT_MB * 1024 * 1024))" "$CGROUP/memory.max"
+      write_end_ns=$(date +%s%N)
+      last_change_ns=$write_end_ns
+    fi
+
     previous=$(order_total_stores)
     quiet=0
     quiet_start=$(date +%s)
@@ -360,7 +409,7 @@ for kb in $PAGE_SIZES_KB; do
     [ "$oom_after" -eq "$oom_before" ] || rdma_die "cgroup OOM killed the workset process; see $run_dir"
     kill -0 "$current_pid" 2>/dev/null || rdma_die "workset process exited during reclaim; see $run_dir"
 
-    memory_max_write_ms=$(( (write_end_ns - start_ns) / 1000000 ))
+    memory_max_write_ms=$(( (write_end_ns - limit_write_start_ns) / 1000000 ))
     completion_ms=$(( (last_change_ns - start_ns) / 1000000 ))
     [ "$completion_ms" -gt 0 ] || completion_ms=1
     target_stores=$(( $(order_field "$after" "$order" 3) - $(order_field "$before" "$order" 3) ))
@@ -389,6 +438,9 @@ for kb in $PAGE_SIZES_KB; do
     protocol_gib_per_sec=${rest#*,}
     swapout_gib=$(awk -v p="$pswpout_delta" 'BEGIN { printf "%.6f", p*4096/1073741824 }')
     protocol_gib=$(awk -v b="$total_store_bytes" 'BEGIN { printf "%.6f", b/1073741824 }')
+    measured_write_amplification=$(awk -v protocol_bytes="$total_store_bytes" \
+      -v swapped_pages="$pswpout_delta" \
+      'BEGIN { printf "%.6f", (swapped_pages > 0 ? protocol_bytes / (swapped_pages * 4096) : 0) }')
 
     # Restore headroom before the sparse scan. Otherwise each swap-in could
     # force another swap-out and measure memcg thrashing instead of loads.
@@ -473,14 +525,16 @@ for kb in $PAGE_SIZES_KB; do
     [ "$swapin_pswpout_delta" -eq 0 ] || \
       rdma_die "swap-in caused $swapin_pswpout_delta new swap-outs; results are not isolated"
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-      "$kb" "$order" "$repeat" "$access_ratio" "$actual_access_pct" \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$kb" "$order" "$repeat" "$BENCH_THREADS" "$SWAPOUT_TRIGGER" \
+      "$access_ratio" "$actual_access_pct" \
       "$access_order" "$access_locality" "$access_seed" "$pages_per_folio" \
       "$accessed_pages" "$accessed_bytes" "$WORKSET_MB" "$LIMIT_MB" "$populate_sec" "$anon_huge_kb" \
       "$memory_max_write_ms" "$completion_ms" "$pswpout_delta" "$target_stores" \
       "$target_loads" "$target_fallback" "$target_errors" "$total_store_bytes" \
       "$large_store_bytes" "$large_store_pct" "$swapout_gib" "$protocol_gib" \
-      "$protocol_gib_per_sec" "$swapin_scan_sec" "$swapin_wall_ms" \
+      "$protocol_gib_per_sec" "$measured_write_amplification" \
+      "$swapin_scan_sec" "$swapin_wall_ms" \
       "$swapin_pswpin_delta" "$swapin_pswpout_delta" "$swapin_target_loads" \
       "$swapin_target_fallback" "$swapin_target_errors" "$total_load_bytes" \
       "$large_load_bytes" "$large_load_pct" "$swapin_gib" "$load_protocol_gib" \
@@ -488,7 +542,7 @@ for kb in $PAGE_SIZES_KB; do
       "$accessed_scan_gib_per_sec" "$load_to_accessed_ratio" \
       "$expected_read_amplification" "$measured_read_amplification" \
       "$checksum_errors" >> "$CSV"
-    rdma_log "page=${kb}k ratio=$access_ratio actual=${actual_access_pct}% order=$access_order locality=$access_locality repeat=$repeat swapout=${protocol_gib_per_sec}GiB/s stores=$stores_delta store_large=${large_store_pct}% swapin=${load_protocol_gib_per_sec}GiB/s read_amp=${measured_read_amplification} loads=$swapin_target_loads load_large=${large_load_pct}% checksum_errors=$checksum_errors fallback=$swapin_target_fallback errors=$swapin_target_errors"
+    rdma_log "page=${kb}k ratio=$access_ratio actual=${actual_access_pct}% order=$access_order locality=$access_locality repeat=$repeat threads=$BENCH_THREADS trigger=$SWAPOUT_TRIGGER swapout=${protocol_gib_per_sec}GiB/s write_amp=${measured_write_amplification} stores=$stores_delta store_large=${large_store_pct}% swapin=${load_protocol_gib_per_sec}GiB/s read_amp=${measured_read_amplification} loads=$swapin_target_loads load_large=${large_load_pct}% checksum_errors=$checksum_errors fallback=$swapin_target_fallback errors=$swapin_target_errors"
     cleanup_process
         done
       done

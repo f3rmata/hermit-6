@@ -18,6 +18,17 @@ def median(group, field):
     return statistics.median(float(row[field]) for row in group)
 
 
+def benchmark_context(rows):
+    parts = []
+    threads = sorted({row.get("bench_threads", "") for row in rows} - {""})
+    triggers = sorted({row.get("swapout_trigger", "") for row in rows} - {""})
+    if len(threads) == 1:
+        parts.append(f"{threads[0]} threads")
+    if len(triggers) == 1:
+        parts.append(triggers[0])
+    return ", ".join(parts)
+
+
 def plot_full_scan(rows, output):
     groups = defaultdict(list)
     for row in rows:
@@ -136,7 +147,11 @@ def plot_sparse(rows, output):
                 )
             if row_index == 0 and column == len(metrics) - 1:
                 axis.legend(title="Access ratio", ncol=2, fontsize=8)
-    fig.suptitle("Sparse anonymous-memory swap-in")
+    context = benchmark_context(rows)
+    title = "Sparse anonymous-memory swap-in"
+    if context:
+        title += f" ({context})"
+    fig.suptitle(title)
     fig.savefig(output, dpi=180)
     plt.close(fig)
 
@@ -145,6 +160,8 @@ def plot_sparse_summary(rows, output):
     pages = sorted({int(row["page_kb"]) for row in rows})
     labels = [page_label(page) for page in pages]
     ratios = list(dict.fromkeys(row["access_ratio"] for row in rows))
+    repeat_count = len({row["repeat"] for row in rows})
+    context = benchmark_context(rows)
     page_groups = defaultdict(list)
     ratio_groups = defaultdict(list)
     for row in rows:
@@ -264,8 +281,9 @@ def plot_sparse_summary(rows, output):
     fig.text(
         0.5,
         -0.015,
-        "Medians over 3 repeats and 4 order/locality combinations. "
-        "Requested access ratios are quantized to 4 KiB base pages.",
+        f"Medians over {repeat_count} repeats and 4 order/locality combinations"
+        + (f"; {context}. " if context else ". ")
+        + "Requested access ratios are quantized to 4 KiB base pages.",
         ha="center",
         fontsize=9,
     )
