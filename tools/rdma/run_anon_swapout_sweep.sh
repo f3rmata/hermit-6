@@ -22,7 +22,8 @@ of base pages in each folio to measure and verify RDMA loads.
 
 Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
-  ACCESS_RATIOS="100 50 25 6.25 1p" (1p means one base page per folio)
+  ACCESS_RATIOS="100 50 25 6.25 1p" (1p = one base page per folio;
+                  chunk64k = a contiguous 64 KiB chunk per folio)
   ACCESS_ORDERS="sequential random" (folio traversal order)
   ACCESS_LOCALITIES="high low"       (contiguous vs scattered base pages)
   ACCESS_SEED=1
@@ -226,6 +227,13 @@ case "$SWAPOUT_TRIGGER" in
   *) rdma_die "SWAPOUT_TRIGGER must be memory-max or parallel-fault" ;;
 esac
 for access_ratio in $ACCESS_RATIOS; do
+  if [[ "$access_ratio" =~ ^chunk[0-9]+[kK]$ ]]; then
+    awk -v token="$access_ratio" 'BEGIN {
+      size = substr(token, 6, length(token) - 6) + 0
+      exit !(size > 0 && size <= 1048576)
+    }' || rdma_die "chunk size must be between 1 KiB and 1048576 KiB: $access_ratio"
+    continue
+  fi
   [[ "$access_ratio" =~ ^([0-9]+([.][0-9]+)?|1p)$ ]] || \
     rdma_die "invalid access ratio: $access_ratio"
   if [ "$access_ratio" != 1p ]; then

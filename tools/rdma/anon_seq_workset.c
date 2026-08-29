@@ -30,6 +30,7 @@ struct access_config {
 	size_t pages_to_access;
 	size_t folio_count;
 	size_t accessed_pages;
+	size_t chunk_bytes;
 	size_t random_mask;
 	size_t random_shift;
 	size_t random_multiplier1;
@@ -126,6 +127,19 @@ static int parse_ratio(const char *text, struct access_config *config)
 		config->ratio_basis_points = 0;
 		return 0;
 	}
+	if (!strncmp(text, "chunk", 5)) {
+		unsigned long long kib;
+		char *tail;
+
+		errno = 0;
+		kib = strtoull(text + 5, &tail, 10);
+		if (errno || !kib || !*tail ||
+		    (strcmp(tail, "k") && strcmp(tail, "K")) ||
+		    kib > SIZE_MAX / 1024ULL)
+			return -1;
+		config->chunk_bytes = (size_t)kib * 1024;
+		return 0;
+	}
 	errno = 0;
 	percent = strtod(text, &tail);
 	if (errno || *tail || percent <= 0.0 || percent > 100.0)
@@ -199,7 +213,15 @@ static void *workset_worker(void *opaque)
 			continue;
 		}
 
-		if (config->locality == LOCALITY_HIGH) {
+		if (config->chunk_bytes) {
+			/* Read one contiguous chunk from the beginning of every
+			 * folio.  For folios not larger than the chunk this reads
+			 * the whole folio; for larger folios only the first
+			 * chunk is useful while Hermit still loads the folio.
+			 */
+			start = 0;
+			stride = 1;
+		} else if (config->locality == LOCALITY_HIGH) {
 			size_t starts = config->pages_per_folio -
 					config->pages_to_access + 1;
 
@@ -396,7 +418,16 @@ int main(int argc, char **argv)
 			threads, config.folio_count);
 		return 2;
 	}
-	if (config.one_page_per_folio) {
+	if (config.chunk_bytes) {
+		if (config.chunk_bytes < page_size ||
+		    config.chunk_bytes % page_size) {
+			fprintf(stderr, "chunk size must be page-aligned\n");
+			return 2;
+		}
+		config.pages_to_access = config.chunk_bytes / page_size;
+		if (config.pages_to_access > config.pages_per_folio)
+			config.pages_to_access = config.pages_per_folio;
+	} else if (config.one_page_per_folio) {
 		config.pages_to_access = 1;
 	} else {
 		config.pages_to_access =

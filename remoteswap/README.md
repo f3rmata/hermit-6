@@ -154,8 +154,12 @@ output, and the absence of local swap writes after successful remote stores.
 
 Use `THP_SIZE_KB=64 REMOTE_ORDER_MASK=0x11 BYPASS_SWAPCACHE=Y` to cover mTHP
 large-folio store and load. Use `THP_SIZE_KB=2048 REMOTE_ORDER_MASK=0x201` to
-cover PMD-sized THP store. Linux 6.18's PTE swapin aggregation currently covers
-mTHP orders below `PMD_ORDER`, so the 2 MiB case does not imply an order-9 load.
+cover PMD-sized THP store and load. For a committed order-9 remote extent with
+bit 9 enabled in the effective mask, Hermit allocates one order-9 folio, reads
+the 2 MiB extent with one large RDMA transaction, and installs its 512 base
+pages into the existing PTE table. The PTE-mapped order-9 folio uses per-page
+rmap accounting; native swap-in keeps the upstream policy of considering only
+orders below `PMD_ORDER`.
 
 An RDMA build only proves API and symbol compatibility. End-to-end validation
 also requires the matching OFED runtime, a supported NIC, a reachable memory

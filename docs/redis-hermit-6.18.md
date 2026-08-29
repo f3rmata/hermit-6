@@ -6,20 +6,24 @@ RDMA 交换传输的收益。
 ## 1. 设计
 
 memcached 使用哈希表 + 小对象，内存碎片化严重，很难形成 THP/mTHP。
-Redis 测试改用可配置大小的字符串 value：每个 value 是一块连续匿名内存，THP
-`always` 策略下可以被大 folio 覆盖。harness 既可以顺序读取全部 key 作为 dense
-基线，也可以确定性抽样一部分 key，并通过多个连接随机 GET，测量真实 Redis 请求
-路径中的大页固定开销收益和读放大代价。
+Redis 测试改用**大字符串 value + 固定 chunk 读取**：每个 value 默认 1 MiB，
+是连续匿名内存，THP `always` 策略下可以被大 folio 覆盖；BENCH 阶段默认只读取
+每个 value 的前 64 KiB（`GETRANGE`），从而在真实 Redis 请求路径中制造一个
+类似数组扫描 `chunk64k` 的读放大/大页权衡：
 
 ```text
-启动 redis-server -> 启动 python harness
-  -> 等待 SIGUSR1 -> FLUSHALL -> SET N 个 2 MiB value -> READY
+启动 N 个 redis-server -> 启动 python harness
+  -> 等待 SIGUSR1 -> FLUSHALL -> SET N 个 1 MiB value -> READY
   -> 脚本降低 cgroup memory.max，触发 Hermit RDMA swap-out
   -> 脚本恢复 memory.max，发送 SIGUSR2
-  -> harness 按比例选择 key，多个连接同步执行顺序或随机 GET
-  -> 校验每个 value 的长度和聚合 CRC32
+  -> harness 顺序 GETRANGE 每个 value 的前 64 KiB
+  -> 校验长度和聚合 CRC32
   -> worker 打印 BENCH sec/checksum_errors
 ```
+
+folio ≤ 64 KiB 时整页有用，有效带宽随协议带宽上升；folio > 64 KiB 后只
+读取 64 KiB 却可能加载整个 folio，有效带宽随 folio 增大下降。这样可以清楚
+展现大页收益与 overfetch 代价的拐点。
 
 只有 Redis 服务端放入受限 cgroup；Python harness 留在 cgroup 外并固定到独立
 CPU 集，避免客户端 key 列表、线程栈和 GET 返回缓冲区污染 Hermit swap 计数。
@@ -67,30 +71,35 @@ MODE=cgroup-hermit REDIS_WORKSET_MB=16384 LOCAL_RATIO_PCT=70 \
 
 默认配置：
 
-- `REDIS_VALUE_SIZE=2097152`（2 MiB）；
-- `REDIS_WORKSET_MB=16384` -> `8192` 个 key；
+- `REDIS_VALUE_SIZE=1048576`（1 MiB）；
+- `REDIS_SCAN_CHUNK=65536`（BENCH 阶段每个 value 只读前 64 KiB）；
+- `REDIS_ACTIVE_RATIOS="100"`、`REDIS_ACCESS_ORDER=sequential`；
+- `REDIS_WORKSET_MB=16384` -> `16384` 个 key；
 - `REDIS_PORT=6391`；
 - `PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"`；
 - 每个 page size 重复 3 次。
 
-稀疏随机访问和多连接测试：
+稀疏随机访问和多实例并行测试：
 
 ```bash
 MODE=cgroup-hermit \
 PAGE_SIZES_KB='4 16 32 64 128 256 512 1024' \
 REDIS_WORKSET_MB=16384 REDIS_VALUE_SIZE=16384 \
 REDIS_ACTIVE_RATIOS='100 25 6.25' \
-REDIS_ACCESS_ORDER=random REDIS_ACCESS_SEED=1 REDIS_CLIENTS=8 \
+REDIS_ACCESS_ORDER=random REDIS_ACCESS_SEED=1 \
+REDIS_INSTANCES=8 REDIS_CLIENTS=1 \
 REDIS_CHECKSUM=N \
-BENCH_CPUS=8-15 REDIS_SERVER_CPU=0 \
+BENCH_CPUS=8-15 REDIS_SERVER_CPUS=0-7 \
 LOCAL_RATIO_PCT=50 BENCH_REPEATS=5 \
 ./run_redis_page_sweep.sh
 ```
 
 `REDIS_ACTIVE_RATIOS` 控制每轮实际 GET 的 key 比例；抽样集合和随机顺序由
-`REDIS_ACCESS_SEED` 固定。`REDIS_CLIENTS` 创建多个独立 TCP 连接并使用 barrier
-同步开始请求，但单个 Redis server 的命令执行仍主要由主线程串行完成；该参数增加
-连接和请求队列压力，不应解释成多个 Redis 执行线程。
+`REDIS_ACCESS_SEED` 固定。`REDIS_INSTANCES` 从 `REDIS_PORT` 开始使用连续端口，
+将总工作集均分给多个独立 `redis-server`；所有实例的加载和扫描通过 barrier 同步，
+因此能够并行触发 Hermit swap-in。`REDIS_CLIENTS` 是每个实例的连接数；例如
+`REDIS_INSTANCES=8 REDIS_CLIENTS=2` 最多会建立 16 条并发 GET 连接。由于单个 Redis
+实例的命令执行仍主要由主线程串行完成，优先增加实例数，再用客户端数增加排队深度。
 性能轮建议使用 `REDIS_CHECKSUM=N`，此时仍检查 value 是否存在和长度，但不对每个
 返回字节执行 CRC32；另跑一次 `REDIS_CHECKSUM=Y BENCH_REPEATS=1` 做完整正确性复核。
 
@@ -133,6 +142,7 @@ Hermit sweep CSV 关键列：
 | `target_stores_delta` / `target_loads_delta` | 目标 order 的 store/load folio 数 |
 | `target_errors_delta` | 必须为 0 |
 | `get_qps` | 实际完成的 GET/s |
+| `instances` / `clients_per_instance` | Redis 进程数和每实例请求连接数 |
 | `useful_gib_per_sec` | Redis 返回给客户端的有效 value 字节吞吐 |
 | `remote_bytes_per_useful_byte` | Hermit load 字节 / Redis 返回字节；未校正本地命中 |
 | `normalized_read_amplification` | 按本轮换出比例归一化后的远端读放大估计 |
@@ -150,6 +160,6 @@ page size 上升，`checksum_errors=0`，`target_errors_delta=0`。
   严格，可改 `REDIS_CHECKSUM=Y`（默认）或让 harness 逐 key 生成不同 value。
 - 测试结束后脚本会 `kill` redis-server 和 harness，但不会自动删除
   Redis 内存数据；每次 run 开始时 harness 会执行 `FLUSHALL`。
-- 多个客户端连接不会让单个 Redis 实例并行执行 GET。若目标是通过多个独立 Redis
-  地址空间压满 Hermit/RDMA，还需要在 sweep 中启动多个 redis-server 实例；当前
-  `REDIS_CLIENTS` 只用于真实协议路径上的并发连接和请求排队。
+- 多个客户端连接不会让单个 Redis 实例并行执行 GET；提高 RDMA 压力时应增加
+  `REDIS_INSTANCES`，并确保 `REDIS_SERVER_CPUS` 和 `BENCH_CPUS` 使用互不重叠的
+  CPU 集。`REDIS_WORKSET_MB` 是所有实例合计值，不会随实例数成倍增加。

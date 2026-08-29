@@ -1,4 +1,4 @@
-# dnet-61 memcached 测试
+# dnet-61 hermit 测试
 
 <!-- - Linux 6.18.38-hermit 运行 Memcached 和 Mutilate，测试 `local`、`cgroup-local` 与 `cgroup-Hermit` 三种模式；数据集为 3200 万条记录。
 - Memcached 使用 0–7 核，Mutilate 使用 8–15 核，每个负载重复3次并取中位数。

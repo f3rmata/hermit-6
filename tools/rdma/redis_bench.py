@@ -18,15 +18,18 @@ Environment
 -----------
 REDIS_HOST           default 127.0.0.1
 REDIS_PORT           default 6391
+REDIS_PORTS          comma-separated ports; overrides REDIS_PORT
 REDIS_WORKSET_MB     total value bytes to load (default 16384)
-REDIS_VALUE_SIZE     value size in bytes (default 2097152 = 2 MiB)
+REDIS_VALUE_SIZE     value size in bytes (default 1048576 = 1 MiB)
+REDIS_SCAN_CHUNK     read only the first N bytes of each value during BENCH
+                     via GETRANGE (default 65536 = 64 KiB; 0 = whole value)
 REDIS_VALUE_SEED     seed for the deterministic value template (default 42)
 REDIS_CHECKSUM       Y/N, verify CRC32 during scan (default Y)
 REDIS_LOAD_PIPELINE  number of SET commands per pipeline batch (default 256)
 REDIS_ACTIVE_RATIO   percent of keys read during BENCH (default 100)
 REDIS_ACCESS_ORDER   sequential or random (default sequential)
 REDIS_ACCESS_SEED    deterministic key-selection/order seed (default 1)
-REDIS_CLIENTS        concurrent GET connections (default 1)
+REDIS_CLIENTS        concurrent GET connections per Redis instance (default 1)
 """
 
 import math
@@ -143,18 +146,22 @@ def load_dataset(redis, keys, template):
         sent += len(batch)
 
 
-def scan_dataset(redis, keys, template, check):
-    expected_crc = zlib.crc32(template) & 0xffffffff
+def scan_dataset(redis, keys, template, check, scan_chunk=0):
+    expected = template[:scan_chunk] if scan_chunk > 0 else template
+    expected_crc = zlib.crc32(expected) & 0xffffffff
     expected_sum = (len(keys) * expected_crc) & MASK64
     seen_sum = 0
     errors = 0
     total_bytes = 0
     for key in keys:
-        value = redis.execute("GET", key)
+        if scan_chunk > 0:
+            value = redis.execute("GETRANGE", key, "0", str(scan_chunk - 1))
+        else:
+            value = redis.execute("GET", key)
         if value is None:
             errors += 1
             continue
-        if len(value) != len(template):
+        if len(value) != len(expected):
             errors += 1
             continue
         total_bytes += len(value)
@@ -182,23 +189,68 @@ def select_keys(keys, ratio, order, seed):
     return selected
 
 
-def scan_dataset_parallel(host, port, keys, template, check, clients):
-    worker_count = min(clients, len(keys))
-    chunks = [keys[len(keys) * index // worker_count:
-                   len(keys) * (index + 1) // worker_count]
-              for index in range(worker_count)]
-    results = [None] * worker_count
-    failures = [None] * worker_count
-    barrier = threading.Barrier(worker_count + 1)
+def load_datasets_parallel(host, ports, key_groups, template):
+    failures = [None] * len(ports)
+    barrier = threading.Barrier(len(ports) + 1)
 
     def run(index):
         redis = None
         try:
+            redis = Redis(host, ports[index])
+            redis.execute("PING")
+            redis.execute("FLUSHALL")
+            barrier.wait()
+            load_dataset(redis, key_groups[index], template)
+        except BaseException as exc:
+            failures[index] = exc
+            try:
+                barrier.abort()
+            except threading.BrokenBarrierError:
+                pass
+        finally:
+            if redis is not None:
+                redis.close()
+
+    threads = [threading.Thread(target=run, args=(index,))
+               for index in range(len(ports))]
+    for thread in threads:
+        thread.start()
+    start = time.monotonic()
+    try:
+        barrier.wait()
+    except threading.BrokenBarrierError:
+        pass
+    for thread in threads:
+        thread.join()
+    seconds = time.monotonic() - start
+    for failure in failures:
+        if failure is not None:
+            raise failure
+    return seconds
+
+
+def scan_datasets_parallel(host, ports, key_groups, template, check,
+                           clients_per_instance, scan_chunk=0):
+    jobs = []
+    for port, keys in zip(ports, key_groups):
+        worker_count = min(clients_per_instance, len(keys))
+        for index in range(worker_count):
+            chunk = keys[len(keys) * index // worker_count:
+                         len(keys) * (index + 1) // worker_count]
+            jobs.append((port, chunk))
+    results = [None] * len(jobs)
+    failures = [None] * len(jobs)
+    barrier = threading.Barrier(len(jobs) + 1)
+
+    def run(index):
+        redis = None
+        try:
+            port, keys = jobs[index]
             redis = Redis(host, port)
             redis.execute("PING")
             barrier.wait()
-            results[index] = scan_dataset(redis, chunks[index], template,
-                                          check)
+            results[index] = scan_dataset(redis, keys, template, check,
+                                          scan_chunk)
         except BaseException as exc:  # propagate worker failures to main
             failures[index] = exc
             try:
@@ -210,7 +262,7 @@ def scan_dataset_parallel(host, port, keys, template, check, clients):
                 redis.close()
 
     threads = [threading.Thread(target=run, args=(index,))
-               for index in range(worker_count)]
+               for index in range(len(jobs))]
     for thread in threads:
         thread.start()
     start = time.monotonic()
@@ -226,14 +278,22 @@ def scan_dataset_parallel(host, port, keys, template, check, clients):
             raise failure
     total_bytes = sum(result[0] for result in results)
     checksum_errors = sum(result[1] for result in results)
-    return total_bytes, checksum_errors, seconds, worker_count
+    return total_bytes, checksum_errors, seconds, len(jobs)
 
 
 def main():
     host = os.environ.get("REDIS_HOST", "127.0.0.1")
     port = env_int("REDIS_PORT", 6391)
+    ports_text = os.environ.get("REDIS_PORTS", "").strip()
+    try:
+        ports = ([int(item) for item in ports_text.split(",") if item]
+                 if ports_text else [port])
+    except ValueError:
+        log("invalid REDIS_PORTS=%s" % ports_text)
+        return 2
     workset_mb = env_int("REDIS_WORKSET_MB", 16384)
-    value_size = env_int("REDIS_VALUE_SIZE", 2 * 1024 * 1024)
+    value_size = env_int("REDIS_VALUE_SIZE", 1024 * 1024)
+    scan_chunk = env_int("REDIS_SCAN_CHUNK", 64 * 1024)
     seed = env_int("REDIS_VALUE_SEED", 42)
     active_ratio = env_float("REDIS_ACTIVE_RATIO", 100.0)
     access_order = os.environ.get("REDIS_ACCESS_ORDER", "sequential").strip().lower()
@@ -241,8 +301,13 @@ def main():
     clients = env_int("REDIS_CLIENTS", 1)
     check = os.environ.get("REDIS_CHECKSUM", "Y").strip().upper() not in ("0", "N", "NO", "OFF")
 
-    if workset_mb <= 0 or value_size <= 0 or clients <= 0:
+    if (workset_mb <= 0 or value_size <= 0 or clients <= 0 or not ports or
+            any(item <= 0 or item > 65535 for item in ports) or
+            len(set(ports)) != len(ports)):
         log("REDIS_WORKSET_MB, REDIS_VALUE_SIZE and REDIS_CLIENTS must be positive")
+        return 2
+    if scan_chunk < 0 or scan_chunk > value_size:
+        log("REDIS_SCAN_CHUNK must be between 0 and REDIS_VALUE_SIZE")
         return 2
     if active_ratio <= 0.0 or active_ratio > 100.0:
         log("REDIS_ACTIVE_RATIO must be in (0, 100]")
@@ -252,55 +317,62 @@ def main():
         return 2
 
     n_keys = max(1, (workset_mb * 1024 * 1024) // value_size)
+    if len(ports) > n_keys:
+        log("number of Redis instances must not exceed number of keys")
+        return 2
     keys = ["redis:%08d" % i for i in range(n_keys)]
-    active_keys = select_keys(keys, active_ratio, access_order, access_seed)
-    actual_access_pct = 100.0 * len(active_keys) / n_keys
+    key_groups = [keys[n_keys * index // len(ports):
+                       n_keys * (index + 1) // len(ports)]
+                  for index in range(len(ports))]
+    active_key_groups = [
+        select_keys(group, active_ratio, access_order, access_seed + index)
+        for index, group in enumerate(key_groups)
+    ]
+    active_key_count = sum(len(group) for group in active_key_groups)
+    actual_access_pct = 100.0 * active_key_count / n_keys
 
     sigs = {signal.SIGUSR1, signal.SIGUSR2, signal.SIGTERM, signal.SIGINT}
     signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
 
     log("WAITING pid=%d active_keys=%d actual_access_pct=%.6f "
-        "access_order=%s clients=%d" %
-        (os.getpid(), len(active_keys), actual_access_pct, access_order,
-         clients))
+        "access_order=%s instances=%d clients_per_instance=%d" %
+        (os.getpid(), active_key_count, actual_access_pct, access_order,
+         len(ports), clients))
 
-    redis = None
+    loaded = False
     while True:
         sig = signal.sigwait(sigs)
         if sig in (signal.SIGTERM, signal.SIGINT):
             break
         if sig == signal.SIGUSR1:
-            start = time.monotonic()
-            redis = Redis(host, port)
-            redis.execute("PING")
-            redis.execute("FLUSHALL")
             rng = random.Random(seed)
             template = rng.randbytes(value_size)
-            load_dataset(redis, keys, template)
-            populate_sec = time.monotonic() - start
-            log("READY pid=%d keys=%d value_size=%d workset_mb=%d "
-                "populate_sec=%.6f" %
-                (os.getpid(), n_keys, value_size, workset_mb, populate_sec))
+            populate_sec = load_datasets_parallel(host, ports, key_groups,
+                                                  template)
+            loaded = True
+            log("READY pid=%d keys=%d value_size=%d scan_chunk=%d "
+                "workset_mb=%d populate_sec=%.6f instances=%d" %
+                (os.getpid(), n_keys, value_size, scan_chunk, workset_mb,
+                 populate_sec, len(ports)))
         elif sig == signal.SIGUSR2:
-            if redis is None:
+            if not loaded:
                 log("BENCH skipped: no dataset loaded; send SIGUSR1 first")
                 continue
             total_bytes, errors, bench_sec, actual_clients = \
-                scan_dataset_parallel(host, port, active_keys, template,
-                                      check, clients)
-            get_qps = len(active_keys) / bench_sec if bench_sec > 0 else 0.0
+                scan_datasets_parallel(host, ports, active_key_groups,
+                                       template, check, clients, scan_chunk)
+            get_qps = active_key_count / bench_sec if bench_sec > 0 else 0.0
             useful_gib_per_sec = (total_bytes / (1024.0 ** 3) / bench_sec
                                   if bench_sec > 0 else 0.0)
             log("BENCH sec=%.6f keys=%d active_keys=%d bytes=%d "
-                "actual_access_pct=%.6f access_order=%s clients=%d "
+                "scan_chunk=%d actual_access_pct=%.6f access_order=%s "
+                "clients=%d instances=%d clients_per_instance=%d "
                 "get_qps=%.3f useful_gib_per_sec=%.6f "
                 "checksum_errors=%d" %
-                (bench_sec, n_keys, len(active_keys), total_bytes,
-                 actual_access_pct, access_order, actual_clients, get_qps,
-                 useful_gib_per_sec, errors))
+                (bench_sec, n_keys, active_key_count, total_bytes, scan_chunk,
+                 actual_access_pct, access_order, actual_clients, len(ports),
+                 clients, get_qps, useful_gib_per_sec, errors))
 
-    if redis is not None:
-        redis.close()
     log("EXIT")
     return 0
 

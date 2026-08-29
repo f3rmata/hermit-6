@@ -248,6 +248,10 @@ def plot_sparse_summary(rows, output):
 
     store_share = [median(page_groups[page], "large_store_pct") for page in pages]
     load_share = [median(page_groups[page], "large_load_pct") for page in pages]
+    pmd_load_fallback = (
+        2048 in pages
+        and median(page_groups[2048], "large_load_pct") < 50.0
+    )
     ax_share.plot(positions, store_share, "o-", linewidth=2, label="Store")
     ax_share.plot(positions, load_share, "s-", linewidth=2, label="Load")
     ax_share.set_title("Requested-order byte share")
@@ -259,7 +263,7 @@ def plot_sparse_summary(rows, output):
         axis.set_xticks(positions, labels)
         axis.set_xlabel("Requested folio size")
         axis.grid(axis="y", alpha=0.3)
-        if 2048 in pages:
+        if pmd_load_fallback:
             fallback_position = pages.index(2048)
             axis.axvspan(
                 fallback_position - 0.35,
@@ -268,7 +272,7 @@ def plot_sparse_summary(rows, output):
                 alpha=0.65,
                 zorder=0,
             )
-    if 2048 in pages:
+    if pmd_load_fallback:
         ax_protocol.annotate(
             "2 MiB swap-in uses 4 KiB loads",
             xy=(pages.index(2048), dense_load_bw[pages.index(2048)]),
@@ -291,11 +295,87 @@ def plot_sparse_summary(rows, output):
     plt.close(fig)
 
 
+def plot_effective_throughput_by_density(rows, output):
+    """Plot application-visible (not overfetch-inclusive) swap-in throughput."""
+    pages = sorted({int(row["page_kb"]) for row in rows})
+    labels = [page_label(page) for page in pages]
+    positions = list(range(len(pages)))
+    ratios = list(dict.fromkeys(row["access_ratio"] for row in rows))
+    repeat_count = len({row["repeat"] for row in rows})
+    context = benchmark_context(rows)
+    groups = defaultdict(list)
+    for row in rows:
+        groups[(int(row["page_kb"]), row["access_ratio"])].append(row)
+
+    styles = {
+        "100": ("tab:orange", "s", "100% access"),
+        "50": ("tab:green", "^", "50% access"),
+        "25": ("tab:red", "D", "25% access"),
+        "6.25": ("tab:purple", "P", "6.25% access"),
+        "1p": ("tab:brown", "X", "1 page/folio"),
+    }
+    fig, axis = plt.subplots(figsize=(14, 8), constrained_layout=True)
+    for ratio in ratios:
+        color, marker, label = styles.get(ratio, (None, "o", ratio))
+        values = [
+            median(groups[(page, ratio)], "accessed_scan_gib_per_sec")
+            for page in pages
+        ]
+        axis.plot(
+            positions,
+            values,
+            marker=marker,
+            color=color,
+            linewidth=2.4,
+            markersize=8,
+            label=label,
+        )
+
+    if 2048 in pages:
+        fallback_position = pages.index(2048)
+        axis.axvspan(
+            fallback_position - 0.35,
+            fallback_position + 0.35,
+            color="0.85",
+            alpha=0.65,
+            zorder=0,
+        )
+        axis.annotate(
+            "2 MiB swap-in uses 4 KiB loads",
+            xy=(fallback_position, max(
+                median(groups[(2048, ratio)], "accessed_scan_gib_per_sec")
+                for ratio in ratios
+            )),
+            xytext=(-210, -45),
+            textcoords="offset points",
+            arrowprops={"arrowstyle": "->", "color": "0.3"},
+            fontsize=11,
+        )
+    axis.set_xticks(positions, labels)
+    axis.set_xlabel("Requested folio size")
+    axis.set_ylabel("Effective application throughput (GiB/s)")
+    axis.set_title("Effective application throughput by access density")
+    axis.grid(axis="y", alpha=0.3)
+    axis.legend(ncol=2, loc="upper right")
+    fig.suptitle("Hermit sparse anonymous-memory swap I/O", fontsize=20)
+    fig.text(
+        0.5,
+        -0.015,
+        f"dnet-61; {context}; medians over {repeat_count} repeats and "
+        "4 order/locality combinations. Only application-accessed 4 KiB pages are counted.",
+        ha="center",
+        fontsize=10,
+    )
+    fig.savefig(output, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary-output", type=Path)
+    parser.add_argument("--effective-output", type=Path)
     args = parser.parse_args()
     with args.csv.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -309,6 +389,10 @@ def main():
             args.summary_output.parent.mkdir(parents=True, exist_ok=True)
             plot_sparse_summary(rows, args.summary_output)
             print(args.summary_output)
+        if args.effective_output:
+            args.effective_output.parent.mkdir(parents=True, exist_ok=True)
+            plot_effective_throughput_by_density(rows, args.effective_output)
+            print(args.effective_output)
     else:
         plot_full_scan(rows, args.output)
     print(args.output)

@@ -76,10 +76,13 @@ def main():
     axes[1][0].set_yscale("log", base=2)
 
     clients = sorted({row.get("clients", "") for row in rows} - {""})
+    instances = sorted({row.get("instances", "") for row in rows} - {""})
     order = sorted({row.get("access_order", "") for row in rows} - {""})
     context = []
     if len(clients) == 1:
         context.append(f"{clients[0]} clients")
+    if len(instances) == 1:
+        context.append(f"{instances[0]} instances")
     if len(order) == 1:
         context.append(f"{order[0]} access")
     title = "Redis sparse GET under Hermit"
