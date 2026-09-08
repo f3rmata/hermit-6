@@ -6,14 +6,14 @@ RDMA 交换传输的收益。
 ## 1. 设计
 
 memcached 使用哈希表 + 小对象，内存碎片化严重，很难形成 THP/mTHP。
-Redis 测试改用**大字符串 value + 固定 chunk 读取**：每个 value 默认 1 MiB，
+Redis 测试改用**大字符串 value + 固定 chunk 读取**：每个 value 默认 2 MiB，
 是连续匿名内存，THP `always` 策略下可以被大 folio 覆盖；BENCH 阶段默认只读取
 每个 value 的前 64 KiB（`GETRANGE`），从而在真实 Redis 请求路径中制造一个
 类似数组扫描 `chunk64k` 的读放大/大页权衡：
 
 ```text
 启动 N 个 redis-server -> 启动 python harness
-  -> 等待 SIGUSR1 -> FLUSHALL -> SET N 个 1 MiB value -> READY
+  -> 等待 SIGUSR1 -> FLUSHALL -> SET N 个 2 MiB value -> READY
   -> 脚本降低 cgroup memory.max，触发 Hermit RDMA swap-out
   -> 脚本恢复 memory.max，发送 SIGUSR2
   -> harness 顺序 GETRANGE 每个 value 的前 64 KiB
@@ -71,10 +71,10 @@ MODE=cgroup-hermit REDIS_WORKSET_MB=16384 LOCAL_RATIO_PCT=70 \
 
 默认配置：
 
-- `REDIS_VALUE_SIZE=1048576`（1 MiB）；
+- `REDIS_VALUE_SIZE=2097152`（2 MiB）；
 - `REDIS_SCAN_CHUNK=65536`（BENCH 阶段每个 value 只读前 64 KiB）；
 - `REDIS_ACTIVE_RATIOS="100"`、`REDIS_ACCESS_ORDER=sequential`；
-- `REDIS_WORKSET_MB=16384` -> `16384` 个 key；
+- `REDIS_WORKSET_MB=16384` -> `8192` 个 key；
 - `REDIS_PORT=6391`；
 - `PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"`；
 - 每个 page size 重复 3 次。

@@ -20,7 +20,7 @@ REDIS_HOST           default 127.0.0.1
 REDIS_PORT           default 6391
 REDIS_PORTS          comma-separated ports; overrides REDIS_PORT
 REDIS_WORKSET_MB     total value bytes to load (default 16384)
-REDIS_VALUE_SIZE     value size in bytes (default 1048576 = 1 MiB)
+REDIS_VALUE_SIZE     value size in bytes (default 2097152 = 2 MiB)
 REDIS_SCAN_CHUNK     read only the first N bytes of each value during BENCH
                      via GETRANGE (default 65536 = 64 KiB; 0 = whole value)
 REDIS_VALUE_SEED     seed for the deterministic value template (default 42)
@@ -292,7 +292,7 @@ def main():
         log("invalid REDIS_PORTS=%s" % ports_text)
         return 2
     workset_mb = env_int("REDIS_WORKSET_MB", 16384)
-    value_size = env_int("REDIS_VALUE_SIZE", 1024 * 1024)
+    value_size = env_int("REDIS_VALUE_SIZE", 2 * 1024 * 1024)
     scan_chunk = env_int("REDIS_SCAN_CHUNK", 64 * 1024)
     seed = env_int("REDIS_VALUE_SEED", 42)
     active_ratio = env_float("REDIS_ACTIVE_RATIO", 100.0)

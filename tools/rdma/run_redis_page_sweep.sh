@@ -23,7 +23,7 @@ restores memory.max, and GET-scans the keys to measure and verify RDMA loads.
 Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
   REDIS_WORKSET_MB=16384            (total value bytes to load)
-  REDIS_VALUE_SIZE=1048576          (bytes per value; default 1 MiB)
+  REDIS_VALUE_SIZE=2097152          (bytes per value; default 2 MiB)
   REDIS_SCAN_CHUNK=65536            (read first 64 KiB of each value during
                                      BENCH via GETRANGE; 0 = whole value)
   REDIS_ACTIVE_RATIOS="100"          (percent of keys read per run)
@@ -63,8 +63,16 @@ MODE=$(normalize_mode "${requested_mode:-cgroup-hermit}")
 
 PAGE_SIZES_KB=${PAGE_SIZES_KB:-"4 16 32 64 128 256 512 1024 2048"}
 REDIS_WORKSET_MB=${REDIS_WORKSET_MB:-16384}
-REDIS_VALUE_SIZE=${REDIS_VALUE_SIZE:-1048576}
-REDIS_SCAN_CHUNK=${REDIS_SCAN_CHUNK:-65536}
+REDIS_VALUE_SIZE=${REDIS_VALUE_SIZE:-2097152}
+if [ -n "${REDIS_SCAN_CHUNK:-}" ]; then
+  REDIS_SCAN_CHUNK=${REDIS_SCAN_CHUNK}
+else
+  if [ "$REDIS_VALUE_SIZE" -ge 65536 ]; then
+    REDIS_SCAN_CHUNK=65536
+  else
+    REDIS_SCAN_CHUNK=0
+  fi
+fi
 REDIS_ACTIVE_RATIOS=${REDIS_ACTIVE_RATIOS:-100}
 REDIS_ACCESS_ORDER=${REDIS_ACCESS_ORDER:-sequential}
 REDIS_ACCESS_SEED=${REDIS_ACCESS_SEED:-1}

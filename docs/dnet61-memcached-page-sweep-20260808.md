@@ -1,143 +1,78 @@
 # dnet-61 hermit 测试
 
-<!-- - Linux 6.18.38-hermit 运行 Memcached 和 Mutilate，测试 `local`、`cgroup-local` 与 `cgroup-Hermit` 三种模式；数据集为 3200 万条记录。
-- Memcached 使用 0–7 核，Mutilate 使用 8–15 核，每个负载重复3次并取中位数。
-- mTHP页大小 4 KiB–2 MiB，本地和远端内存比例设为70%
-- 2026-08-12 后使用 `/dev/sdb6` 块设备，修复后的高阶 swap-out 与 swap-in 均可用； -->
+<!-- ## 研究动机（Motivation）
 
-## 2026-08-17：XGBoost 大页 RDMA swap-out/swap-in
+内存资源正在走向池化/解耦：主机可以通过 RDMA 把冷内存换到远端内存节点，在不增加本地 DRAM 的前提下扩大可用内存。Hermit 就是这条路线上的一个实现——cgroup 内存压力触发 swap-out，经 RDMA 写到远端；本地再次访问时经 RDMA swap-in 读回。
 
-使用 HIGGS CSV（1100 万行、28 个特征），`hist` 方法训练 30 轮，XGBoost 线程数为 4；每个页大小重复 3 次取中位数。READY 后实际常驻约 2538–2540 MiB，`memory.max` 为 70%（约 1776–1778 MiB），训练 AUC 在所有配置中均为 0.820776。
+当前要回答的核心问题是：**RDMA swap 的传输粒度（folio 大小）应该怎么选，收益边界在哪里？**
 
-XGBoost hist 训练也主要对 dense DMatrix 做块状、顺序或高局部性访问。因此它与内存扫描的结果更接近。
+- 4 KiB 小页路径下，每页都要付一次完整的固定开销：DMA map/unmap、RDMA WR post、CQ completion、pending 计数与对象释放。实测 4 KiB 的 swap-in 协议带宽只有 0.6 GiB/s 左右，RDMA 网卡远未喂满。
+- 使用 THP/mTHP 大 folio 后，一次 RDMA WR 可以传输 16 KiB–2 MiB，固定开销被摊薄。anon 顺序扫描中 swap-in 协议带宽从 4 KiB 的 0.6 GiB/s 提升到 2 MiB 的约 10–11 GiB/s，应用可见带宽到 36 GiB/s。
+- 但大 folio 不是免费的：如果应用只访问 folio 里的一小部分（比例 `f`），读放大约为 `1/f`，无用数据传输会反过来吞掉收益。Memcached 随机小对象、16 KiB value 随机 GET 都表现为 QPS 对 folio 大小不敏感；稀疏 chunk64k 扫描则出现明显倒 U。
+x x x 因此，大页收益不是由页大小本身决定，而是取决于**访问密度与空间局部性**：固定开销节省和无效传输代价之间的平衡，决定最佳 folio。
 
-![XGBoost 大页 RDMA swap 测试](../tools/rdma/results/dnet-61/20260817-175412-xgboost-swapio/xgboost-swapio.png)
+本文档用同一套 page sweep 方法（同时改变 mTHP 分配大小与 Hermit `remote_order_mask`）在多种负载上复现了这个权衡： -->
 
-|  页大小 | order | swap-out 协议 GiB/s | 大页 store 字节占比 | store 请求数 | 大页 load 字节占比 | load 请求数 | train 秒 |
-| ------: | ----: | ------------------: | ------------------: | -----------: | -----------------: | ----------: | -------: |
-|   4 KiB |     0 |               0.636 |                  0% |      201,862 |                 0% |     194,886 |  195.854 |
-|  16 KiB |     2 |               1.457 |             99.668% |       50,349 |            99.971% |      48,991 |  193.863 |
-|  32 KiB |     3 |               1.975 |             99.541% |       25,188 |            99.959% |      24,652 |  194.022 |
-|  64 KiB |     4 |               2.656 |             99.252% |       12,611 |            99.922% |      12,419 |  193.376 |
-| 128 KiB |     5 |               3.155 |             98.636% |        6,298 |            99.815% |       6,244 |  193.330 |
-| 256 KiB |     6 |               3.462 |             97.795% |        2,981 |            99.577% |       2,970 |  193.306 |
-| 512 KiB |     7 |               3.665 |             97.448% |        1,486 |            99.350% |       1,485 |  193.135 |
-|   1 MiB |     8 |               4.255 |             98.317% |        1,435 |            99.374% |       1,435 |  193.395 |
-|   2 MiB |     9 |               4.399 |             98.039% |          543 |                 0% |           0 |  187.264 |
+<!-- ## 222111-redis
+
+![222111](../tools/rdma/results/dnet-61/20260829-222111-redis-swapio/redis-swapio-summary.png)
+
+要点：
+
+1. 改成大 value + 顺序 64 KiB chunk 后，Redis 首次出现倒 U：峰值在 16–32 KiB（GET/s 约 9.6–9.7k），而非 chunk 大小 64 KiB；原因是 64 KiB chunk 起点与 mTHP folio 边界不对齐，16–32 KiB folio 更容易被 PTE swap fault 完整聚合。
+2. ≥512 KiB 大页形成率快速下降：1 MiB value 在 512 KiB 的 `large_store_%` 只有 50.6%、1 MiB 仅 0.8%、2 MiB 为 0；2 MiB value 在 2 MiB 同样为 0，因此 1 MiB/2 MiB 档又退回 4 KiB 路径，QPS 小幅反弹。
+3. 后续定位为 Redis（jemalloc）的 2 MiB value 缓冲区按 1 MiB 对齐而非 2 MiB PMD 对齐，故 2 MiB folio 形成不了； -->
+
+## 2026-08-29：Anon chunk64k 单线程 / 8 线程对比
+
+测试目录：
+
+- 单线程：`20260831-141039-anon-sparse-swapio`（`BENCH_THREADS=1, BENCH_CPUS=16`）
+- 8 线程：`20260831-142313-anon-sparse-swapio`（`BENCH_THREADS=8, BENCH_CPUS=16-23`）
+
+配置与之前数组扫描一致：16 GiB workset、70% 本地内存、`parallel-fault` swapout、`ACCESS_RATIOS="100 chunk64k"`、sequential + high locality，每档 3 次取中位数。
+
+![Anon chunk64k 单线程 vs 8 线程](../tools/rdma/results/dnet-61/anon-threads-compare.png)
+
+100% 全扫有效带宽在 8 线程下从 4 KiB 的 11.70 GiB/s 增至 2 MiB 的 34.20 GiB/s；
+单线程从 2.02 GiB/s 增至 18.59 GiB/s。关键结论：
+
+1. 峰值位置不随线程数改变：chunk64k 的有效带宽峰值都在 64 KiB，说明最优 folio 由访问 chunk 大小决定，而不是由并发度决定。
+2. 8 线程整体抬升 2–5.8 倍：峰值处从 8.44 GiB/s 提升到 26.09 GiB/s（3.09×）。单线程受单请求延迟限制，无法喂满 RDMA；8 线程并行 fault 才接近协议带宽上限。
+
+## 2026-08-29：Redis 大 value + 64 KiB chunk 初测（1 MiB 与 2 MiB）
+
+### 211403-redis
+
+1 MiB value + 64 KiB chunk、1 instance、顺序 GET 全部 key，每档 3 次。
+
+![211403](../tools/rdma/results/dnet-61/20260829-211403-redis-swapio/redis-swapio-summary.png)
+
+## 2026-08-30：Redis 2 MiB value + 64 KiB chunk
+
+配置为 2 MiB value、BENCH 阶段每个 value只 `GETRANGE` 前 64 KiB、顺序访问全部 key、1 个 Redis 实例、每档 5 次取中位数；redis cgroup `memory.max` 为 70%。
+
+![Redis 2 MiB value + 64 KiB chunk](../tools/rdma/results/dnet-61/20260831-001724-redis-swapio/redis-swapio-summary.png)
+
+<!-- |  页大小 | GET/s | useful GiB/s | backend loads/GET | large*store*% | large*load*% | read_amp |
+| ------: | ----: | -----------: | ----------------: | ------------: | -----------: | -------: |
+|   4 KiB |  7963 |       0.4860 |              7.81 |            0% |           0% |     0.96 |
+|  16 KiB | 10056 |       0.6138 |              2.26 |          100% |         100% |     1.11 |
+|  32 KiB | 10442 |       0.6373 |              1.36 |          100% |         100% |     1.36 |
+|  64 KiB | 10726 |       0.6547 |              0.91 |          100% |         100% |     1.82 |
+| 128 KiB | 11065 |       0.6753 |              0.46 |          100% |         100% |     1.80 |
+| 256 KiB | 10004 |       0.6106 |              0.45 |          100% |         100% |     3.44 |
+| 512 KiB |  8444 |       0.5154 |              0.45 |          100% |         100% |     6.39 |
+|   1 MiB |  6290 |       0.3839 |              0.47 |          100% |         100% |    12.76 |
+|   2 MiB |  8044 |       0.4910 |              7.73 |            0% |           0% |     0.95 | -->
 
 结论：
 
-1. swap-out 协议吞吐从 4 KiB 的 0.636 GiB/s 提升到 2 MiB 的 4.399 GiB/s，约S6.9×；store 请求数从 201,862 降到 543，说明减少 WR、DMA map/unmap、入队和Scompletion 的固定开销是主要收益来源。16 KiB–1 MiB 已经有 97.4%–99.7% 的大页 store 字节占比，说明后端确实按目标 order 传输。
-2. order 2–8 的 swap-in 大页字节占比为 99.35%–99.97%，与 dense 训练矩阵的访问特征一致。训练时间从 195.854 s（4 KiB）降到约 193.1–193.9 s（16 KiB–1 MiB），实际应用收益只有约 1%–1.4%，因为 XGBoost 主要受计算限制，而不是受 swap 协议带宽限制。
-3. 2 MiB 的 `large_load_pct=0` 且 `target_loads_delta=0`，当前不能作为完整 2 MiB swap-in 的收益证据。现有内核的swap-in 候选 order 还没有覆盖 order 9，必须补齐 2 MiB swap-in 路径后再纳入结论。
+1. Redis 2 MiB value + 64 KiB chunk 的 **GET/s 和 useful 带宽出现明显先升后降，峰值在 128 KiB**。
+2. 16 KiB–1 MiB 的 `large_store_%` 和 `large_load_%` 都达到 100%，说明大 value 确实能稳定形成 mTHP。
+3. 2048k 仍未形成 2 MiB folio：`large_store_%=0`、`large_load_%=0`，原因是 Redis 当前使用 jemalloc，2 MiB value 按 1 MiB 对齐而非 2 MiB PMD 对齐，每个 value 只能形成两个 1 MiB folio。你修复的 Hermit 2 MiB 路径在 Redis 侧还没有被触发；2 MiB 路径的有效性已由上一节 anon 2048k `large_load%=100%` 验证。
 
-## 测试方法
-
-- memcached 主要暴露了随机访问下的大页读放大；
-- 匿名数组扫描测到的是连续、全覆盖访问下的大 WR 协议收益；
-- XGBoost 也是高空间局部性、计算占主导的 dense workload，因此只会看到交换协议收益被训练计算掩盖；
-
-### 大页收益
-
-匿名数组扫描和XGBoost测试随页变大而变快
-增大 folio 后，主要减少了：
-
-- DMA map/unmap；
-- RDMA WR post；
-- CQ completion；
-- 锁和对象管理；
-- 每次请求的固定延迟。
-
-### 读/写放大问题
-
-Memcached的测试时吞吐随页面大小提升而下降
-其中16–256 KiB 的情况符合随机小对象访问的预期：一次 fault 会把整个 folio 搬回来，但实际只访问其中很小的一部分，产生读放大
-
-> 读放大 = 远端实际读回字节 / 应用真正访问字节
-
-此时大页虽然减少了 RDMA 请求数，却增加了：
-
-- 无用数据传输；
-- fault 延迟；
-- RDMA 队列和 CQ 压力；
-- cache 污染；
-- 访存线程等待时间。
-
-所以吞吐下降，128 KiB 附近最差。
-
-#### 访问热度偏斜的收益分析
-
-即决定了大页带来的固定开销节省是否会被读放大抵消。
-按当前三类负载，潜在收益排序为：Memcached 最大，XGBoost 中等，顺序数组扫描最小。
-
-- **Memcached**：随机且离散的热点最适合小粒度 swap-in；swap-out 可以继续使用较大 WR 以降低回收成本，形成“大粒度换出、小粒度换入”的非对称策略。若热点在一个 folio 内连续，中等粒度才有收益。
-- **匿名数组扫描**：访问热度接近均匀，静态大页已经接近最优；按热度拆分只会增管理成本，收益很小。
-- **XGBoost**：训练矩阵的 dense 区域适合大粒度双向传输，但不同训练阶段或特征块
-  可能存在区域性热点，未来可按区域/阶段选择粒度，而不是全局固定一个 order。
-
-### 理想 workload
-
-小粒度：请求固定开销较高
-中等粒度：达到最佳点
-大粒度：读/写放大主导，吞吐下降
-
-## 2026-08-20：Sparse/Random 匿名内存测试
-
-<!--
-测试目录为 `20260820-114721-anon-sparse-full`。工作集为 16 GiB，`memory.max`为 11468 MiB（约 70%），通过 RDMA 换出约 4.8–5.0 GiB。测试覆盖 9 种页大小、5 种访问比例、顺序/随机 folio 顺序和高/低 folio 内局部性，每种组合重复 3 次，共 `9 × 5 × 2 × 2 × 3 = 540` 轮。图中数据为每个页大小和访问比例下 12 个样本的中位数。 -->
-
-有效吞吐：控制一个mTHP folio中设置的热页比例，并测量得到的吞吐
-每次测试都按不同的folio顺序和folio内偏斜测试。图中数据为每个页大小和访问比例下 12 个样本的中位数。
-
-- sequential + high locality
-- sequential + low locality
-- random + high locality
-- random + low locality
-
-![Sparse/Random 匿名内存传输收益与读放大](assets/dnet61-anon-sparse-20260820/anon-sparse-benefit-summary.png)
-
-### 结果分析
-
-|  页大小 | swap-out 协议 GiB/s | 100% 有效 GiB/s | 25% 有效 GiB/s | 6.25% 有效 GiB/s | 1 页/folio 有效 GiB/s | 1 页/folio 读放大 | 大页 load 字节占比 |
-| ------: | ------------------: | --------------: | -------------: | ---------------: | --------------------: | ----------------: | -----------------: |
-|   4 KiB |               0.619 |           1.847 |              x |                x |                 1.847 |                1× |                 0% |
-|  16 KiB |               1.484 |           3.905 |          1.221 |                x |                 1.206 |                4× |               100% |
-|  32 KiB |               2.028 |           5.178 |          1.694 |                x |                 0.913 |                8× |               100% |
-|  64 KiB |               2.787 |           6.612 |          2.404 |            0.679 |                 0.684 |               16× |               100% |
-| 128 KiB |               3.439 |           7.537 |          2.879 |            0.837 |                 0.429 |               32× |               100% |
-| 256 KiB |               3.974 |           8.153 |          3.269 |            0.965 |                 0.253 |               64× |               100% |
-| 512 KiB |               4.330 |           8.460 |          3.486 |            1.043 |                 0.139 |              128× |               100% |
-|   1 MiB |               4.555 |           8.639 |          3.596 |            1.081 |                 0.073 |              256× |               100% |
-|   2 MiB |               5.110 |           2.390 |          2.349 |            2.224 |                 1.307 |                1× |                 0% |
-
-### 收益与放大
-
-1. swapout在页面大小增大时收益一直上升：吞吐从 4 KiB 的 0.619 GiB/s 增至 1 MiB 的 4.555 GiB/s（7.36×）和 2 MiB 的 5.110 GiB/s（8.25×）。
-2. 50%、25% 和 6.25% 访问分别产生约 2×、4× 和 16× 的读放大。对 16 KiB–1 MiB，同一比例的读放大不随页大小变化，而 RDMA 协议吞吐随粒度提高，因此 25% 有效吞吐从 16 KiB 的 1.221 GiB/s 增至1 MiB 的 3.596 GiB/s。此前全扫描和 XGBoost 随页大小提高而变快，符合这一结果。
-3. 读放大随 folio 大小从 4×、8×、16×一直增长到 1 MiB 的 256×，实测值与理论值一致；有效吞吐从 16 KiB 的1.206 GiB/s 降到 1 MiB 的 0.073 GiB/s。这才是随机稀疏热点下预期的大页性能下降。
-
-### 顺序与局部性
-
-在实际使用大粒度 load 的 16 KiB–1 MiB 范围内，随机 folio 顺序相对顺序访问的协议吞吐中位数低 6.3%。惩罚从 16 KiB 的约 17.0% 逐渐降至 1 MiB 的约 1.6%，说明大传输能更充分地摊薄随机 fault 和请求调度开销。
-
-低 folio 内局部性相对高局部性只低约 1.3%。这不是局部性不重要，而是当前 workload 会访问每一个 folio：第一次 fault 已经读回整个 folio，之后访问连续还是分散的基页都不会改变 RDMA 字节数。若要测试热度偏斜收益，需要固定逻辑区域和地址集合，让高局部性访问集中在少量传输 folio、低局部性访问分散到更多传输 folio。
-
-### 用访问密度控制写/读放大
-
-在相同 workset、相同 cgroup 压力和相同远端数据量下，构造四种模式：
-
-1. 顺序扫描全部 4 KiB 子页（`f≈1`）；
-2. 每个 folio 只访问一个随机子页（最大读放大）；
-3. 每个 folio 访问连续的 `k` 个子页（可控的空间局部性）；
-4. Zipf/热点-冷数据访问（接近 Memcached），分别改变热点比例和热点是否连续。
-
-这样可以直接画出 `active_ratio` 与最佳传输粒度的关系：密集访问应随粒度增大
-后平台，稀疏随机访问应在某个粒度后下降。
-
-<!-- ### 分离 swap-out、swap-in 和应用阶段
-
-每一档分别记录：实际传输字节数、WR 数、协议阶段 wall time、应用阶段 wall time、
-`large_*_pct`、fallback/error、以及 checksum/AUC 等正确性指标。每档至少 3 次，建议随机化页大小顺序并报告中位数和离散度。 -->
+补充：`20260829-223923-redis-swapio` 的 16 KiB value 随机 GET 测试仍显示 QPS 平坦在约 28.8k，与 folio 大小无关，再次说明随机小对象 KV 不适合展示大页收益。
 
 ## 统一分析：传输粒度、访问密度与预期收益
 
@@ -295,6 +230,213 @@ swap-in 吞吐从 4 KiB 的 0.626 GiB/s 增至 1 MiB 的2.635 GiB/s。完整 16 
 - pending 计数和对象释放；
 - CPU 调度和锁竞争。
 
+<!-- - Linux 6.18.38-hermit 运行 Memcached 和 Mutilate，测试 `local`、`cgroup-local` 与 `cgroup-Hermit` 三种模式；数据集为 3200 万条记录。
+- Memcached 使用 0–7 核，Mutilate 使用 8–15 核，每个负载重复3次并取中位数。
+- mTHP页大小 4 KiB–2 MiB，本地和远端内存比例设为70%
+- 2026-08-12 后使用 `/dev/sdb6` 块设备，修复后的高阶 swap-out 与 swap-in 均可用； -->
+
+## 2026-08-17：XGBoost 大页 RDMA swap-out/swap-in
+
+使用 HIGGS CSV（1100 万行、28 个特征），`hist` 方法训练 30 轮，XGBoost 线程数为 4；每个页大小重复 3 次取中位数。READY 后实际常驻约 2538–2540 MiB，`memory.max` 为 70%（约 1776–1778 MiB），训练 AUC 在所有配置中均为 0.820776。
+
+XGBoost hist 训练也主要对 dense DMatrix 做块状、顺序或高局部性访问。因此它与内存扫描的结果更接近。
+
+![XGBoost 大页 RDMA swap 测试](../tools/rdma/results/dnet-61/20260817-175412-xgboost-swapio/xgboost-swapio.png)
+
+|  页大小 | order | swap-out 协议 GiB/s | 大页 store 字节占比 | store 请求数 | 大页 load 字节占比 | load 请求数 | train 秒 |
+| ------: | ----: | ------------------: | ------------------: | -----------: | -----------------: | ----------: | -------: |
+|   4 KiB |     0 |               0.636 |                  0% |      201,862 |                 0% |     194,886 |  195.854 |
+|  16 KiB |     2 |               1.457 |             99.668% |       50,349 |            99.971% |      48,991 |  193.863 |
+|  32 KiB |     3 |               1.975 |             99.541% |       25,188 |            99.959% |      24,652 |  194.022 |
+|  64 KiB |     4 |               2.656 |             99.252% |       12,611 |            99.922% |      12,419 |  193.376 |
+| 128 KiB |     5 |               3.155 |             98.636% |        6,298 |            99.815% |       6,244 |  193.330 |
+| 256 KiB |     6 |               3.462 |             97.795% |        2,981 |            99.577% |       2,970 |  193.306 |
+| 512 KiB |     7 |               3.665 |             97.448% |        1,486 |            99.350% |       1,485 |  193.135 |
+|   1 MiB |     8 |               4.255 |             98.317% |        1,435 |            99.374% |       1,435 |  193.395 |
+|   2 MiB |     9 |               4.399 |             98.039% |          543 |                 0% |           0 |  187.264 |
+
+结论：
+
+1. swap-out 协议吞吐从 4 KiB 的 0.636 GiB/s 提升到 2 MiB 的 4.399 GiB/s，约S6.9×；store 请求数从 201,862 降到 543，说明减少 WR、DMA map/unmap、入队和Scompletion 的固定开销是主要收益来源。16 KiB–1 MiB 已经有 97.4%–99.7% 的大页 store 字节占比，说明后端确实按目标 order 传输。
+2. order 2–8 的 swap-in 大页字节占比为 99.35%–99.97%，与 dense 训练矩阵的访问特征一致。训练时间从 195.854 s（4 KiB）降到约 193.1–193.9 s（16 KiB–1 MiB），实际应用收益只有约 1%–1.4%，因为 XGBoost 主要受计算限制，而不是受 swap 协议带宽限制。
+3. 2 MiB 的 `large_load_pct=0` 且 `target_loads_delta=0`，当前不能作为完整 2 MiB swap-in 的收益证据。现有内核的swap-in 候选 order 还没有覆盖 order 9，必须补齐 2 MiB swap-in 路径后再纳入结论。
+
+## 测试方法
+
+- memcached 主要暴露了随机访问下的大页读放大；
+- 匿名数组扫描测到的是连续、全覆盖访问下的大 WR 协议收益；
+- XGBoost 也是高空间局部性、计算占主导的 dense workload，因此只会看到交换协议收益被训练计算掩盖；
+
+### 大页收益
+
+匿名数组扫描和XGBoost测试随页变大而变快
+增大 folio 后，主要减少了：
+
+- DMA map/unmap；
+- RDMA WR post；
+- CQ completion；
+- 锁和对象管理；
+- 每次请求的固定延迟。
+
+### 读/写放大问题
+
+Memcached的测试时吞吐随页面大小提升而下降
+其中16–256 KiB 的情况符合随机小对象访问的预期：一次 fault 会把整个 folio 搬回来，但实际只访问其中很小的一部分，产生读放大
+
+> 读放大 = 远端实际读回字节 / 应用真正访问字节
+
+此时大页虽然减少了 RDMA 请求数，却增加了：
+
+- 无用数据传输；
+- fault 延迟；
+- RDMA 队列和 CQ 压力；
+- cache 污染；
+- 访存线程等待时间。
+
+所以吞吐下降，128 KiB 附近最差。
+
+#### 访问热度偏斜的收益分析
+
+即决定了大页带来的固定开销节省是否会被读放大抵消。
+按当前三类负载，潜在收益排序为：Memcached 最大，XGBoost 中等，顺序数组扫描最小。
+
+- **Memcached**：随机且离散的热点最适合小粒度 swap-in；swap-out 可以继续使用较大 WR 以降低回收成本，形成“大粒度换出、小粒度换入”的非对称策略。若热点在一个 folio 内连续，中等粒度才有收益。
+- **匿名数组扫描**：访问热度接近均匀，静态大页已经接近最优；按热度拆分只会增管理成本，收益很小。
+- **XGBoost**：训练矩阵的 dense 区域适合大粒度双向传输，但不同训练阶段或特征块
+  可能存在区域性热点，未来可按区域/阶段选择粒度，而不是全局固定一个 order。
+
+### 理想 workload
+
+小粒度：请求固定开销较高
+中等粒度：达到最佳点
+大粒度：读/写放大主导，吞吐下降
+
+## 2026-08-20：Sparse/Random 匿名内存测试
+
+<!--
+测试目录为 `20260820-114721-anon-sparse-full`。工作集为 16 GiB，`memory.max`为 11468 MiB（约 70%），通过 RDMA 换出约 4.8–5.0 GiB。测试覆盖 9 种页大小、5 种访问比例、顺序/随机 folio 顺序和高/低 folio 内局部性，每种组合重复 3 次，共 `9 × 5 × 2 × 2 × 3 = 540` 轮。图中数据为每个页大小和访问比例下 12 个样本的中位数。 -->
+
+有效吞吐：控制一个mTHP folio中设置的热页比例，并测量得到的吞吐
+每次测试都按不同的folio顺序和folio内偏斜测试。图中数据为每个页大小和访问比例下 12 个样本的中位数。
+
+- sequential + high locality
+- sequential + low locality
+- random + high locality
+- random + low locality
+
+![Sparse/Random 匿名内存传输收益与读放大](assets/dnet61-anon-sparse-20260820/anon-sparse-benefit-summary.png)
+
+### 结果分析
+
+|  页大小 | swap-out 协议 GiB/s | 100% 有效 GiB/s | 25% 有效 GiB/s | 6.25% 有效 GiB/s | 1 页/folio 有效 GiB/s | 1 页/folio 读放大 | 大页 load 字节占比 |
+| ------: | ------------------: | --------------: | -------------: | ---------------: | --------------------: | ----------------: | -----------------: |
+|   4 KiB |               0.619 |           1.847 |              x |                x |                 1.847 |                1× |                 0% |
+|  16 KiB |               1.484 |           3.905 |          1.221 |                x |                 1.206 |                4× |               100% |
+|  32 KiB |               2.028 |           5.178 |          1.694 |                x |                 0.913 |                8× |               100% |
+|  64 KiB |               2.787 |           6.612 |          2.404 |            0.679 |                 0.684 |               16× |               100% |
+| 128 KiB |               3.439 |           7.537 |          2.879 |            0.837 |                 0.429 |               32× |               100% |
+| 256 KiB |               3.974 |           8.153 |          3.269 |            0.965 |                 0.253 |               64× |               100% |
+| 512 KiB |               4.330 |           8.460 |          3.486 |            1.043 |                 0.139 |              128× |               100% |
+|   1 MiB |               4.555 |           8.639 |          3.596 |            1.081 |                 0.073 |              256× |               100% |
+|   2 MiB |               5.110 |           2.390 |          2.349 |            2.224 |                 1.307 |                1× |                 0% |
+
+### 收益与放大
+
+1. swapout在页面大小增大时收益一直上升：吞吐从 4 KiB 的 0.619 GiB/s 增至 1 MiB 的 4.555 GiB/s（7.36×）和 2 MiB 的 5.110 GiB/s（8.25×）。
+2. 50%、25% 和 6.25% 访问分别产生约 2×、4× 和 16× 的读放大。对 16 KiB–1 MiB，同一比例的读放大不随页大小变化，而 RDMA 协议吞吐随粒度提高，因此 25% 有效吞吐从 16 KiB 的 1.221 GiB/s 增至1 MiB 的 3.596 GiB/s。此前全扫描和 XGBoost 随页大小提高而变快，符合这一结果。
+3. 读放大随 folio 大小从 4×、8×、16×一直增长到 1 MiB 的 256×，实测值与理论值一致；有效吞吐从 16 KiB 的1.206 GiB/s 降到 1 MiB 的 0.073 GiB/s。这才是随机稀疏热点下预期的大页性能下降。
+
+### 顺序与局部性
+
+在实际使用大粒度 load 的 16 KiB–1 MiB 范围内，随机 folio 顺序相对顺序访问的协议吞吐中位数低 6.3%。惩罚从 16 KiB 的约 17.0% 逐渐降至 1 MiB 的约 1.6%，说明大传输能更充分地摊薄随机 fault 和请求调度开销。
+
+低 folio 内局部性相对高局部性只低约 1.3%。这不是局部性不重要，而是当前 workload 会访问每一个 folio：第一次 fault 已经读回整个 folio，之后访问连续还是分散的基页都不会改变 RDMA 字节数。若要测试热度偏斜收益，需要固定逻辑区域和地址集合，让高局部性访问集中在少量传输 folio、低局部性访问分散到更多传输 folio。
+
+### 用访问密度控制写/读放大
+
+在相同 workset、相同 cgroup 压力和相同远端数据量下，构造四种模式：
+
+1. 顺序扫描全部 4 KiB 子页（`f≈1`）；
+2. 每个 folio 只访问一个随机子页（最大读放大）；
+3. 每个 folio 访问连续的 `k` 个子页（可控的空间局部性）；
+4. Zipf/热点-冷数据访问（接近 Memcached），分别改变热点比例和热点是否连续。
+
+这样可以直接画出 `active_ratio` 与最佳传输粒度的关系：密集访问应随粒度增大
+后平台，稀疏随机访问应在某个粒度后下降。
+
+<!-- ### 分离 swap-out、swap-in 和应用阶段
+
+每一档分别记录：实际传输字节数、WR 数、协议阶段 wall time、应用阶段 wall time、
+`large_*_pct`、fallback/error、以及 checksum/AUC 等正确性指标。每档至少 3 次，建议随机化页大小顺序并报告中位数和离散度。 -->
+
+## 2026-08-27：Anon sparse 8 线程 vs 16 线程全矩阵复测
+
+测试目录：
+
+- 8 线程：`20260827-163500-anon-sparse-swapio`（`BENCH_THREADS=8, BENCH_CPUS=0-7`）
+- 16 线程：`20260827-000430-anon-sparse-swapio`（`BENCH_THREADS=16, BENCH_CPUS=0-15`）
+
+配置同 08-20 sparse 测试：16 GiB workset、`memory.max` 11468 MiB、`parallel-fault`、
+`ACCESS_RATIOS="100 50 25 6.25 1p"` × sequential/random × high/low locality，每组合 5 次取中位数（每轮 900 行）。
+
+![Anon sparse 8 vs 16 线程](../tools/rdma/results/dnet-61/20260827-163500-anon-sparse-swapio/anon-swapio-complete-8-vs-16-threads.png)
+
+100% 全扫有效带宽（应用可见 GiB/s，中位数）：
+
+|  页大小 | 8 线程 | 16 线程 | 16T/8T |
+| ------: | -----: | ------: | -----: |
+|   4 KiB |  10.83 |   16.63 |  1.54× |
+|  16 KiB |  21.40 |   24.92 |  1.16× |
+|  32 KiB |  23.79 |   26.17 |  1.10× |
+|  64 KiB |  24.72 |   26.22 |  1.06× |
+| 128 KiB |  24.98 |   26.12 |  1.05× |
+| 256 KiB |  25.08 |   26.18 |  1.04× |
+| 512 KiB |  24.53 |   26.13 |  1.06× |
+|   1 MiB |  24.76 |   25.57 |  1.03× |
+|   2 MiB |  13.60 |   19.55 |  1.44× |
+
+要点：
+
+1. 8 线程在 16 KiB–1 MiB 已达 21.4–25.1 GiB/s 平台；16 线程只在小页有明显提升（4 KiB +54%、16 KiB +16%），≥64 KiB 仅高 3–6%，说明并发 fault 在小传输粒度时更能压满 RDMA，大 folio 时带宽已趋饱和。
+2. 稀疏访问结果与 08-20 一致：1p/folio 有效带宽从 16 KiB 的约 7.3 GiB/s（16T）单调降到 1 MiB 的 0.12 GiB/s，读放大按 folio/4 KiB 增长。
+3. 2 MiB 仍是回退假象：`large_load_pct=0`，实际走 4 KiB load，因此有效带宽向 4 KiB 组靠拢。
+
+## 2026-08-27：Anon chunk64k 8 线程
+
+8 线程（CPU 16-23）、`parallel-fault`、`ACCESS_RATIOS="100 chunk64k"`、sequential + high locality，每档 3 次取中位数。
+
+![chunk64k 倒 U 曲线](../tools/rdma/results/dnet-61/20260827-201718-anon-sparse-swapio/chunk64k-inverted-u.png)
+
+要点：
+
+1. chunk64k 有效带宽呈倒 U：4 KiB→64 KiB 升至 24.76 GiB/s（峰值），128 KiB 后按 chunk/folio 比例下降，峰值正好等于 chunk 大小 64 KiB。
+2. 协议带宽在 512 KiB–1 MiB 达到约 10.5–10.6 GiB/s，有效带宽的下降完全来自读放大，而非协议带宽下降。
+3. 2 MiB 的“回升”是 4 KiB 回退假象（`large_load_pct=0`）。
+
+## 2026-08-27 / 08-29：Redis 16 KiB value 随机 GET
+
+两次配置相同：16 KiB value、随机 key、8 instances × 8 clients（每实例 1 client）、16 GiB workset。
+08-27 为 `20260827-175448-redis-swapio`，08-29 复测为 `20260829-223923-redis-swapio`。
+
+![Redis 16 KiB 随机 GET](../tools/rdma/results/dnet-61/20260829-223923-redis-swapio/redis-swapio-summary.png)
+
+|  页大小 | 08-27 GET/s | 08-29 GET/s | 08-29 large_load% |
+| ------: | ----------: | ----------: | ----------------: |
+|   4 KiB |       28500 |       28782 |                0% |
+|  16 KiB |       28505 |       28851 |             92.8% |
+|  32 KiB |       28468 |       28824 |             79.8% |
+|  64 KiB |       28428 |       28921 |             51.1% |
+| 128 KiB |       28594 |       28983 |              3.2% |
+| 256 KiB |       28501 |       28827 |                0% |
+| 512 KiB |       28478 |       28859 |                0% |
+|   1 MiB |       28358 |       28850 |                0% |
+
+要点：
+
+1. GET/s 与页大小、active ratio 完全平坦（28.4k–29.0k），瓶颈在 Redis 单线程事件循环/网络栈，不在 swap-in。
+2. 大 folio 只减少了后端 load 请求数（4 KiB 约 2.3–4.0 loads/GET，16–32 KiB 降到 0.7–1.1），但 QPS 不变。
+3. 16 KiB value 只能形成 16–64 KiB 小 mTHP，≥256 KiB 大页 load 归零；随机小对象 KV 不适合展示大页收益。
+
 原始汇总数据：
 
 - [2026-07-27 Native](../tools/rdma/results/dnet-61/20260727-235121-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
@@ -304,3 +446,13 @@ swap-in 吞吐从 4 KiB 的 0.626 GiB/s 增至 1 MiB 的2.635 GiB/s。完整 16 
 - [Native page-sweep-summary.csv](../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
 - [Hermit page-sweep-summary.csv](../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/hermit/page-sweep-summary.csv)
 - [2026-08-09 Native](../tools/rdma/results/dnet-61/20260809-114645-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
+- [2026-08-27 Anon sparse 8T](../tools/rdma/results/dnet-61/20260827-163500-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-27 Anon sparse 16T](../tools/rdma/results/dnet-61/20260827-000430-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-27 Anon chunk64k 8T](../tools/rdma/results/dnet-61/20260827-201718-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-27 Redis 16 KiB 随机](../tools/rdma/results/dnet-61/20260827-175448-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-29 Redis 1 MiB value + 64 KiB chunk](../tools/rdma/results/dnet-61/20260829-211403-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-29 Redis 2 MiB value + 64 KiB chunk 初测](../tools/rdma/results/dnet-61/20260829-222111-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-29 Redis 16 KiB 随机复测](../tools/rdma/results/dnet-61/20260829-223923-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-31 Redis 2 MiB value + 64 KiB chunk](../tools/rdma/results/dnet-61/20260831-001724-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-31 Anon chunk64k 1T](../tools/rdma/results/dnet-61/20260831-141039-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-31 Anon chunk64k 8T](../tools/rdma/results/dnet-61/20260831-142313-anon-sparse-swapio/swapio-summary.csv)
