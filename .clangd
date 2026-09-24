@@ -1,0 +1,16 @@
+CompileFlags:
+  CompilationDatabase: linux-stable
+  Remove:
+    - -mpreferred-stack-boundary=3
+    - -mindirect-branch=thunk-extern
+    - -mindirect-branch-register
+    - -fno-allow-store-data-races
+    - -fmin-function-alignment=16
+    - -fconserve-stack
+  Add:
+    - -Wno-unknown-warning-option
+    - -Wno-unused-command-line-argument
+
+Diagnostics:
+  Suppress:
+    - drv_unknown_argument

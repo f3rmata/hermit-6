@@ -1,3 +1,5 @@
+# Conclusion
+
 ## Motivation
 
 内存资源正在走向池化/解耦：主机可以通过 RDMA 把冷内存换到远端内存节点，在不增加本地 DRAM 的前提下扩大可用内存。
@@ -48,3 +50,74 @@ PEBS 的 Data Linear Address（DLA）给出被采样 load 的**线性地址**。
 2. 把地址右移对齐到 page，统计每页的**访问次数**（热度）与**平均延迟**；
 3. `data_src` 里的 `Local RAM` vs `Remote RAM` 直接区分本地命中与远端（swap-in 后仍未本地化）的访问；
 4. 由此得到一张页面热度 + 远端访问占比的 heatmap。
+
+
+## pebs design
+
+使用PEBS硬件采样测量swapin的内存地址附近（2MiB）的访问密度（偏斜度skewness），并在Hermit的swapin路径上自动选择每次RDMA传输的folio粒度，替代原先的全局变量（remote_order_mask）
+
+### swapout
+
+尽量整个大 folio 换出  
+选中大 folio  
+→ 分配连续 swap 槽位  
+→ 整个 folio 加入 swapcache  
+→ 解除映射  
+→ 按整个 folio 构造写 BIO/hermit_swap_write_folio()  
+  
+hermit_swap_write_folio()  
+-> prepare remote()  
+-> 选择transfer_order // PEBS/debugfs mask  
+-> backend_store()  
+-> commit_remote()  
+
+### swapin
+
+memory.c
+```c
+alloc_swap_folio()  // 选择并分配读回的folio (PEBS预测)  
+swapcache_prepare() // 并发设置  
+发起hermit load  
+处理memcg/workingset/lru数据  
+poll read完成  
+```
+
+### kernel design
+
+我们复用了很多Linux原生的mTHP优化
+
+- folio 连续分配
+- 整个folio写出（RDMA）
+- mTHP和PTE批量恢复
+
+还有一些kernel原生的优化
+
+- swap readahead: 缺页时提前读取缺页地址附近的页面，但是策略是在正确性约束下尝试较大的folio (我们则是用PEBS实现更精确的调控)
+- khugepaged collapse: 后台线程负责把符合条件的小页区域合并成THP，也可以把之前换出的页面先读回再合并
+
+### design analysis
+
+写出与读回的目标并不相同：
+
+- swap-out：一个已确定要回收的 folio，其全部数据都必须保存。仅把它从一个大 WR 改成多个小 WR，不会减少写出的总字节，只会增加请求数。
+- swap-in：一次 fault 可以只读原始远端 extent 的一部分。减小读回大小能直接减少无用传输和本地内存占用。
+
+因此，合理的初始设计是：
+
+> 换出时尽量合并传输；读回时让 PEBS 决定围绕 fault 地址应该带回多少相邻数据。
+
+例如原来是 2 MiB folio，可以先整体写出；随后某处缺页，PEBS 判断附近只有 64 KiB 活跃，就只恢复对应的 64 KiB。当前远端 extent 跟踪已允许读取其完整有效的子范围，具备这条路径的基础；性能收益仍需独立实验验证。
+
+如果要通过小粒度 swap-out 减少“误换出热页”，则还需要改变选页或 folio 拆分
+
+4. PEBS 应预测“这次读回来后会用多少”，而不是累计触及多少
+
+倒 U 的转折点意味着：继续扩大读回范围，新增的有用数据已不足以抵消新增成本。
+
+PEBS 应围绕 fault 地址，为每个候选大小估计：
+
+- 一个近期时间窗口内，哪些相邻页会一起被访问；
+- 扩大范围后能减少多少后续 fault / RDMA 请求；
+- 会额外读回多少冷数据；
+- 样本是否足够，能否支持这个判断。
+

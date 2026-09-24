@@ -6,3 +6,9 @@ tools/rdma/plot_measured_hermit_page_sweep.py
 
 # Downloaded datasets used by benchmarks
 data/
+docs/.dnet61-memcached-page-sweep-20260808.preview.html
+docs/.motivation.preview.html
+docs/.pebs-implementation-summary.preview.html
+docs/.numamma.preview.html
+docs/.numamma.md.preview.html
+docs/.numamma.md.preview.html

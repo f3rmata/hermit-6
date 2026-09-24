@@ -25,7 +25,7 @@ static int rswap_hermit_store(struct hermit_io *io)
 	if (force_local)
 		return -EOPNOTSUPP;
 
-	io->fallback = io->folio_order && io->transfer_order == 0;
+	io->fallback = io->folio_order > 0;
 	ret = rswap_dram_write_folio(io->folio, rswap_entry_offset(io->entry));
 	if (unlikely(ret))
 		pr_err_ratelimited("rswap_dram: store failed for entry 0x%lx: %d\n",
@@ -40,7 +40,7 @@ static int rswap_hermit_load(struct hermit_io *io, bool async)
 
 	(void)async;
 
-	io->fallback = io->folio_order && io->transfer_order == 0;
+	io->fallback = io->folio_order > 0;
 	ret = rswap_dram_read_folio(io->folio, rswap_entry_offset(io->entry));
 	if (unlikely(ret && ret != -ENOENT))
 		pr_err_ratelimited("rswap_dram: load failed for entry 0x%lx: %d\n",

@@ -11,8 +11,8 @@ static int hermit_reset_swap_stats(void) {
   return (int)syscall(SYS_RESET_SWAP_STAT);
 }
 
-static int hermit_get_swap_stats(int *ondemand, int *prefetch,
-                                 int *hit_on_cache) {
+static int hermit_get_swap_stats(long *ondemand, long *prefetch,
+                                 long *hit_on_cache) {
   return (int)syscall(SYS_GET_SWAP_STATS, ondemand, prefetch, hit_on_cache);
 }
 
@@ -36,17 +36,17 @@ int main(int argc, char **argv) {
   }
 
   if (strcmp(action, "stats") == 0) {
-    int ondemand = 0;
-    int prefetch = 0;
-    int hit_on_cache = 0;
+    long ondemand = 0;
+    long prefetch = 0;
+    long hit_on_cache = 0;
 
     if (hermit_get_swap_stats(&ondemand, &prefetch, &hit_on_cache) != 0) {
       fprintf(stderr, "get_swap_stats failed: %s\n", strerror(errno));
       return 1;
     }
 
-    printf("HERMIT_SWAP_STATS: action=stats label=%s ondemand=%d prefetch=%d "
-           "hit_on_swap_cache=%d\n",
+    printf("HERMIT_SWAP_STATS: action=stats label=%s ondemand=%ld prefetch=%ld "
+           "hit_on_swap_cache=%ld\n",
            label, ondemand, prefetch, hit_on_cache);
     return 0;
   }

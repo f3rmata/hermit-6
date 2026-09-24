@@ -20,9 +20,13 @@ Linux 源码树内的 RDMA core。
 - 远端 extent 在整个 folio 范围内事务化预留和提交，支持 partial invalidate；
 - 运行时 order 位图和逐 order store/load/fallback/error 统计；
 - memcg 接近 =memory.max= 时的定向异步回收；
-- QEMU DRAM checksum、vmstat、backend 计数和本地 swap 写扇区验证。
+- QEMU DRAM checksum、vmstat、backend 计数和本地 swap 写扇区验证；
+- PEBS 页面大小策略（=mm/hermit_pebs.c=）：Intel PEBS 采样 + 2 MiB region
+  热度表 + 代价模型，在 swap-out/swap-in 路径按访问局部性自动选择传输
+  folio 粒度（syscall 473/474、=memory.hermit_pebs=、debugfs =pebs_*=）。
+  详见 =docs/pebs-order-policy.md=。
 
-详细迁移记录见 =docs/migration-6.18.md=。=docs/plan/= 下的 6.6 文档作为历史
+详细迁移记录见 =docs/migration-6.18.md=。=docs/assets/plan/= 下的 6.6 文档作为历史
 记录保留。
 
 * 目录
@@ -93,6 +97,45 @@ make -C linux-stable olddefconfig
 make -C linux-stable -j"$(nproc)" bzImage modules
 #+end_src
 
+* 开发环境与 clangd LSP
+
+仓库根目录的 =.clangd= 已配置好内核源码的 clangd 支持：
+
+#+begin_example
+CompileFlags:
+  CompilationDatabase: linux-stable
+  Remove:   # 仅 gcc 支持的代码生成参数，clang 不认识
+    - -mpreferred-stack-boundary=3
+    - -mindirect-branch=thunk-extern
+    - -mindirect-branch-register
+    - -fno-allow-store-data-races
+    - -fmin-function-alignment=16
+    - -fconserve-stack
+  Add:
+    - -Wno-unknown-warning-option
+    - -Wno-unused-command-line-argument
+Diagnostics:
+  Suppress: [drv_unknown_argument]
+#+end_example
+
+clangd 需要 =linux-stable/compile_commands.json=。完成一次内核构建后生成：
+
+#+begin_src sh
+python3 linux-stable/scripts/clang-tools/gen_compile_commands.py \
+  -d linux-stable -o linux-stable/compile_commands.json
+#+end_src
+
+修改 =.config=、新增源文件或清理重建后重新执行上面的生成命令即可。验证：
+
+#+begin_src sh
+clangd --check=linux-stable/mm/hermit.c
+#+end_src
+
+输出应以 =All checks completed, 0 errors= 结尾。=--check= 模式对部分 token
+报告的 =tweak: SwapBinaryOperands ==> FAIL= 是 clangd 自检工具的内部噪音，
+不是编辑器里出现的 LSP 诊断。VSCode/Vim/Emacs 的 clangd 插件打开本仓库根目录
+或 =linux-stable/= 均可，无需再传 =--compile-commands-dir=。
+
 * QEMU DRAM 验证
 
 本机没有 =/dev/kvm= 时使用 TCG：
@@ -136,9 +179,10 @@ QEMU_ACCEL=tcg QEMU_CPU=max SKIP_BUILD=1 TIMEOUT_SEC=360 \
 #+end_src
 
 2 MiB THP swapout 回归把最后一行改为
-=THP_SIZE_KB=2048 REMOTE_ORDER_MASK=0x201=。Linux 6.18 的 PTE swap fault
-只聚合 order 2–8 的 mTHP，因此这个用例验证 order-9 大 WR 写入；64 KiB 用例
-同时验证大粒度写入和回读。
+=THP_SIZE_KB=2048 REMOTE_ORDER_MASK=0x201=。Hermit 的 PTE swap fault 在远端 extent 完整且 effective mask 允许时可读回
+order-9 folio，再安装多个 PTE。DRAM backend 仅支持 order 0 传输，因此
+此 QEMU 用例验证 order-9 写出记账与 4 KiB 回退；大 WR 和 order-9 读回
+需要 RDMA backend 验证。
 
 串口日志位于 =tools/qemu-dram/_work/guest-serial.log=。
 
@@ -173,7 +217,8 @@ RDMA 请求。
 order>0 的连续槽位，swapfile（=S_ISREG=）不满足，所有 folio 都会被拆成 4 KiB，
 =remote_order_mask= 的 bit 2–9 因此永不生效。使用 =RSWAP_SWAP_DEV= 指定块设备，
 或用 =manage_rswap_client.sh loop= 把 swap 文件绑定成回环设备；详见
-=remoteswap/README.md=。注意 =bypass_swapcache= 直读只在同步 swap 设备上合法。
+=remoteswap/README.md=。Hermit 远端 entry 的 =bypass_swapcache= 直读不要求同步 swap 设备；
+原生 swap 的直读仍保留同步设备限制。
 
 * 控制面与 ABI
 
@@ -238,11 +283,28 @@ base-page submit 失败会在原请求完成后统一重试 4 KiB 路径。
 
 * 当前边界
 
-- Linux 6.18 的 PMD THP 可按 order 9 swapout；PTE swap fault 可聚合 order
-  2–8 mTHP，当前不会把 order-9 swap entry 直接恢复成 PMD THP；
+- Hermit 可将完整 order-9 远端 extent 读入 2 MiB folio 并恢复为多个 PTE，
+  不直接建立 PMD 映射；原生 swap 保留上游 order 2–8 聚合策略；
 - DRAM backend 是功能验证工具，不模拟真实 RDMA 的时延、DMA 或设备错误；
 - 外部 OFED RDMA 客户端可编译路径与真实 NIC/server 端到端测试是两级验证，
   后者必须在对应硬件环境完成；
 - backend dispatch 使用 SRCU，RDMA client 还会等待 active I/O 和各队列已提交
   WR 完成后再释放资源；但 remote-only entry 没有本地副本，因此仍必须先
   =swapoff= 并确认成功，不能把该等待机制当成带活跃 swap 热卸载支持。
+
+* PEBS 修复与观测
+
+常规回收在 =try_to_unmap()= 前调用 =hermit_swapout_order()=，在 anon_vma
+读锁内查询区域策略，随后通过调用参数把 order 传到写出路径。无有效样本时
+回退静态 mask，最终传输仍受 backend 能力约束。
+
+RDMA backend 支持中间 order 分段：2 MiB folio 选择 order 4 时发送 32 个
+64 KiB WR；任一分段失败后排空请求，再按 4 KiB 重试整个 folio。
+=/sys/module/rswap_client/parameters/wr_stats= 按实际 WR order 统计已提交的
+读写请求数及字节数（包括重试）；=order_stats= 仍按原始 folio order 记账。
+DRAM 始终按 base page 复制，大 folio 始终计入 =fallback_4k=。
+
+=pebs_test_eval= 与生产路径复用决策函数；=pebs_ring_test= 验证跨页、回绕
+读取以及 perf buffer 创建/销毁。QEMU 功能通过不能代替真实 PEBS 采样与
+RDMA 性能验证。已有 remote-only 标记但 backend 不可用时，读取返回错误，
+不会读取本地无效副本。

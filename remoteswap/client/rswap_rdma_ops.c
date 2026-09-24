@@ -24,6 +24,36 @@ static DECLARE_WAIT_QUEUE_HEAD(rswap_active_io_wait);
 static DEFINE_SPINLOCK(rswap_io_lifecycle_lock);
 static bool rswap_stopping = true;
 
+/* Posted traffic includes retries, grouped by the actual WR size. */
+static atomic64_t rswap_posted_writes[PMD_ORDER + 1];
+static atomic64_t rswap_posted_reads[PMD_ORDER + 1];
+
+static int rswap_wr_stats_get(char *buffer, const struct kernel_param *kp)
+{
+	int len = 0;
+	unsigned int order;
+
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
+		"order write_wrs read_wrs write_bytes read_bytes\n");
+	for (order = 0; order <= PMD_ORDER; order++) {
+		u64 writes = atomic64_read(&rswap_posted_writes[order]);
+		u64 reads = atomic64_read(&rswap_posted_reads[order]);
+
+		if (order == 1)
+			continue;
+		len += scnprintf(buffer + len, PAGE_SIZE - len,
+			"%u %llu %llu %llu %llu\n", order, writes, reads,
+			writes * (PAGE_SIZE << order), reads * (PAGE_SIZE << order));
+	}
+	return len;
+}
+
+static const struct kernel_param_ops rswap_wr_stats_ops = {
+	.get = rswap_wr_stats_get,
+};
+module_param_cb(wr_stats, &rswap_wr_stats_ops, NULL, 0444);
+MODULE_PARM_DESC(wr_stats, "posted RDMA WR counts and bytes by actual order (including retries)");
+
 static unsigned int max_order = PMD_ORDER;
 module_param(max_order, uint, 0444);
 MODULE_PARM_DESC(max_order, "maximum folio order for one RDMA WR");
@@ -246,6 +276,10 @@ static int rswap_rdma_send(struct rswap_io_context *io, int cpu,
 		atomic_dec_return_release(&io->pending);
 		goto free_req;
 	}
+	if (type == QP_STORE)
+		atomic64_inc(&rswap_posted_writes[ilog2(len >> PAGE_SHIFT)]);
+	else
+		atomic64_inc(&rswap_posted_reads[ilog2(len >> PAGE_SHIFT)]);
 
 out:
 	return ret;
@@ -342,26 +376,17 @@ static int rswap_submit_folio(struct hermit_io *io,
 	if (!rswap_extent_in_pool(swp_offset(io->entry), nr_pages))
 		return -ERANGE;
 
-	if (!base_pages && io->transfer_order == io->folio_order &&
-	    io->folio_order) {
-		ret = rswap_rdma_send(ctx, io->cpu, swp_offset(io->entry),
-				      &io->folio->page, folio_size(io->folio),
-				      type);
-		if (ret)
-			atomic_cmpxchg(&ctx->status, 0, ret);
-		return ret;
-	}
+	if (io->transfer_order > io->folio_order ||
+	    io->transfer_order > max_order || io->transfer_order == 1)
+		return -EINVAL;
 
-	for (i = 0; i < nr_pages; i++) {
-		ret = rswap_rdma_send(ctx, io->cpu,
-				      swp_offset(io->entry) + i,
-				      folio_page(io->folio, i), PAGE_SIZE, type);
+	for (i = 0; i < nr_pages; i += 1U << (base_pages ? 0 : io->transfer_order)) {
+		size_t len = PAGE_SIZE << (base_pages ? 0 : io->transfer_order);
+
+		ret = rswap_rdma_send(ctx, io->cpu, swp_offset(io->entry) + i,
+				      folio_page(io->folio, i), len, type);
 		if (ret) {
-			/*
-			 * Some earlier WRs may already be posted; drain them
-			 * so the caller can retry with a clean pending count
-			 * instead of tripping the WARN in rswap_retry_base().
-			 */
+			/* Drain partial submission before retrying the entire folio. */
 			if (atomic_read_acquire(&ctx->pending))
 				rswap_io_poll(ctx, true);
 			atomic_cmpxchg(&ctx->status, 0, ret);
