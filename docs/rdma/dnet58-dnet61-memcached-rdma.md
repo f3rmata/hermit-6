@@ -242,8 +242,6 @@ printf 'kernel_release=%s\n' "$kernel_release"
 
 sudo make LOCALVERSION= modules_install
 sudo make LOCALVERSION= install
-sudo dkms autoinstall -k "$kernel_release"
-sudo update-grub
 sudo grub-reboot "Advanced options for Ubuntu>Ubuntu, with Linux 6.18.38-hermit"
 ```
 
@@ -741,7 +739,7 @@ order capability 和 OOM 状态，并在退出时终止工作集、恢复 THP po
 
 ```bash
 RESULT_DIR=tools/rdma/results/<时间>-anon-sparse-swapio
-python3 tools/rdma/plot_anon_swapout_sweep.py \
+python3 tools/rdma/plots/plot_anon_swapout_sweep.py \
   "$RESULT_DIR/swapio-summary.csv" \
   --output "$RESULT_DIR/anon-sparse-swapio-by-page.png"
 ```

@@ -94,8 +94,8 @@ RSWAP_SWAP_DEV=/dev/loopN ./manage_rswap_client.sh install
 For a block device, `rmsize` is taken from `RSWAP_MEM_GB` when set, otherwise
 derived from `blockdev --getsize64` (GiB). `uninstall` detaches a `/dev/loop*`
 target after swapping it off. Keep `RSWAP_MEM_GB` consistent with the actual
-device size so the remote pool and the swap slots line up. Note that
-`bypass_swapcache` direct swap-in is only legal on a synchronous swap device.
+device size so the remote pool and the swap slots line up. Hermit remote entries can use `bypass_swapcache` on asynchronous swap
+devices too; native direct swap-in retains its synchronous-device restriction.
 
 The transfer size is selected with `remote_order_mask`. Bit 0 is 4 KiB, bit 2
 is 16 KiB, and bit 9 is 2 MiB; bit 1 is not valid. The default is `0x1`, and
@@ -108,8 +108,10 @@ cat /sys/kernel/debug/hermit/effective_order_mask
 cat /sys/kernel/debug/hermit/order_stats
 ```
 
-When a large order is enabled, the RDMA backend first submits one variable-size
-WR for the physically contiguous folio. A DMA-map, post, or completion failure
+When a large order is enabled, the RDMA backend submits variable-size WRs for physically contiguous
+segments of the folio. A matching transfer and folio order uses one WR; a
+smaller nonzero transfer order uses multiple equally sized WRs. For example,
+a 2 MiB folio at transfer order 4 uses 32 WRs of 64 KiB each. A DMA-map, post, or completion failure
 causes the request to be retried as one 4 KiB WR per base page. If the order is
 disabled, the backend uses those 4 KiB WRs directly. `max_order` limits the
 largest single WR supported by the RDMA client, and `effective_order_mask` is
@@ -154,7 +156,8 @@ output, and the absence of local swap writes after successful remote stores.
 
 Use `THP_SIZE_KB=64 REMOTE_ORDER_MASK=0x11 BYPASS_SWAPCACHE=Y` to cover mTHP
 large-folio store and load. Use `THP_SIZE_KB=2048 REMOTE_ORDER_MASK=0x201` to
-cover PMD-sized THP store and load. For a committed order-9 remote extent with
+cover PMD-sized THP store accounting and base-page fallback in DRAM.
+DRAM advertises only order 0, so order-9 load requires RDMA. For a committed order-9 remote extent with
 bit 9 enabled in the effective mask, Hermit allocates one order-9 folio, reads
 the 2 MiB extent with one large RDMA transaction, and installs its 512 base
 pages into the existing PTE table. The PTE-mapped order-9 folio uses per-page
@@ -170,3 +173,16 @@ reload.
 
 The codebase is derived from Fastswap and Canvas and retains their server
 protocol and queue layout.
+
+### Actual transport counters
+
+Read `/sys/module/rswap_client/parameters/wr_stats` on the RDMA client for
+`order write_wrs read_wrs write_bytes read_bytes`. These are posted requests,
+including retries, grouped by actual WR size; they are not successful folio
+counts. `/sys/kernel/debug/hermit/order_stats` remains grouped by folio size.
+A policy-selected intermediate order is not a 4 KiB fallback; retries using
+base pages are. DRAM always reports base-page fallback for large folios.
+
+If a remote-only entry outlives its backend, reads fail instead of consulting
+an invalid local copy. This does not remove the requirement to swapoff before
+unloading the backend.

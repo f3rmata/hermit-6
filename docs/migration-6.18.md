@@ -7,7 +7,7 @@
 - Previous migration snapshot: Linux `v6.6.138`
 - RDMA provider: external Mellanox OFED built for the target kernel
 
-The historical 6.6 plans remain under `docs/plan/`. This document records the
+The historical 6.6 plans remain under `docs/archive/plan/`. This document records the
 6.18 result rather than rewriting those earlier stages.
 
 ## Kernel integration

@@ -1,2 +1,6 @@
-results
+# Keep navigation, ignore large datasets and generated run artifacts.
+/results/*
+!/results/README.md
+/data/*
+!/data/README.md
 __pycache__/

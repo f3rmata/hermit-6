@@ -150,7 +150,7 @@ def main():
         "",
         f"Median table: `{median_csv.name}`",
     ]
-    analysis = args.csv.with_name("analysis.md")
+    analysis = args.csv.with_name("docs/rdma/redis-chunk64k-20260831.md")
     analysis.write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
     print(f"\nWrote {analysis}")

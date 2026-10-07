@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10.1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>pebs-performance-summary-20261006</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: 1.5em;}
+    div.column{flex: auto;}
+    @media screen {
+    div.columns{gap: min(4vw, 1.5em);}
+    div.column{overflow-x: auto;}
+    }
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+<style>
+  body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+         max-width: 60em; margin: 0 auto; padding: 1.2em 2em 4em;
+         color: #1f2328; background: #fff; line-height: 1.6; }
+  h1, h2, h3 { border-bottom: 1px solid #d0d7de; padding-bottom: .3em; }
+  a { color: #0969da; text-decoration: none; }
+  code { background: #f6f8fa; padding: .15em .4em; border-radius: 6px;
+         font-family: 'PT Mono', 'Noto Sans Mono CJK SC', monospace; }
+  pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  blockquote { color: #57606a; border-left: 4px solid #d0d7de;
+               margin-left: 0; padding-left: 1em; }
+  table { border-collapse: collapse; }
+  th, td { border: 1px solid #d0d7de; padding: 6px 13px; }
+  img { max-width: 100%; }
+  .org-src-container { background: #f6f8fa; }
+</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">pebs-performance-summary-20261006</h1>
+</header>
+<h1 id="pebs-性能评估--简明重析2026-10-06">PEBS 性能评估 ·
+简明重析（2026-10-06）</h1>
+<blockquote>
+<p>对 <code>docs/pebs/pebs-performance-20261006.md</code>
+同一份数据的重析与重排，聚焦四个问题： ① PEBS 开/关的吞吐、②
+不同采样频率的影响、③ 纯采样开销、④ 优化策略的收益。 数值全部取自 <a
+href="../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md">SUMMARY.md</a>
+与各阶段 <code>summary.csv</code>， 中位数为点估计、方括号为 5 次重复的
+min–max（不是置信区间）。</p>
+</blockquote>
+<h2 id="0-先看结论">0. 先看结论</h2>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话回答</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PEBS 开 vs 关（吞吐）</td>
+<td>采样本身让饱和吞吐 <strong>−6.2%</strong>（static-medium vs
+off）；但叠加策略后吞吐 <strong>+124%</strong>（vs off）</td>
+</tr>
+<tr>
+<td>采样频率影响（吞吐）</td>
+<td>无换页时三档频率的原始吞吐<strong>几乎无差异</strong>（开销 &lt;1%
+CPU）；频率真正决定的是<strong>策略能提取多少收益</strong>——低频样本不足使策略近乎失效，高频/中频才能拿到
+−86% 以上的 RDMA 流量削减</td>
+</tr>
+<tr>
+<td>PEBS 纯开销</td>
+<td>无换页：<strong>CPU/请求 +0.5%～+0.8%</strong>，read p99 绝对增量
+<strong>1.3–1.6 µs</strong>；换页饱和负载下纯采样吞吐 −6.2%</td>
+</tr>
+<tr>
+<td>策略收益</td>
+<td>饱和吞吐 <strong>+136%</strong>（vs 同频
+static）、<strong>+124%</strong>（vs off）、<strong>+223%</strong>（vs
+原始 4 KiB 掩码）；固定 QPS 下 CPU/请求 −16～−18%、RDMA 读流量
+−86～−91%</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="1-术语与对照关系">1. 术语与对照关系</h2>
+<p>这次矩阵里同一组硬件（dnet-61，Memcached 800k 项 × 1 KiB value，64
+KiB THP）跑了四个 “配置族”，理解它们的差异是读懂全部数字的前提：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>采样</th>
+<th>决策</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>off-original-mask</code></td>
+<td>关</td>
+<td>静态 4 KiB（0x1）</td>
+<td>最原始基线，每个 4 KiB 页一个 WR，写放大最严重</td>
+</tr>
+<tr>
+<td><code>off</code></td>
+<td>关</td>
+<td>静态全 order（0x3fd）</td>
+<td>只放开大 folio、<strong>不采样</strong>的基线</td>
+</tr>
+<tr>
+<td><code>static-{low,medium,high,adaptive}</code></td>
+<td><strong>开</strong></td>
+<td>静态全 order</td>
+<td>PEBS 采样开着，但<strong>决策仍是静态
+mask</strong>（对照采样纯开销）</td>
+</tr>
+<tr>
+<td><code>policy-{low,medium,high,adaptive}</code></td>
+<td><strong>开</strong></td>
+<td><strong>动态策略</strong></td>
+<td>采样 + 用样本在线选传输粒度（本文说的“优化策略”）</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>采样频率档</strong>：<code>low/medium/high</code> 只改 load
+事件周期（19997 / 1999 / 199），store 周期固定 1500003；
+<code>adaptive</code> 同时改 load/store 周期。周期是硬件事件数阈值，不是
+Hz。</li>
+<li><strong>实测采样率</strong>（samples/s）：low ≈ 820，medium ≈
+870–1000，high ≈ 1300–2200，adaptive ≈ 12800。</li>
+<li><strong>策略（policy）做什么</strong>：PEBS 采样每个 2 MiB region
+的访问密度，用代价模型 <code>c(o)=固定开销/2^o + 读放大×4KiB/带宽</code>
+为每次 RDMA 传输选 folio 粒度（order 0/2–9）， 替代全局静态 mask。详见
+<a href="pebs-order-policy.md">pebs-order-policy.md</a>。</li>
+</ul>
+<p><strong>“策略收益”的正确读法</strong>：<code>policy vs static</code>（同频）才等于“我在
+PEBS 基础上加的优化”带来的收益； <code>policy vs off</code> 是“采样 +
+策略”相对纯静态的净变化；<code>policy vs off-original-mask</code>
+是相对最原始实现的提升。</p>
+<hr />
+<h2 id="2-结论一pebs-开-vs-关--应用吞吐">2. 结论一：PEBS 开 vs 关 ——
+应用吞吐</h2>
+<p>不限速（saturation）阶段直接回答这个问题。唯一被纳入不限速测试的采样配置是
+<code>medium</code>（在看结果前选定，避免事后挑档）。</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">QPS 中位数 [范围]</th>
+<th style="text-align: right;">read p99 µs</th>
+<th style="text-align: right;">CPU µs/请求</th>
+<th style="text-align: right;">RDMA read KiB/请求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>off-original-mask（4 KiB 静态）</td>
+<td style="text-align: right;">44,492 [42,009–47,739]</td>
+<td style="text-align: right;">12,848</td>
+<td style="text-align: right;">168.88</td>
+<td style="text-align: right;">49.64</td>
+</tr>
+<tr>
+<td>off（全 order，不采样）</td>
+<td style="text-align: right;">63,424 [60,228–65,582]</td>
+<td style="text-align: right;">10,156</td>
+<td style="text-align: right;">118.41</td>
+<td style="text-align: right;">43.58</td>
+</tr>
+<tr>
+<td>static-medium（PEBS 开·静态）</td>
+<td style="text-align: right;">59,489 [52,372–64,388]</td>
+<td style="text-align: right;">10,773</td>
+<td style="text-align: right;">122.88</td>
+<td style="text-align: right;">44.04</td>
+</tr>
+<tr>
+<td><strong>policy-medium（PEBS 开·策略）</strong></td>
+<td style="text-align: right;"><strong>145,338</strong>
+[137,874–152,345]</td>
+<td style="text-align: right;"><strong>5,444</strong></td>
+<td style="text-align: right;"><strong>48.90</strong></td>
+<td style="text-align: right;"><strong>3.59</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>开采样但不动决策（static vs off）</strong>：吞吐
+−6.2%（配对中位数，范围 −20.07%～+3.49%）。 这就是 PEBS 硬件采样 + ring
+消费在饱和负载下的净成本——它把吞吐从 63.4k 拉到 59.5k QPS。</p>
+<p><strong>开采样 + 用策略（policy）</strong>：吞吐 145k QPS，是纯静态
+off 的 <strong>2.24 倍</strong>、是同频 static 的 <strong>2.36
+倍</strong>。 换言之：PEBS 采样单独看是
+−6%，但它为策略提供的信息把吞吐拉高了 +124%（相对 off）、 +136%（相对
+static），净效果远大于采样成本本身。</p>
+<p><img
+src="../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig1-throughput.png"
+alt="不限速吞吐" /></p>
+<hr />
+<h2 id="3-结论二不同采样频率对吞吐的影响">3.
+结论二：不同采样频率对吞吐的影响</h2>
+<p>这里要把“原始吞吐”和“策略收益”分开看，否则会得出误导性结论。</p>
+<h3 id="31-对原始吞吐几乎无影响无换页固定-qps">3.1
+对原始吞吐：几乎无影响（无换页、固定 QPS）</h3>
+<p>resident 阶段（无换页、QPS 固定
+30000）是“纯采样”场景，三档频率都能轻松打满 30000 QPS：</p>
+<table>
+<thead>
+<tr>
+<th>频率档</th>
+<th style="text-align: right;">samples/s</th>
+<th style="text-align: right;">QPS</th>
+<th style="text-align: right;">read p99 µs</th>
+<th style="text-align: right;">CPU µs/请求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>off</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">29,984</td>
+<td style="text-align: right;">23.30</td>
+<td style="text-align: right;">142.03</td>
+</tr>
+<tr>
+<td>low</td>
+<td style="text-align: right;">821</td>
+<td style="text-align: right;">29,955</td>
+<td style="text-align: right;">24.60</td>
+<td style="text-align: right;">143.07</td>
+</tr>
+<tr>
+<td>medium</td>
+<td style="text-align: right;">868</td>
+<td style="text-align: right;">29,966</td>
+<td style="text-align: right;">24.80</td>
+<td style="text-align: right;">142.79</td>
+</tr>
+<tr>
+<td>high</td>
+<td style="text-align: right;">1324</td>
+<td style="text-align: right;">29,996</td>
+<td style="text-align: right;">24.90</td>
+<td style="text-align: right;">143.18</td>
+</tr>
+</tbody>
+</table>
+<p>QPS 三档都锁在 ~30000（固定 QPS
+阶段本来就测不出吞吐差异）；频率差异只体现在
+CPU（+0.52%～+0.79%）和尾延迟（+6.0%～+7.3%，绝对增量 1.3–1.6
+µs），且幅度很小、
+基本平坦，<strong>不存在“采样频率越高吞吐越低”的单调关系</strong>。</p>
+<h3 id="32-对策略收益频率是决定性的换页固定-qps">3.2
+对策略收益：频率是决定性的（换页、固定 QPS）</h3>
+<p>真正被频率影响的，是策略能从样本里提取多少信息。pressure 阶段（固定
+30000 QPS + 换页） 中，策略相对 off 的净收益随频率档变化剧烈：</p>
+<table>
+<thead>
+<tr>
+<th>频率档</th>
+<th style="text-align: right;">samples/s</th>
+<th style="text-align: right;">CPU/请求 净变化</th>
+<th style="text-align: right;">RDMA 读流量 净变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>low</td>
+<td style="text-align: right;">~820</td>
+<td style="text-align: right;"><strong>−2.98%</strong></td>
+<td style="text-align: right;"><strong>−16.03%</strong></td>
+</tr>
+<tr>
+<td>medium</td>
+<td style="text-align: right;">~900</td>
+<td style="text-align: right;">−14.45%</td>
+<td style="text-align: right;">−84.39%</td>
+</tr>
+<tr>
+<td>high</td>
+<td style="text-align: right;">~1500</td>
+<td style="text-align: right;">−15.69%</td>
+<td style="text-align: right;">−90.90%</td>
+</tr>
+<tr>
+<td>adaptive</td>
+<td style="text-align: right;">~12800</td>
+<td style="text-align: right;">−15.71%</td>
+<td style="text-align: right;">−90.78%</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>low 档几乎失效</strong>：样本太稀疏，策略大量回退（unknown
+占比中位数 ~22%，而 medium/high 只有 ~0.017%/0.001%）， 只能减 16%
+的读流量、2% 的 CPU。</li>
+<li><strong>medium/high/adaptive
+三档收益饱和</strong>：一旦采样覆盖足够，RDMA 读流量削减稳定在
+−84%～−91%， CPU −14%～−16%。<code>adaptive</code>
+的实测采样率（~12800/s）是 <code>high</code>（~1500/s）的 8 倍多，
+但收益没有对应放大——<strong>说明收益不随采样率线性增长，达到覆盖阈值后即饱和</strong>。</li>
+</ul>
+<blockquote>
+<p>结论：选采样频率的判据不是“哪个开销更低”（三档开销都
+&lt;1%），而是“哪个能给策略足够覆盖”。 low
+不足以支撑策略；medium/high/adaptive 都能支撑。就本次负载，high
+在压力场景尾延迟最稳（read p99 612 µs）。</p>
+</blockquote>
+<p><img
+src="../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig3-frequency.png"
+alt="频率与策略收益" /></p>
+<hr />
+<h2 id="4-结论三pebs-纯采样开销">4. 结论三：PEBS 纯采样开销</h2>
+<p>“纯采样开销”= static vs off（同页档、同静态
+mask，唯一区别是采样开关）。</p>
+<h3 id="41-无换页resident固定-30000-qps">4.1 无换页（resident，固定
+30000 QPS）</h3>
+<table>
+<thead>
+<tr>
+<th>频率档</th>
+<th style="text-align: right;">CPU/请求 配对变化</th>
+<th style="text-align: right;">read p99 配对变化</th>
+<th style="text-align: right;">read p99 绝对增量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>low</td>
+<td style="text-align: right;">+0.73% [+0.66%, +0.78%]</td>
+<td style="text-align: right;">+5.98%</td>
+<td style="text-align: right;">23.3 → 24.6 µs</td>
+</tr>
+<tr>
+<td>medium</td>
+<td style="text-align: right;">+0.52% [+0.41%, +0.70%]</td>
+<td style="text-align: right;">+6.01%</td>
+<td style="text-align: right;">23.3 → 24.8 µs</td>
+</tr>
+<tr>
+<td>high</td>
+<td style="text-align: right;">+0.79% [+0.48%, +0.92%]</td>
+<td style="text-align: right;">+7.26%</td>
+<td style="text-align: right;">23.3 → 24.9 µs</td>
+</tr>
+</tbody>
+</table>
+<p>CPU 开销 <strong>0.5%–0.8%</strong>，尾延迟绝对增量 <strong>1.3–1.6
+µs</strong>。这是 PEBS 硬件采样 + ring 消费 + region
+维护的总成本，采样线程 CPU 只是其中一部分。</p>
+<p><img
+src="../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig2-overhead.png"
+alt="纯采样开销" /></p>
+<h3 id="42-换页压力pressure固定-30000-qps">4.2 换页压力（pressure，固定
+30000 QPS）</h3>
+<table>
+<thead>
+<tr>
+<th>纯采样配置</th>
+<th style="text-align: right;">CPU/请求 配对变化（vs off）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>static-low</td>
+<td style="text-align: right;">+0.03% [−8.04%, +0.52%]</td>
+</tr>
+<tr>
+<td>static-medium</td>
+<td style="text-align: right;">+4.26% [−3.03%, +6.69%]</td>
+</tr>
+<tr>
+<td>static-high</td>
+<td style="text-align: right;">+0.71% [−3.48%, +4.72%]</td>
+</tr>
+<tr>
+<td>static-adaptive</td>
+<td style="text-align: right;">+1.09% [+0.58%, +4.07%]</td>
+</tr>
+</tbody>
+</table>
+<p>此场景含回收与 RDMA 行为波动，数值散布大，不能全归因于硬件 PEBS
+指令成本。</p>
+<h3 id="43-饱和换页saturation不限速">4.3
+饱和换页（saturation，不限速）</h3>
+<table>
+<thead>
+<tr>
+<th>对照</th>
+<th style="text-align: right;">QPS 配对变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>static-medium vs off</td>
+<td style="text-align: right;"><strong>−6.20%</strong> [−20.07%,
++3.49%]</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论</strong>：不能把 PEBS 概括为“所有场景开销
+&lt;1%”——无换页时 CPU 开销确实 ~0.5–0.8%，
+但在饱和换页负载下，纯采样的吞吐损失约为 6%。</p>
+<hr />
+<h2 id="5-结论四优化策略带来的收益">5. 结论四：优化策略带来的收益</h2>
+<p>“优化策略”= policy（用 PEBS 样本动态选传输粒度），相对 static
+的收益才是策略本身的贡献。</p>
+<h3 id="51-不限速吞吐saturation">5.1 不限速吞吐（saturation）</h3>
+<table>
+<thead>
+<tr>
+<th>对照</th>
+<th style="text-align: right;">QPS 配对变化</th>
+<th style="text-align: right;">read p99 配对变化</th>
+<th style="text-align: right;">CPU/请求 配对变化</th>
+<th style="text-align: right;">RDMA read/请求 配对变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>policy-medium vs static-medium</td>
+<td style="text-align: right;"><strong>+136.11%</strong> [+118.7%,
++190.9%]</td>
+<td style="text-align: right;">−49.64%</td>
+<td style="text-align: right;">−59.40%</td>
+<td style="text-align: right;">−91.73%</td>
+</tr>
+<tr>
+<td>policy-medium vs off</td>
+<td style="text-align: right;"><strong>+123.76%</strong> [+117.4%,
++144.4%]</td>
+<td style="text-align: right;">−47.00%</td>
+<td style="text-align: right;">−58.24%</td>
+<td style="text-align: right;">−91.79%</td>
+</tr>
+<tr>
+<td>policy-medium vs off-original-mask</td>
+<td style="text-align: right;"><strong>+223.10%</strong> [+204.4%,
++250.3%]</td>
+<td style="text-align: right;">−58.36%</td>
+<td style="text-align: right;">−70.57%</td>
+<td style="text-align: right;">−92.58%</td>
+</tr>
+</tbody>
+</table>
+<p>策略让饱和吞吐从 ~59k（static）翻到 ~145k
+QPS：<strong>+136%</strong>。同时 read p99 减半、 单位请求 CPU 减
+~59%、RDMA 读流量减 ~92%。收益来自“按访问密度选对传输粒度”，
+而非仅仅切换开关——WR 分布真实改变（大 WR 读字节占比从 static 的 ~98%
+降到 policy 的 ~14%）。</p>
+<h3 id="52-固定-qps-压力pressure策略净收益vs-off">5.2 固定 QPS
+压力（pressure）：策略净收益（vs off）</h3>
+<table>
+<thead>
+<tr>
+<th>频率档</th>
+<th style="text-align: right;">CPU/请求 净变化</th>
+<th style="text-align: right;">RDMA 读流量 净变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>policy-low</td>
+<td style="text-align: right;">−2.98%</td>
+<td style="text-align: right;">−16.03%</td>
+</tr>
+<tr>
+<td>policy-medium</td>
+<td style="text-align: right;">−14.45%</td>
+<td style="text-align: right;">−84.39%</td>
+</tr>
+<tr>
+<td><strong>policy-high</strong></td>
+<td style="text-align: right;"><strong>−15.69%</strong></td>
+<td style="text-align: right;"><strong>−90.90%</strong></td>
+</tr>
+<tr>
+<td>policy-adaptive</td>
+<td style="text-align: right;">−15.71%</td>
+<td style="text-align: right;">−90.78%</td>
+</tr>
+</tbody>
+</table>
+<p>在固定 30000 QPS 下，策略通过削减读流量换来净成本收益：CPU/请求
+−14%～−16%、 RDMA 读流量 −84%～−91%（medium/high/adaptive）。相对同频
+static 的收益更大（CPU −17.8%、RDMA −91.5%）。</p>
+<p><strong>一个需要保留的 caveat</strong>：medium
+的不限速吞吐最高，但其压力场景尾延迟波动大 （read p99 4383 µs，范围
+479–40046 µs）；high 的尾延迟更稳（612 µs，范围 604–1805 µs）。 medium
+的 +136% 吞吐不能直接套用到 high 的配置上，high 的饱和吞吐本次未测。</p>
+<hr />
+<h2 id="6-局限诚实边界">6. 局限（诚实边界）</h2>
+<ul>
+<li>单机（dnet-61）、单一 Memcached 工作集（800k × 1 KiB）、每配置 5
+次重复；min–max 不是置信区间， 不能据此声明统计显著或普遍适用。</li>
+<li>压力场景用 <code>memory.high=640 MiB</code>（软压力），与此前 70%
+<code>memory.max</code> 硬限额基线不可跨实验归因。</li>
+<li>压力日志出现 9 次 <code>perf: interrupt took too long</code>，内核把
+<code>kernel.perf_event_max_sample_rate</code> 从 24000 自动下调到
+2750；各轮可能受此历史状态影响，未关闭 perf 保护机制。</li>
+<li>采样周期是事件数阈值不是 Hz；实测 samples/s
+是观测量（受策略改变后的访存行为影响），
+不能当独立控制变量反推因果。</li>
+<li>采样频率与吞吐：resident 阶段 QPS
+被固定，测不出频率对最大吞吐的影响；saturation 只测了 medium 单点，
+没有“频率–吞吐”曲线。</li>
+</ul>
+<h2 id="7-数据与复现">7. 数据与复现</h2>
+<ul>
+<li>完整数据与配对统计：<a
+href="../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md">SUMMARY.md</a></li>
+<li>原始
+CSV：<code>pressure/resident/saturation/summary.csv</code>（同目录下）</li>
+<li>采样频率快照：<a
+href="../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-frequencies.csv">sampling-frequencies.csv</a></li>
+<li>本文图表脚本：<a
+href="../../tools/rdma/pebs/plot_pebs_clean.py">tools/rdma/pebs/plot_pebs_clean.py</a></li>
+<li>完整原始记录（含全部 caveat 与验收细节）：<a
+href="pebs-performance-20261006.md">pebs-performance-20261006.md</a></li>
+</ul>
+</body>
+</html>

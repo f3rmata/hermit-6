@@ -15,7 +15,7 @@ x x x 因此，大页收益不是由页大小本身决定，而是取决于**访
 
 <!-- ## 222111-redis
 
-![222111](../tools/rdma/results/dnet-61/20260829-222111-redis-swapio/redis-swapio-summary.png)
+![222111](../../tools/rdma/results/dnet-61/20260829-222111-redis-swapio/redis-swapio-summary.png)
 
 要点：
 
@@ -32,7 +32,7 @@ x x x 因此，大页收益不是由页大小本身决定，而是取决于**访
 
 配置与之前数组扫描一致：16 GiB workset、70% 本地内存、`parallel-fault` swapout、`ACCESS_RATIOS="100 chunk64k"`、sequential + high locality，每档 3 次取中位数。
 
-![Anon chunk64k 单线程 vs 8 线程](../tools/rdma/results/dnet-61/anon-threads-compare.png)
+![Anon chunk64k 单线程 vs 8 线程](../../tools/rdma/results/dnet-61/anon-threads-compare.png)
 
 100% 全扫有效带宽在 8 线程下从 4 KiB 的 11.70 GiB/s 增至 2 MiB 的 34.20 GiB/s；
 单线程从 2.02 GiB/s 增至 18.59 GiB/s。关键结论：
@@ -46,25 +46,13 @@ x x x 因此，大页收益不是由页大小本身决定，而是取决于**访
 
 1 MiB value + 64 KiB chunk、1 instance、顺序 GET 全部 key，每档 3 次。
 
-![211403](../tools/rdma/results/dnet-61/20260829-211403-redis-swapio/redis-swapio-summary.png)
+![211403](../../tools/rdma/results/dnet-61/20260829-211403-redis-swapio/redis-swapio-summary.png)
 
 ## 2026-08-30：Redis 2 MiB value + 64 KiB chunk
 
 配置为 2 MiB value、BENCH 阶段每个 value只 `GETRANGE` 前 64 KiB、顺序访问全部 key、1 个 Redis 实例、每档 5 次取中位数；redis cgroup `memory.max` 为 70%。
 
-![Redis 2 MiB value + 64 KiB chunk](../tools/rdma/results/dnet-61/20260831-001724-redis-swapio/redis-swapio-summary.png)
-
-<!-- |  页大小 | GET/s | useful GiB/s | backend loads/GET | large*store*% | large*load*% | read_amp |
-| ------: | ----: | -----------: | ----------------: | ------------: | -----------: | -------: |
-|   4 KiB |  7963 |       0.4860 |              7.81 |            0% |           0% |     0.96 |
-|  16 KiB | 10056 |       0.6138 |              2.26 |          100% |         100% |     1.11 |
-|  32 KiB | 10442 |       0.6373 |              1.36 |          100% |         100% |     1.36 |
-|  64 KiB | 10726 |       0.6547 |              0.91 |          100% |         100% |     1.82 |
-| 128 KiB | 11065 |       0.6753 |              0.46 |          100% |         100% |     1.80 |
-| 256 KiB | 10004 |       0.6106 |              0.45 |          100% |         100% |     3.44 |
-| 512 KiB |  8444 |       0.5154 |              0.45 |          100% |         100% |     6.39 |
-|   1 MiB |  6290 |       0.3839 |              0.47 |          100% |         100% |    12.76 |
-|   2 MiB |  8044 |       0.4910 |              7.73 |            0% |           0% |     0.95 | -->
+![Redis 2 MiB value + 64 KiB chunk](../../tools/rdma/results/dnet-61/20260831-001724-redis-swapio/redis-swapio-summary.png)
 
 结论：
 
@@ -131,30 +119,30 @@ Hermit 的 `remote_order_mask`（目标 RDMA 传输 order）。因此，当前�
 
 ### 2026-07-30：早期 Hermit 完整 sweep
 
-![2026-07-30 Hermit 实测吞吐与 p99](../tools/rdma/results/dnet-61/20260730-184935-hermit-6.18-page-sweep/measured-throughput-by-page.png)
+![2026-07-30 Hermit 实测吞吐与 p99](../../tools/rdma/results/dnet-61/20260730-184935-hermit-6.18-page-sweep/measured-throughput-by-page.png)
 
 该轮 Hermit 峰值约为 659–688 KQPS，但 debugfs 中只有 order 0 的传输计数；
 原因是普通 swapfile 无法分配高阶 swap entry，大 folio 在进入 RDMA backend 前已拆分为 4 KiB。
 
 ### 2026-08-03：Hermit 完整 sweep
 
-![2026-08-03 Hermit stable 与 mixed 峰值](../tools/rdma/results/dnet-61/20260803-231615-hermit-6.18-page-sweep/cgroup-hermit-throughput-by-page-measured.png)
+![2026-08-03 Hermit stable 与 mixed 峰值](../../tools/rdma/results/dnet-61/20260803-231615-hermit-6.18-page-sweep/cgroup-hermit-throughput-by-page-measured.png)
 
 4 KiB–1 MiB 的负载点均为 `stable`；2 MiB 在 750 KQPS 以上达到约 705 KQPS，
 但稳定等待状态为 `mixed`。
 
 ### 2026-08-04：2 MiB 单独复测
 
-![2026-08-04 2 MiB 复测叠加](../tools/rdma/results/dnet-61/20260804-195156-hermit-6.18-page-sweep/cgroup-hermit-throughput-by-page-measured-with-rerun.png)
+![2026-08-04 2 MiB 复测叠加](../../tools/rdma/results/dnet-61/20260804-195156-hermit-6.18-page-sweep/cgroup-hermit-throughput-by-page-measured-with-rerun.png)
 
 2 MiB 复测峰值由约 705.3 KQPS 提高到 713.3 KQPS，峰值 p99 从约 4.58 ms
 降低到 4.51 ms；高负载仍为 `mixed`
 
 ## 2026-08-08：修复前基线
 
-![2026-08-08 完整页大小吞吐对比](../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/latest-mode-throughput-comparison.png)
+![2026-08-08 完整页大小吞吐对比](../../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/latest-mode-throughput-comparison.png)
 
-![2026-08-08 在 500 KQPS 下的 read p99 对比](../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/latest-read-p99-comparison-500k.png)
+![2026-08-08 在 500 KQPS 下的 read p99 对比](../../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/latest-read-p99-comparison-500k.png)
 
 该轮在相同的 500 KQPS offered load 下，local 的 read p99 约为 59 µs，
 cgroup-Hermit 约为 1.7–2.1 ms，而严重换页抖动的 cgroup-local 达到约 0.22–0.65 s。
@@ -176,20 +164,20 @@ Memcached 0–7 核、Mutilate 8–15 核、每档负载重复 3 次取中位数
 |   1 MiB |              943.1 |                       6.8 |                      670.1 |
 |   2 MiB |              938.5 |                       5.7 |                      679.2 |
 
-![swap-in 修复后不同页大小的峰值吞吐](assets/dnet61-memcached-page-sweep-20260812/memcached-peak-throughput.png)
+![swap-in 修复后不同页大小的峰值吞吐](../assets/dnet61-memcached-page-sweep-20260812/memcached-peak-throughput.png)
 
 local 峰值稳定在 937.5–945.5 KQPS；cgroup-local 只有 4.1–6.9 KQPS，处于严重 thrashing。
 cgroup-Hermit 为 186.3–685.4 KQPS，并呈明显 U 形：64–256 KiB 实际大量换入高阶 folio，随机小对象只消费其中少数子页，导致 swap-in 读放大；同时 swap-out 若按完整 folio 传输也会产生写放大。1–2 MiB 组则主要退化为 4 KiB load，因此其高吞吐不能当作 1–2 MiB 协议收益。
 
 > 目前Linux内核还没有为2MiB的大页做swapin的单独路径优化，所以测试时所有2MiB的大页都会被拆分成4KiB的小页，导致退化
 
-![500 KQPS offered load 下的 read p99](assets/dnet61-memcached-page-sweep-20260812/memcached-read-p99-500k.png)
+![500 KQPS offered load 下的 read p99](../assets/dnet61-memcached-page-sweep-20260812/memcached-read-p99-500k.png)
 
-![memcached 实际高阶 RDMA load 字节占比](assets/dnet61-memcached-page-sweep-20260812/memcached-high-order-load-share.png)
+![memcached 实际高阶 RDMA load 字节占比](../assets/dnet61-memcached-page-sweep-20260812/memcached-high-order-load-share.png)
 
 逐 order 前后快照表明，16–256 KiB 的目标 order load 字节占比为84.2%–98.1%；512 KiB 降至 20.4%，1 MiB 仅 0.15%，2 MiB 为 0%。因此本轮memcached在随机访问模式没有表现出协议性能收益；更适合用顺序或空间局部性更强的匿名内存 workload 衡量大 WR 收益。
 
-<!-- ![专项 mTHP swap-in 修复前后对比](assets/dnet61-memcached-page-sweep-20260812/mthp-swapin-before-after.png)
+<!-- ![专项 mTHP swap-in 修复前后对比](../assets/dnet61-memcached-page-sweep-20260812/mthp-swapin-before-after.png)
 
 专项测试顺序换入固定 512 MiB 匿名区域。修复前所有配置均退化成 131072 次4 KiB load；修复后 16 KiB–1 MiB 均完全使用目标 order，耗时由约0.69–0.74 s 降至 0.091–0.296 s，提升 2.47–7.68 倍。 -->
 
@@ -198,7 +186,7 @@ cgroup-Hermit 为 186.3–685.4 KQPS，并呈明显 U 形：64–256 KiB 实际�
 用mmap分配匿名内存，再按指定mTHP大小分配并顺序写入内存。
 再把专用 cgroup 的 `memory.max` 从 `max` 降至 11468 MiB，每轮通过 RDMA 换出约5 GiB；换出稳定后将上限恢复为 `max`，顺序扫描完整映射触发 swap-in，记录时间和吞吐数据。
 
-![顺序匿名内存大页 RDMA swap-out 和 swap-in](assets/dnet61-anon-swapio-20260813/anon-swapio-throughput-by-page.png)
+![顺序匿名内存大页 RDMA swap-out 和 swap-in](../assets/dnet61-anon-swapio-20260813/anon-swapio-throughput-by-page.png)
 
 表中采用 3 次测试的中位数。swap-in 吞吐以实际远端读回字节为分子，以顺序扫描完整 16 GiB 映射的时间为分母：
 
@@ -241,7 +229,7 @@ swap-in 吞吐从 4 KiB 的 0.626 GiB/s 增至 1 MiB 的2.635 GiB/s。完整 16 
 
 XGBoost hist 训练也主要对 dense DMatrix 做块状、顺序或高局部性访问。因此它与内存扫描的结果更接近。
 
-![XGBoost 大页 RDMA swap 测试](../tools/rdma/results/dnet-61/20260817-175412-xgboost-swapio/xgboost-swapio.png)
+![XGBoost 大页 RDMA swap 测试](../../tools/rdma/results/dnet-61/20260817-175412-xgboost-swapio/xgboost-swapio.png)
 
 |  页大小 | order | swap-out 协议 GiB/s | 大页 store 字节占比 | store 请求数 | 大页 load 字节占比 | load 请求数 | train 秒 |
 | ------: | ----: | ------------------: | ------------------: | -----------: | -----------------: | ----------: | -------: |
@@ -324,7 +312,7 @@ Memcached的测试时吞吐随页面大小提升而下降
 - random + high locality
 - random + low locality
 
-![Sparse/Random 匿名内存传输收益与读放大](assets/dnet61-anon-sparse-20260820/anon-sparse-benefit-summary.png)
+![Sparse/Random 匿名内存传输收益与读放大](../assets/dnet61-anon-sparse-20260820/anon-sparse-benefit-summary.png)
 
 ### 结果分析
 
@@ -379,7 +367,7 @@ Memcached的测试时吞吐随页面大小提升而下降
 配置同 08-20 sparse 测试：16 GiB workset、`memory.max` 11468 MiB、`parallel-fault`、
 `ACCESS_RATIOS="100 50 25 6.25 1p"` × sequential/random × high/low locality，每组合 5 次取中位数（每轮 900 行）。
 
-![Anon sparse 8 vs 16 线程](../tools/rdma/results/dnet-61/20260827-163500-anon-sparse-swapio/anon-swapio-complete-8-vs-16-threads.png)
+![Anon sparse 8 vs 16 线程](../../tools/rdma/results/dnet-61/20260827-163500-anon-sparse-swapio/anon-swapio-complete-8-vs-16-threads.png)
 
 100% 全扫有效带宽（应用可见 GiB/s，中位数）：
 
@@ -405,7 +393,7 @@ Memcached的测试时吞吐随页面大小提升而下降
 
 8 线程（CPU 16-23）、`parallel-fault`、`ACCESS_RATIOS="100 chunk64k"`、sequential + high locality，每档 3 次取中位数。
 
-![chunk64k 倒 U 曲线](../tools/rdma/results/dnet-61/20260827-201718-anon-sparse-swapio/chunk64k-inverted-u.png)
+![chunk64k 倒 U 曲线](../../tools/rdma/results/dnet-61/20260827-201718-anon-sparse-swapio/chunk64k-inverted-u.png)
 
 要点：
 
@@ -418,7 +406,7 @@ Memcached的测试时吞吐随页面大小提升而下降
 两次配置相同：16 KiB value、随机 key、8 instances × 8 clients（每实例 1 client）、16 GiB workset。
 08-27 为 `20260827-175448-redis-swapio`，08-29 复测为 `20260829-223923-redis-swapio`。
 
-![Redis 16 KiB 随机 GET](../tools/rdma/results/dnet-61/20260829-223923-redis-swapio/redis-swapio-summary.png)
+![Redis 16 KiB 随机 GET](../../tools/rdma/results/dnet-61/20260829-223923-redis-swapio/redis-swapio-summary.png)
 
 |  页大小 | 08-27 GET/s | 08-29 GET/s | 08-29 large_load% |
 | ------: | ----------: | ----------: | ----------------: |
@@ -439,20 +427,20 @@ Memcached的测试时吞吐随页面大小提升而下降
 
 原始汇总数据：
 
-- [2026-07-27 Native](../tools/rdma/results/dnet-61/20260727-235121-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
-- [2026-07-30 Hermit](../tools/rdma/results/dnet-61/20260730-184935-hermit-6.18-page-sweep/page-sweep-summary.csv)
-- [2026-08-03 Hermit](../tools/rdma/results/dnet-61/20260803-231615-hermit-6.18-page-sweep/page-sweep-summary.csv)
-- [2026-08-04 2 MiB Hermit 复测](../tools/rdma/results/dnet-61/20260804-195156-hermit-6.18-page-sweep/page-sweep-summary.csv)
-- [Native page-sweep-summary.csv](../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
-- [Hermit page-sweep-summary.csv](../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/hermit/page-sweep-summary.csv)
-- [2026-08-09 Native](../tools/rdma/results/dnet-61/20260809-114645-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
-- [2026-08-27 Anon sparse 8T](../tools/rdma/results/dnet-61/20260827-163500-anon-sparse-swapio/swapio-summary.csv)
-- [2026-08-27 Anon sparse 16T](../tools/rdma/results/dnet-61/20260827-000430-anon-sparse-swapio/swapio-summary.csv)
-- [2026-08-27 Anon chunk64k 8T](../tools/rdma/results/dnet-61/20260827-201718-anon-sparse-swapio/swapio-summary.csv)
-- [2026-08-27 Redis 16 KiB 随机](../tools/rdma/results/dnet-61/20260827-175448-redis-swapio/redis-swapio-summary.csv)
-- [2026-08-29 Redis 1 MiB value + 64 KiB chunk](../tools/rdma/results/dnet-61/20260829-211403-redis-swapio/redis-swapio-summary.csv)
-- [2026-08-29 Redis 2 MiB value + 64 KiB chunk 初测](../tools/rdma/results/dnet-61/20260829-222111-redis-swapio/redis-swapio-summary.csv)
-- [2026-08-29 Redis 16 KiB 随机复测](../tools/rdma/results/dnet-61/20260829-223923-redis-swapio/redis-swapio-summary.csv)
-- [2026-08-31 Redis 2 MiB value + 64 KiB chunk](../tools/rdma/results/dnet-61/20260831-001724-redis-swapio/redis-swapio-summary.csv)
-- [2026-08-31 Anon chunk64k 1T](../tools/rdma/results/dnet-61/20260831-141039-anon-sparse-swapio/swapio-summary.csv)
-- [2026-08-31 Anon chunk64k 8T](../tools/rdma/results/dnet-61/20260831-142313-anon-sparse-swapio/swapio-summary.csv)
+- [2026-07-27 Native](../../tools/rdma/results/dnet-61/20260727-235121-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
+- [2026-07-30 Hermit](../../tools/rdma/results/dnet-61/20260730-184935-hermit-6.18-page-sweep/page-sweep-summary.csv)
+- [2026-08-03 Hermit](../../tools/rdma/results/dnet-61/20260803-231615-hermit-6.18-page-sweep/page-sweep-summary.csv)
+- [2026-08-04 2 MiB Hermit 复测](../../tools/rdma/results/dnet-61/20260804-195156-hermit-6.18-page-sweep/page-sweep-summary.csv)
+- [Native page-sweep-summary.csv](../../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
+- [Hermit page-sweep-summary.csv](../../tools/rdma/results/dnet-61/20260808-140944-hermit-6.18-native-hermit/hermit/page-sweep-summary.csv)
+- [2026-08-09 Native](../../tools/rdma/results/dnet-61/20260809-114645-hermit-6.18-native-hermit/native/page-sweep-summary.csv)
+- [2026-08-27 Anon sparse 8T](../../tools/rdma/results/dnet-61/20260827-163500-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-27 Anon sparse 16T](../../tools/rdma/results/dnet-61/20260827-000430-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-27 Anon chunk64k 8T](../../tools/rdma/results/dnet-61/20260827-201718-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-27 Redis 16 KiB 随机](../../tools/rdma/results/dnet-61/20260827-175448-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-29 Redis 1 MiB value + 64 KiB chunk](../../tools/rdma/results/dnet-61/20260829-211403-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-29 Redis 2 MiB value + 64 KiB chunk 初测](../../tools/rdma/results/dnet-61/20260829-222111-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-29 Redis 16 KiB 随机复测](../../tools/rdma/results/dnet-61/20260829-223923-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-31 Redis 2 MiB value + 64 KiB chunk](../../tools/rdma/results/dnet-61/20260831-001724-redis-swapio/redis-swapio-summary.csv)
+- [2026-08-31 Anon chunk64k 1T](../../tools/rdma/results/dnet-61/20260831-141039-anon-sparse-swapio/swapio-summary.csv)
+- [2026-08-31 Anon chunk64k 8T](../../tools/rdma/results/dnet-61/20260831-142313-anon-sparse-swapio/swapio-summary.csv)

@@ -82,8 +82,8 @@ aria2c -x 16 -s 16 -k 4M --file-allocation=none \
   --dir="$PWD/data" --out=HIGGS.zip \
   'https://www.kaggle.com/api/v1/datasets/download/arpit1bansal/higgs-dataset'
 
-unzip data/HIGGS.zip -d data
-# -> data/HIGGS.csv/HIGGS.csv（约 7.5 GiB，第一列为 label）
+unzip tools/rdma/data/HIGGS.zip -d tools/rdma/data
+# -> tools/rdma/data/HIGGS.csv/HIGGS.csv（约 7.5 GiB，第一列为 label）
 ```
 
 运行 sweep 时把 `XGB_DATA_FILE` 指向解压后的 CSV 即可，worker 会自动

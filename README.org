@@ -24,9 +24,9 @@ Linux 源码树内的 RDMA core。
 - PEBS 页面大小策略（=mm/hermit_pebs.c=）：Intel PEBS 采样 + 2 MiB region
   热度表 + 代价模型，在 swap-out/swap-in 路径按访问局部性自动选择传输
   folio 粒度（syscall 473/474、=memory.hermit_pebs=、debugfs =pebs_*=）。
-  详见 =docs/pebs-order-policy.md=。
+  详见 =docs/pebs/pebs-order-policy.md=。
 
-详细迁移记录见 =docs/migration-6.18.md=。=docs/assets/plan/= 下的 6.6 文档作为历史
+详细迁移记录见 =docs/migration-6.18.md=。=docs/archive/plan/= 下的 6.6 文档作为历史
 记录保留。
 
 * 目录
@@ -36,11 +36,17 @@ linux-stable/              Linux v6.18.38 + Hermit
 remoteswap/client/         DRAM/RDMA Hermit backend
 remoteswap/server/         RDMA memory server
 tools/qemu-dram/           本地 DRAM backend 构建与 QEMU 回归
+tools/rdma/                RDMA 基准、PEBS、绘图与宿主机回归
+tools/rdma/data/           输入数据集
+tools/rdma/results/        实测结果、构建日志与归档
+docs/README.md            分类文档索引
 docs/migration-6.18.md     6.18 迁移说明和验证矩阵
 #+end_example
 
 dnet-58 作为 memory server、dnet-61 同机运行 Hermit、memcached 与
-mutilate 的部署和测试步骤见 =docs/dnet58-dnet61-memcached-rdma.md=。
+mutilate 的部署和测试步骤见 =docs/rdma/dnet58-dnet61-memcached-rdma.md=。
+
+测试程序导航见 [[file:tools/rdma/README.md][RDMA 测试工具]]，原始数据见 [[file:tools/rdma/results/README.md][结果索引]]，文档导航见 [[file:docs/README.md][项目文档]]。
 
 * 构建内核
 

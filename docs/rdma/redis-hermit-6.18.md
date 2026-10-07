@@ -109,7 +109,7 @@ LOCAL_RATIO_PCT=50 BENCH_REPEATS=5 \
 
 ```bash
 RESULT_DIR=tools/rdma/results/<run-id>
-python3 tools/rdma/plot_redis_swapio.py \
+python3 tools/rdma/plots/plot_redis_swapio.py \
   "$RESULT_DIR/redis-swapio-summary.csv" \
   --output "$RESULT_DIR/redis-sparse-swapio-by-page.png"
 ```
