@@ -7,6 +7,10 @@
 
 ## PEBS 设计与实测
 
+- [PEBS 多负载采样开销与策略评估 2026-10-08](pebs/pebs-workloads-20261008.md)
+
+- [数组、Redis、YCSB、XGBoost 采样率矩阵运行说明](pebs/pebs-workload-matrix.md)
+
 - [Intel PEBS：原理、采集数据与用法](pebs/pebs-analysis.md)
 - [PEBS 页面大小策略：内核修改与 QEMU 测试总结](pebs/pebs-implementation-summary.md)
 - [Hermit PEBS 页面大小策略（pebs-order-policy）](pebs/pebs-order-policy.md)
@@ -23,21 +27,6 @@
 - [Redis 大 value 大页 RDMA 交换测试](rdma/redis-hermit-6.18.md)
 - [XGBoost 大页 RDMA 交换测试](rdma/xgboost-hermit-6.18.md)
 
-## 内核构建与安装记录
-
-- [dnet-61 PEBS 内核构建（2026-09-25）](builds/kernel-build-dnet61-20260925.md)
-- [dnet-61 RDMA 修复与 PEBS 内核安装（2026-10-06）](builds/rdma-pebs-install-20261006.md)
-
-## 修复与回归验证
-
-- [Hermit 修复与验证（2026-09-24）](validation/fix-validation-20260924.md)
-
-## 论文与相关工具
-
-- [Blowfish 论文分析](research/blowfish-paper-analysis.md)
-- [MEMTIS 算法分析：基于 PEBS 的动态页面分类与页面大小判定](research/memtis-algorithm-analysis.md)
-- [Numamma](research/numamma.md)
-
 ## 历史迁移资料
 
 [历史资料使用说明](archive/README.md)
@@ -50,5 +39,3 @@
 - [Hermit Linux 6.6 第五阶段适配说明：5.14 profiling 点迁移](archive/plan/stage5-adaptation-6.6-profiling.md)
 - [Hermit Linux 6.6 第六阶段适配说明：vaddr/vpage directed reclaim](archive/plan/stage6-adaptation-6.6-vaddr-vpage.md)
 - [Hermit Linux 6.6 第七阶段适配说明：RDMA backend 迁移](archive/plan/stage7-adaptation-6.6-rdma.md)
-
-`assets/` 保存报告配图；`.previews/` 保存生成的 HTML 预览并由 Git 忽略。`archive/plan/` 为旧版本适配方案，当前实现以迁移说明、源码和对应日期的验证记录为准。

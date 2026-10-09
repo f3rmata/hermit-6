@@ -4,7 +4,7 @@
 Answers four questions with one figure each:
   fig1  PEBS on vs off, and policy gain  -> saturation throughput (QPS)
   fig2  pure sampling overhead           -> resident phase CPU & tail latency
-  fig3  sampling frequency effect        -> policy benefit vs frequency (pressure)
+  fig3  sampling frequency effect        -> RDMA read traffic vs samples/s (pressure)
 """
 import matplotlib
 matplotlib.use("Agg")
@@ -21,18 +21,21 @@ OUT = os.path.join(OUT, "..", "results", "pebs", "20261006", "pebs-campaign-2026
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--output-dir", default=os.path.abspath(OUT))
 OUT = os.path.abspath(parser.parse_args().output_dir)
-os.makedirs(OUT, exist_ok=True)
+try:
+    os.makedirs(OUT, exist_ok=True)
+except OSError as e:
+    raise SystemExit(f"无法创建输出目录 {OUT}: {e}") from e
 
 # ---- shared colors ----
-C_OFF0 = "#8a8a8a"   # off-original-mask (4KiB static)
-C_OFF  = "#5b9bd5"   # off (full order mask)
-C_STATIC = "#ed7d31" # PEBS on, static mask
+C_OFF0 = "#8a8a8a"   # off-original-mask（只允许 4 KiB）
+C_OFF  = "#5b9bd5"   # off（允许全部页档）
+C_STATIC = "#ed7d31" # PEBS on, 静态页档
 C_POLICY = "#2e9e5b" # PEBS on, policy
 
 # =====================================================================
 # fig1 — saturation throughput (unlimited QPS)
 # =====================================================================
-cases = ["off-original\n(4KiB 静态掩码)", "off\n(全 order 掩码)",
+cases = ["off-original\n(只允许 4 KiB)", "off\n(允许全部页档)",
          "static-medium\n(PEBS 开·静态)", "policy-medium\n(PEBS 开·策略)"]
 qps   = [44492, 63424, 59489, 145338]
 lo    = [42009, 60228, 52372, 137874]
@@ -96,30 +99,42 @@ fig.savefig(os.path.join(OUT, "fig2-overhead.png"), bbox_inches="tight")
 plt.close(fig)
 
 # =====================================================================
-# fig3 — policy benefit vs sampling frequency (pressure, fixed 30k QPS)
+# fig3 — RDMA read traffic vs sampling rate (pressure, fixed 30k QPS)
 # =====================================================================
-freq = ["low\n~820/s", "medium\n~900/s", "high\n~1500/s", "adaptive\n~12800/s"]
-rdma = [-16.03, -84.39, -90.90, -90.78]
-cpu_red = [-2.98, -14.45, -15.69, -15.71]
+# medians from pressure/summary.csv: (samples/s, rdma_read_KiB/op)
+static = [(825.9, 48.27), (953.9, 55.94), (2166.4, 54.35), (13135.2, 50.89)]
+policy = [(815.3, 42.01), (892.1, 7.93), (1485.2, 4.64), (12795.3, 4.66)]
+tiers  = ["low", "medium", "high", "adaptive"]
 
-import numpy as np
-x = np.arange(len(freq))
-w = 0.38
-fig, ax = plt.subplots(figsize=(7.6, 4.4), dpi=110)
-b1 = ax.bar(x - w/2, rdma, w, label="RDMA 读流量 /请求（vs off）",
-            color="#c0504d", edgecolor="black", linewidth=0.5)
-b2 = ax.bar(x + w/2, cpu_red, w, label="整机忙碌 CPU /请求（vs off）",
-            color="#4f81bd", edgecolor="black", linewidth=0.5)
-for b in list(b1) + list(b2):
-    ax.text(b.get_x() + b.get_width()/2, b.get_height() - 3,
-            f"{b.get_height():.0f}%", ha="center", va="top", fontsize=8, color="white")
-ax.axhline(0, color="black", linewidth=0.8)
-ax.set_xticks(x, freq, fontsize=9)
-ax.set_ylabel("相对 off 的变化（%，负值=更好）", fontsize=10)
-ax.set_title("采样频率决定策略收益：低频样本不足，策略几乎失效", fontsize=12)
-ax.legend(fontsize=9, loc="lower left")
-ax.set_ylim(-100, 5)
-ax.grid(axis="y", alpha=0.25)
+fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=110)
+
+# 不采样基线（samples/s=0 画在 log 轴上无意义，用水平虚线表示）
+ax.axhline(56.26, color=C_OFF0, linestyle=":", linewidth=1.4, alpha=0.9)
+ax.axhline(50.90, color=C_OFF, linestyle="--", linewidth=1.4, alpha=0.9)
+
+sx = [p[0] for p in static]; sy = [p[1] for p in static]
+px = [p[0] for p in policy]; py = [p[1] for p in policy]
+
+ax.plot(sx, sy, "-o", color=C_STATIC, linewidth=1.6, markersize=6,
+        label="static（PEBS 开 · 静态页档）", zorder=3)
+ax.plot(px, py, "-o", color=C_POLICY, linewidth=2.2, markersize=7,
+        label="policy（PEBS 开 · 策略）", zorder=4)
+
+for x, y, t in zip(px, py, tiers):
+    ax.annotate(t, (x, y), textcoords="offset points", xytext=(11, 9),
+                fontsize=9, color="#1c5e36", fontweight="bold")
+
+ax.text(1500, 51.6, "off（不采样 · 允许全部页档）", color="#2a5ca8", fontsize=8, va="bottom")
+ax.text(1500, 57.0, "off-original-mask（只允许 4 KiB）", color="#555555", fontsize=8, va="bottom")
+
+ax.set_xscale("log")
+ax.set_xlabel("实际采样率 samples/s（对数刻度）", fontsize=10)
+ax.set_ylabel("RDMA 读流量（KiB/请求）", fontsize=10)
+ax.set_title("采样率与 RDMA 读流量（pressure，固定 30000 QPS）", fontsize=12)
+ax.set_xlim(600, 30000)
+ax.set_ylim(0, 62)
+ax.grid(which="both", alpha=0.22)
+ax.legend(fontsize=9, loc="upper right")
 fig.tight_layout()
 fig.savefig(os.path.join(OUT, "fig3-frequency.png"), bbox_inches="tight")
 plt.close(fig)

@@ -26,7 +26,7 @@ def capture(folder, cg, pid):
         (folder/f).write_text(read(D/f))
     for f in ['memory.current','memory.high','memory.max','memory.swap.current','memory.events','memory.stat']:
         (folder/f).write_text(read(cg/f))
-    for f in ['stat','status']:
+    for f in ['stat','status','smaps_rollup']:
         (folder/('server-'+f)).write_text(read(f'/proc/{pid}/{f}'))
     (folder/'system-stat').write_text(read('/proc/stat'))
     wr=Path('/sys/module/rswap_client/parameters/wr_stats')
@@ -51,6 +51,21 @@ def latency(log):
         result[kind]=float(re.search(pattern,log)[1])
     return result
 
+def case_thp_settings(label, thp_mode, page_kb, original):
+    """off is base pages even in preserve mode; other cases get their own THP state."""
+    if label != 'off' and thp_mode == 'preserve':
+        return dict(original)
+    page_kb = 4 if label == 'off' else page_kb
+    settings = {}
+    for path in original:
+        p = Path(path)
+        if p.parent.name == 'transparent_hugepage':
+            settings[path] = 'always' if page_kb == 2048 else 'never'
+        else:
+            settings[path] = 'always' if page_kb > 4 and p.parent.name == f'hugepages-{page_kb}kB' else 'never'
+    return settings
+
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--user',required=True);ap.add_argument('--output',type=Path,required=True)
@@ -61,7 +76,7 @@ def main():
     ap.add_argument('--memory-mb',type=int,default=640)
     ap.add_argument('--records',type=int,default=800000)
     ap.add_argument('--page-kb',type=int,choices=[4,16,32,64,128,256,512,1024,2048],default=64)
-    ap.add_argument('--cases',default='',help='Comma separated subset; empty runs all cases')
+    ap.add_argument('--cases',default='',help='Comma separated subset; off disables all THP and PEBS; empty runs all cases')
     ap.add_argument('--diagnostic',action='store_true',help='Allow zero samples but explicitly mark sampling ineffective')
     args=ap.parse_args()
     if os.geteuid()!=0: ap.error('sudo is needed for cgroup and PEBS syscalls')
@@ -115,6 +130,8 @@ def main():
         if set(selected)-{c[0] for c in cases}: ap.error('unknown case')
         cases=[c for c in cases if c[0] in selected]
     manifest['cases']=cases
+    manifest['off_baseline']='base-pages-4k-v2'
+    manifest['off_description']='All THP/mTHP disabled, remote_order_mask=0x1, PEBS disabled; differs from historical off'
     manifest['reclaim']={'mode':1,'headroom_pages':16384,'workers':4}
     manifest['binaries_sha256']={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [home/'memcached/memcached',home/'mutilate/mutilate']}
     (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
@@ -134,18 +151,19 @@ def main():
     try:
         for key,value in {'bypass_swapcache':'Y','speculative_io':'Y','lazy_poll':'N','apt_reclaim':'Y'}.items():write(D/key,value)
         write(D/'reclaim_mode',1);write(D/'reclaim_headroom_pages',16384);write(D/'sthd_cnt',4)
-        if args.thp=='always':
-            write(thp_control,'always' if args.page_kb==2048 else 'never')
-            for p in thp_control.parent.glob('hugepages-*kB/enabled'):
-                write(p,'always' if p.parent.name==f'hugepages-{args.page_kb}kB' else 'never')
         for repeat in range(1,args.repeats+1):
             order=cases.copy();random.Random(20261006+repeat).shuffle(order)
             for label,mode,period in order:
+                # Apply before creating the fresh server, including after an off case.
+                thp_settings=case_thp_settings(label,args.thp,args.page_kb,thp_saved)
+                for path,value in thp_settings.items():write(path,value)
+                actual_thp={path:re.search(r'\[([^]]+)\]',read(path))[1] for path in thp_settings}
+                if actual_thp!=thp_settings:raise RuntimeError('THP settings did not take effect')
                 print(f'START repeat={repeat} case={label}',flush=True)
                 write(out/'progress',f'repeat={repeat} case={label}')
                 run=out/f'r{repeat}-{label}';run.mkdir();cg=Path('/sys/fs/cgroup')/f'hermit-pebs-perf-{os.getpid()}';cg.mkdir()
                 write(cg/'memory.max',max(2048,args.memory_mb)*1024**2);write(cg/'memory.swap.max','max');write(cg/'memory.hermit_pebs','enabled' if mode is not None else 'disabled')
-                write(D/'remote_order_mask',saved['remote_order_mask'] if label=='off-original-mask' else '0x3fd')
+                write(D/'remote_order_mask','0x1' if label=='off' else saved['remote_order_mask'] if label=='off-original-mask' else '0x3fd')
                 write(D/'pebs_force_order',0)
                 if mode is not None: write(D/'pebs_mode',mode)
                 if fixed:
@@ -172,7 +190,9 @@ def main():
                 client(requests+['-t',str(args.warmup)],run/'warmup.log',args.warmup+120)
                 (run/'config.json').write_text(json.dumps({'case':label,'mode':mode,
                     'load_period':period,'store_period':1500003 if period else None,
-                    'controls':{f:read(D/f) for f in controls},'thp':read(thp_control)},indent=2))
+                    'controls':{f:read(D/f) for f in controls},'thp':read(thp_control),
+                    'thp_settings':actual_thp,'off_baseline':'base-pages-4k-v2',
+                    'requested_page_kb':4 if label=='off' else args.page_kb},indent=2))
                 capture(run/'before',cg,server.pid)
                 client(requests+['-t',str(args.duration)],run/'measure.log',args.duration+120)
                 capture(run/'after',cg,server.pid);(run/'memcached.stats').write_text(stats(args.port))
@@ -218,6 +238,17 @@ def main():
                     row[name]=sum(v[index]-a[k][index] for k,v in b.items())
                 row['large_wr_write_pct']=100*sum(v[2]-a[k][2] for k,v in b.items() if k>0)/max(row['write_bytes'],1)
                 row['large_wr_read_pct']=100*sum(v[3]-a[k][3] for k,v in b.items() if k>0)/max(row['read_bytes'],1)
+                row['base_page_baseline_valid']=True
+                if label=='off':
+                    huge_bytes=[]
+                    for tag in ['before','after']:
+                        memory=dict(line.split() for line in read(run/tag/'memory.stat').splitlines())
+                        huge_bytes.append(int(memory.get('anon_thp',0)))
+                        smaps=re.search(r'^AnonHugePages:\s*(\d+)',read(run/tag/'server-smaps_rollup'),re.M)
+                        if not smaps:raise RuntimeError('Missing AnonHugePages verification')
+                        huge_bytes.append(int(smaps[1])*1024)
+                    row['base_page_baseline_valid']=(not any(huge_bytes) and
+                        row['large_load_pct']==0 and row['large_wr_read_pct']==0 and row['large_wr_write_pct']==0)
                 for order_idx in range(10):
                     vals=[]
                     for tag in ['before','after']:
@@ -231,7 +262,7 @@ def main():
                     else:row['system_busy_cpu_seconds']=(busy-busy_before)/os.sysconf('SC_CLK_TCK')
                 row['memcached_evictions']=int(re.search(r'STAT evictions (\d+)',read(run/'memcached.stats'))[1])
                 row['workload_valid']=int(not any(row[k] for k in ['oom_kill_total','order_errors_delta','memcached_evictions','miss_pct','skipped_pct']))
-                row['valid']=row['workload_valid']*int(mode is None or row['sampled_delta']>0)
+                row['valid']=row['workload_valid']*int(row['base_page_baseline_valid'])*int(mode is None or row['sampled_delta']>0)
                 row['sampling_effective']=int(mode is not None and row['sampled_delta']>0)
                 row['policy_effective']=int(mode==1 and sum(row[f'decisions_order{i}'] for i in range(10))>0)
                 rows.append(row)
@@ -239,6 +270,7 @@ def main():
                     w=csv.DictWriter(f,fieldnames=rows[0]);w.writeheader();w.writerows(rows)
                 print(json.dumps(row),flush=True)
                 if mode is not None and not row['sampling_effective'] and not args.diagnostic:raise RuntimeError('PEBS produced zero usable samples; measurement is not a valid sampling benchmark')
+                if not row['base_page_baseline_valid']:raise RuntimeError(f'off was not a pure 4 KiB baseline: {run}')
                 if not row['workload_valid']:raise RuntimeError(f'invalid measurement: {run}')
                 if active: syscall(474,server.pid);active=False
                 server.terminate();server.wait(timeout=30);server=None
@@ -260,8 +292,7 @@ def main():
             attempt('stop server',stop_server)
         if cg is not None:attempt('remove cgroup',cg.rmdir)
         for f,value in saved.items():attempt('restore '+f,lambda f=f,value=value:write(D/f,value))
-        if args.thp=='always':
-            for path,value in thp_saved.items():attempt('restore '+path,lambda path=path,value=value:write(path,value))
+        for path,value in thp_saved.items():attempt('restore '+path,lambda path=path,value=value:write(path,value))
         (out/'dmesg-after.txt').write_text(subprocess.check_output(['dmesg'],text=True))
         restored={'controls':{f:read(D/f).strip() for f in saved},'thp':{p:re.search(r'\[([^]]+)\]',read(p))[1] for p in thp_saved},'pebs_enabled':read(D/'pebs_enabled').strip(),'cleanup_errors':cleanup_errors}
         if restored['controls']!=saved or restored['thp']!=thp_saved or restored['pebs_enabled']!='0':cleanup_errors.append('restored values differ')

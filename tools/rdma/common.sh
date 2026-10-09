@@ -942,3 +942,34 @@ save_config() {
     printf 'wait_stable_keys=%s\n' "$WAIT_STABLE_KEYS"
   } > "$RESULT_DIR/config.env"
 }
+
+# Optional instrumentation for the baseline-matched PEBS matrix. Ordinary
+# sweep invocations retain their original behaviour.
+configure_benchmark_pebs() {
+  [ -n "${PEBS_BENCH_MODE:-}" ] || return 0
+  sudo_test -e "$CGROUP/memory.hermit_pebs" || rdma_die "missing memcg PEBS control"
+  local value=enabled
+  [ "$PEBS_BENCH_MODE" != off ] || value=disabled
+  sudo_write "$value" "$CGROUP/memory.hermit_pebs"
+}
+
+snapshot_benchmark_pebs() {
+  [ -n "${PEBS_BENCH_MODE:-}" ] || return 0
+  {
+    printf 'timestamp_ns=%s\n' "$(date +%s%N)"
+    sudo_cat /sys/kernel/debug/hermit/pebs_order_stats
+    local key
+    for key in remote_order_mask effective_order_mask pebs_enabled pebs_mode pebs_force_order; do
+      printf '%s=' "$key"
+      sudo_cat "/sys/kernel/debug/hermit/$key"
+    done
+    printf 'memory.hermit_pebs='
+    sudo_cat "$CGROUP/memory.hermit_pebs"
+    printf 'perf_event_max_sample_rate='
+    cat /proc/sys/kernel/perf_event_max_sample_rate
+    printf 'cpu.stat\n'
+    sudo_cat "$CGROUP/cpu.stat"
+    printf 'memory.events\n'
+    sudo_cat "$CGROUP/memory.events"
+  } > "$1"
+}

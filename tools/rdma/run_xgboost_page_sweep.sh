@@ -81,7 +81,7 @@ RESTORE_THP=${RESTORE_THP:-1}
 RUN_ID=${requested_run_id:-"$(date +%Y%m%d-%H%M%S)-xgboost-swapio"}
 RESULT_DIR=${requested_result_dir:-"$RESULT_ROOT/$RUN_ID"}
 WORKER="$SCRIPT_DIR/xgboost_train.py"
-CGROUP=/sys/fs/cgroup/hermit-xgboost
+CGROUP=${PEBS_CGROUP:-/sys/fs/cgroup/hermit-xgboost}
 THP_ROOT=/sys/kernel/mm/transparent_hugepage
 REMOTE_MASK_FILE=/sys/kernel/debug/hermit/remote_order_mask
 EFFECTIVE_MASK_FILE=/sys/kernel/debug/hermit/effective_order_mask
@@ -239,6 +239,7 @@ else
 fi
 sudo_write max "$CGROUP/memory.max"
 sudo_write max "$CGROUP/memory.swap.max"
+configure_benchmark_pebs
 
 mkdir -p "$RESULT_DIR"
 {
@@ -303,6 +304,7 @@ for kb in $PAGE_SIZES_KB; do
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-before.txt"
     wait_for_stores_quiet
     snapshot_order_stats > "$before"
+    snapshot_benchmark_pebs "$before.pebs"
     pswpout_before=$(read_vmstat_key pswpout)
     stores_before=$(order_total_stores)
     oom_before=$(memory_event oom_kill)
@@ -329,6 +331,7 @@ for kb in $PAGE_SIZES_KB; do
       fi
     done
     snapshot_order_stats > "$after"
+    snapshot_benchmark_pebs "$after.pebs"
     pswpout_after=$(read_vmstat_key pswpout)
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-after.txt"
     sudo_cat "$CGROUP/memory.events" > "$run_dir/memory-events-after.txt"
@@ -372,6 +375,7 @@ for kb in $PAGE_SIZES_KB; do
     load_before="$run_dir/order-before-swapin.txt"
     load_after="$run_dir/order-after-swapin.txt"
     snapshot_order_stats > "$load_before"
+    snapshot_benchmark_pebs "$load_before.pebs"
     pswpin_before=$(read_vmstat_key pswpin)
     train_pswpout_before=$(read_vmstat_key pswpout)
     train_start_ns=$(date +%s%N)
@@ -379,6 +383,7 @@ for kb in $PAGE_SIZES_KB; do
     wait_for_log '^TRAIN ' "$log" "$TRAIN_TIMEOUT_SEC" 1
     train_end_ns=$(date +%s%N)
     snapshot_order_stats > "$load_after"
+    snapshot_benchmark_pebs "$load_after.pebs"
     pswpin_after=$(read_vmstat_key pswpin)
     train_pswpout_after=$(read_vmstat_key pswpout)
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-after-swapin.txt"
