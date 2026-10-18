@@ -7,7 +7,7 @@
 
 ## 1. 目标回顾
 
-用 Intel PEBS 硬件采样在线测量 memcg 内 2 MiB 虚拟区域（region）的访问
+用 Intel PEBS 硬件采样在线测量每个 mm 内 2 MiB 虚拟区域（region）的访问
 密度与空间局部性，通过代价模型在 Hermit swap 路径自动选择每次 RDMA
 传输的 folio 粒度（order 0 / 2–9），替代全局静态的 `remote_order_mask`；
 兼顾 swap-in 的 mTHP 聚合粒度（读放大上限）。完整设计见
@@ -21,7 +21,7 @@ Linux 负责选页、分配 swap 槽位和维护页表；Hermit 接管实际交�
 
 ```mermaid
 flowchart TD
-    A[内存压力 / memcg 主动回收] --> B[Linux 回收扫描：选中匿名 folio]
+    A[内存压力 / 可选 memcg 主动回收] --> B[Linux 回收扫描：选中匿名 folio]
     B --> C[分配 swap 槽位并加入 swapcache]
     C --> D[解除映射：PTE 保存 swap entry]
     D --> E[swap_writeout]
@@ -50,7 +50,7 @@ flowchart TD
 有两类入口，最终进入 Linux 原生回收机制：
 
 - **常规回收**：全局内存压力触发 kswapd、直接回收，或 memcg 达到限制。
-- **Hermit 主动回收**：开启 `apt_reclaim` 后，在 memcg 剩余空间小于 `reclaim_headroom_pages` 时提前排队执行 work，调用 `try_to_free_mem_cgroup_pages()`。`reclaim_mode=1` 时可使用多个 worker。
+- **Hermit 主动回收**（仅 `CONFIG_MEMCG=y`）：开启 `apt_reclaim` 后，在 memcg 剩余空间小于 `reclaim_headroom_pages` 时提前排队执行 work，调用 `try_to_free_mem_cgroup_pages()`。`reclaim_mode=1` 时可使用多个 worker。PEBS 本身按 mm 工作，不依赖这一项。
 
 因此，当前 **PEBS 不直接决定淘汰哪些页**；选页仍由 Linux 回收扫描负责。入口见 [memcontrol.c](../../linux-stable/mm/memcontrol.c:1335)。
 

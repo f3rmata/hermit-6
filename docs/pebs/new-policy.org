@@ -1,0 +1,17 @@
+#+title: PEBS Policy Design
+
+考虑能够一次得到热页区域的策略
+- 原始 folio 大小    | Linux 分配、回收及远端 extent 的单位 |
+- 换入 folio 大小    | 一次缺页实际读回多少数据，直接影响读放大 |
+- RDMA WR 大小      | 一次请求传输多少数据，影响请求数量和处理成本 |
+
+| 当前负载 | 已知访问行为 | 策略应学到什么 |
+|---|---|---|
+| anon full | 连续访问整个数组 | 较大的换入窗口，减少 fault/WR |
+| anon chunk64k | 每个区域只访问局部 64 KiB | 保留局部连续性，避免读完整区域 |
+| Redis | 2 MiB value，GETRANGE 读取前 64 KiB | 对象内局部访问范围 |
+| YCSB | uniform 随机选 key，但读取整个大记录 | key 之间随机，记录内部可能连续 |
+
+- pebs 适用于整机还是单一 cgroup
+- readahead 设计 -> 异步预取
+- 结合 pagefault 地址

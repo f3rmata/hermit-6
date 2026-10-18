@@ -334,6 +334,7 @@ for kb in $PAGE_SIZES_KB; do
       "$BENCH_THREADS" > "$log" 2>&1 &
     current_pid=$!
     sudo_write "$current_pid" "$CGROUP/cgroup.procs"
+    enable_benchmark_pebs_pid "$current_pid"
 
     if [ "$SWAPOUT_TRIGGER" = parallel-fault ]; then
       # Put the cgroup under its final limit before the worker threads fault

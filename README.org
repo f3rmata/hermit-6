@@ -19,12 +19,12 @@ Linux 源码树内的 RDMA core。
 - 大 folio 可用一个可变长 RDMA WR 传输，失败时自动改用多个 4 KiB WR；
 - 远端 extent 在整个 folio 范围内事务化预留和提交，支持 partial invalidate；
 - 运行时 order 位图和逐 order store/load/fallback/error 统计；
-- memcg 接近 =memory.max= 时的定向异步回收；
+- 可选 memcg 集成：接近 =memory.max= 时的定向异步回收（=CONFIG_MEMCG=y= 时启用）；
 - QEMU DRAM checksum、vmstat、backend 计数和本地 swap 写扇区验证；
 - PEBS 页面大小策略（=mm/hermit_pebs.c=）：Intel PEBS 采样 + 2 MiB region
   热度表 + 代价模型，在 swap-out/swap-in 路径按访问局部性自动选择传输
-  folio 粒度（syscall 473/474、=memory.hermit_pebs=、debugfs =pebs_*=）。
-  详见 =docs/pebs/pebs-order-policy.md=。
+  folio 粒度（syscall 473/474、debugfs =pebs_all= / =pebs_*=）。PEBS 历史
+  归属 =mm=，不依赖 cgroup；详见 =docs/pebs/pebs-order-policy.md=。
 
 详细迁移记录见 =docs/migration-6.18.md=。=docs/archive/plan/= 下的 6.6 文档作为历史
 记录保留。
@@ -50,7 +50,8 @@ mutilate 的部署和测试步骤见 =docs/rdma/dnet58-dnet61-memcached-rdma.md=
 
 * 构建内核
 
-Hermit 的 6.18 Kconfig 直接要求 =X86_64=、=MEMCG=、=SWAP= 和 =DEBUG_FS=；
+Hermit 的 6.18 Kconfig 直接要求 =X86_64=、=SWAP= 和 =DEBUG_FS=；
+=MEMCG= 是可选的（只用于 =memory.max= 驱动的主动回收）。
 使用外部 rswap/DOCA OFED 模块还要求 =MODULES=。THP/mTHP 传输测试额外要求
 =TRANSPARENT_HUGEPAGE=，并由 Hermit 选择的 =ARCH_WANTS_THP_SWAP= 自动得到
 =THP_SWAP=：
@@ -58,8 +59,6 @@ Hermit 的 6.18 Kconfig 直接要求 =X86_64=、=MEMCG=、=SWAP= 和 =DEBUG_FS=�
 #+begin_example
 CONFIG_HERMIT=y
 CONFIG_SWAP=y
-CONFIG_CGROUPS=y
-CONFIG_MEMCG=y
 CONFIG_DEBUG_FS=y
 CONFIG_TRANSPARENT_HUGEPAGE=y
 CONFIG_THP_SWAP=y
@@ -85,6 +84,9 @@ CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y
 # CONFIG_ZRAM is not set
 # 若要与传统 LRU 基线对比才关闭；不是 Hermit 的 Kconfig 前提
 # CONFIG_LRU_GEN is not set
+# 可选：启用 memory.max 驱动的 Hermit 主动回收
+CONFIG_CGROUPS=y
+CONFIG_MEMCG=y
 # OFED DKMS 需要替换同名 RDMA/MLX5 模块，因此保持模块化
 CONFIG_INFINIBAND=m
 # 仅 tools/qemu-dram 回归需要

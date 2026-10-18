@@ -172,6 +172,71 @@
       vertical-align: middle;
     }
     .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
   </style>
 <style>
   body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
@@ -197,6 +262,9 @@
 </header>
 <h1 id="pebs-性能评估--简明重析2026-10-06">PEBS 性能评估 ·
 简明重析（2026-10-06）</h1>
+<p>后续结果：<a href="pebs-workloads-20261008.md">2026-10-08
+数组、Redis、YCSB、XGBoost 评估</a>。本文的吞吐收益属于 Memcached
+实验条件；后续多负载矩阵尚未出现一致加速，不能把本文收益直接推广到其他工作负载。</p>
 <blockquote>
 <p>对 <code>docs/pebs/pebs-performance-20261006.md</code>
 同一份数据的重析与重排，聚焦四个问题： ① PEBS 开/关的吞吐、②
@@ -411,52 +479,57 @@ CPU（+0.52%～+0.79%）和尾延迟（+6.0%～+7.3%，绝对增量 1.3–1.6
 <h3 id="32-对策略收益频率是决定性的换页固定-qps">3.2
 对策略收益：频率是决定性的（换页、固定 QPS）</h3>
 <p>真正被频率影响的，是策略能从样本里提取多少信息。pressure 阶段（固定
-30000 QPS + 换页） 中，策略相对 off 的净收益随频率档变化剧烈：</p>
+30000 QPS + 换页） 中，RDMA
+读流量（KiB/请求）随采样率变化剧烈——<strong>不采样基线 off 为 50.90
+KiB/请求</strong>：</p>
 <table>
 <thead>
 <tr>
 <th>频率档</th>
 <th style="text-align: right;">samples/s</th>
-<th style="text-align: right;">CPU/请求 净变化</th>
-<th style="text-align: right;">RDMA 读流量 净变化</th>
+<th style="text-align: right;">RDMA 读流量 static（KiB/请求）</th>
+<th style="text-align: right;">RDMA 读流量 policy（KiB/请求）</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>low</td>
 <td style="text-align: right;">~820</td>
-<td style="text-align: right;"><strong>−2.98%</strong></td>
-<td style="text-align: right;"><strong>−16.03%</strong></td>
+<td style="text-align: right;">48.27</td>
+<td style="text-align: right;">42.01</td>
 </tr>
 <tr>
 <td>medium</td>
 <td style="text-align: right;">~900</td>
-<td style="text-align: right;">−14.45%</td>
-<td style="text-align: right;">−84.39%</td>
+<td style="text-align: right;">55.94</td>
+<td style="text-align: right;">7.93</td>
 </tr>
 <tr>
 <td>high</td>
 <td style="text-align: right;">~1500</td>
-<td style="text-align: right;">−15.69%</td>
-<td style="text-align: right;">−90.90%</td>
+<td style="text-align: right;">54.35</td>
+<td style="text-align: right;">4.64</td>
 </tr>
 <tr>
 <td>adaptive</td>
 <td style="text-align: right;">~12800</td>
-<td style="text-align: right;">−15.71%</td>
-<td style="text-align: right;">−90.78%</td>
+<td style="text-align: right;">50.89</td>
+<td style="text-align: right;">4.66</td>
 </tr>
 </tbody>
 </table>
 <ul>
-<li><strong>low 档几乎失效</strong>：样本太稀疏，策略大量回退（unknown
-占比中位数 ~22%，而 medium/high 只有 ~0.017%/0.001%）， 只能减 16%
-的读流量、2% 的 CPU。</li>
-<li><strong>medium/high/adaptive
-三档收益饱和</strong>：一旦采样覆盖足够，RDMA 读流量削减稳定在
-−84%～−91%， CPU −14%～−16%。<code>adaptive</code>
-的实测采样率（~12800/s）是 <code>high</code>（~1500/s）的 8 倍多，
-但收益没有对应放大——<strong>说明收益不随采样率线性增长，达到覆盖阈值后即饱和</strong>。</li>
+<li><strong>static 系列纹丝不动</strong>：不管采样率多高，读流量都停在
+~48–56 KiB/请求（≈ off 的 50.90）——
+光开采样但不改决策，读放大不会下降。</li>
+<li><strong>policy 系列随采样率骤降</strong>：low 42 → medium 7.9 → high
+4.6 → adaptive 4.66，读流量降低约 9 倍。 low 样本太稀疏（unknown 占比
+~22%），策略退化到只降一点点；medium 及以上达到覆盖阈值， 读流量稳定在
+4.6–7.9 KiB/请求。</li>
+<li><strong>收益饱和</strong>：<code>adaptive</code>
+的采样率（~12800/s）是 <code>high</code>（~1500/s）的 8
+倍多，但读流量没有进一步下降——
+<strong>采样覆盖足够后收益不再随采样率线性增长</strong>。</li>
 </ul>
 <blockquote>
 <p>结论：选采样频率的判据不是“哪个开销更低”（三档开销都
@@ -466,7 +539,11 @@ CPU（+0.52%～+0.79%）和尾延迟（+6.0%～+7.3%，绝对增量 1.3–1.6
 </blockquote>
 <p><img
 src="../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig3-frequency.png"
-alt="频率与策略收益" /></p>
+alt="采样率与 RDMA 读流量" /></p>
+<blockquote>
+<p>low/medium/high/adaptive 背后的采样周期实现（周期表、固定档覆盖、2
+秒自适应窗口）见文末「附录 8」。</p>
+</blockquote>
 <hr />
 <h2 id="4-结论三pebs-纯采样开销">4. 结论三：PEBS 纯采样开销</h2>
 <p>“纯采样开销”= static vs off（同页档、同静态
@@ -676,5 +753,99 @@ href="../../tools/rdma/pebs/plot_pebs_clean.py">tools/rdma/pebs/plot_pebs_clean.
 <li>完整原始记录（含全部 caveat 与验收细节）：<a
 href="pebs-performance-20261006.md">pebs-performance-20261006.md</a></li>
 </ul>
+<hr />
+<h2 id="8-附录采样频率档的实现low--medium--high--adaptive">8.
+附录：采样频率档的实现（low / medium / high / adaptive）</h2>
+<p>采样频率档本质是**采样周期（sample
+period）**的四种配置。<code>hermit_pebsd</code> 内核线程给每个 CPU
+打开两个系统级 PEBS
+事件（<code>precise_ip=1</code>、<code>exclude_kernel/hv=1</code>，
+<code>mm/hermit_pebs.c:401/420</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th>raw code</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HERMIT_PEBS_L3_MISS</code></td>
+<td><code>0x1d3</code></td>
+<td><code>MEM_LOAD_RETIRED.L3_MISS</code>（读）</td>
+</tr>
+<tr>
+<td><code>HERMIT_PEBS_ALL_STORES</code></td>
+<td><code>0x82d0</code></td>
+<td><code>MEM_INST_RETIRED.ALL_STORES</code>（写）</td>
+</tr>
+</tbody>
+</table>
+<p><code>attr.sample_period</code>
+是<strong>两次采样之间间隔的硬件事件数</strong>，周期越小采样越密。周期表移植自
+MEMTIS（<code>htmm_sampler.c</code>，<code>hermit_pebs.c:54-62</code>）：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* load 周期表，30 档 */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span><span class="dv">199</span><span class="op">,</span> <span class="dv">293</span><span class="op">,</span> <span class="dv">401</span><span class="op">,</span> <span class="op">...,</span> <span class="dv">1999</span><span class="op">,</span> <span class="op">...,</span> <span class="dv">19997</span><span class="op">};</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">/* store 周期表，5 档 */</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span><span class="dv">100003</span><span class="op">,</span> <span class="dv">300007</span><span class="op">,</span> <span class="dv">600011</span><span class="op">,</span> <span class="dv">1000003</span><span class="op">,</span> <span class="dv">1500003</span><span class="op">};</span></span></code></pre></div>
+<p><strong>固定档 low / medium / high</strong>：由“固定周期控制”补丁新增
+debugfs <code>pebs_load_period</code> / <code>pebs_store_period</code> /
+<code>pebs_adaptive</code>（<code>hermit_pebs.c:877-879</code>）。当
+<code>pebs_load_period != 0</code> 时用 <code>?:</code>
+覆盖周期表（<code>hermit_pebs_update_periods</code>，<code>hermit_pebs.c:292-295</code>），并写
+<code>pebs_adaptive=0</code> 关掉自适应。驱动只改 load 周期、store 固定
+1500003 （<code>pebs_perf_matrix.py:113,152</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>档</th>
+<th style="text-align: right;">load 周期</th>
+<th style="text-align: right;">store 周期</th>
+<th style="text-align: right;">实测 samples/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>low</td>
+<td style="text-align: right;">19997</td>
+<td style="text-align: right;">1500003</td>
+<td style="text-align: right;">~820</td>
+</tr>
+<tr>
+<td>medium</td>
+<td style="text-align: right;">1999</td>
+<td style="text-align: right;">1500003</td>
+<td style="text-align: right;">~900</td>
+</tr>
+<tr>
+<td>high</td>
+<td style="text-align: right;">199</td>
+<td style="text-align: right;">1500003</td>
+<td style="text-align: right;">~1500</td>
+</tr>
+</tbody>
+</table>
+<p>这三个值正是 load 周期表的第 [29]、[13]、[0] 档。</p>
+<p><strong>adaptive</strong>：写 <code>pebs_adaptive=1</code>、两个
+period 都为 0，回退到周期表<strong>起始档</strong>（load=199、
+store=100003），随后 <code>hermit_pebsd_main</code> 每 2
+秒（<code>window=2000ms</code>）调一次
+<code>hermit_pebs_adapt</code>（<code>hermit_pebs.c:327-341</code>），把每窗口样本数控制在
+1000–50000 内：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>window_samples <span class="op">&gt;</span> <span class="dv">50000</span> <span class="op">&amp;&amp;</span> idx <span class="op">&lt;</span> <span class="dv">29</span><span class="op">)</span> <span class="op">{</span> idx<span class="op">++;</span> <span class="op">...</span> <span class="op">}</span>   <span class="co">// 太密 → 周期+1（变稀）</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>window_samples <span class="op">&lt;</span> <span class="dv">1000</span> <span class="op">&amp;&amp;</span> idx <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> idx<span class="op">--;</span> <span class="op">...</span> <span class="op">}</span> <span class="co">// 太稀 → 周期-1（变密）</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>hermit_pebs_update_periods<span class="op">();</span>                             <span class="co">// 应用到每个 per-CPU 事件</span></span></code></pre></div>
+<p>两个易误读点：</p>
+<ol type="1">
+<li><strong>samples/s 不随 load 周期线性变化</strong>：store 周期固定
+1500003 贡献恒定基线，且采样率随策略 改变后的访存行为变化，所以 load
+周期 19997→199 差 100 倍，samples/s 只从 ~820→~1500。</li>
+<li><strong>adaptive 的 ~12800/s 远高于 high 的 ~1500/s，主因是 store
+周期不同</strong>：两者 load 周期都是 199， 但 adaptive 的
+store=100003（比固定档 1500003 密 15 倍），store 样本占大头。这正是第
+3.2 节 “adaptive 采样率 8 倍于 high
+但收益不放大”能比较、却不可直接归因于 load 采样频率的原因。</li>
+</ol>
 </body>
 </html>

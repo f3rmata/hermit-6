@@ -224,6 +224,7 @@ start_redis_servers() {
     current_redis_pids+=("$pid")
     current_redis_logs+=("$log")
     sudo_write "$pid" "$CGROUP/cgroup.procs"
+    enable_benchmark_pebs_pid "$pid"
   done
 }
 

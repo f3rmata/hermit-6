@@ -17,6 +17,12 @@
 
 ## PEBS
 
+[Memcached 满载采样开销测试](../../docs/pebs/memcached-sampling-cost.md)：`pebs/run_memcached_sampling_cost.py` 自动校准并发，再比较同页大小的采样开关。
+
+[2026-10-08 多负载实测与图表](../../docs/pebs/pebs-workloads-20261008.md)：1323 个样本，离线汇总入口 `pebs/summarize_workload_matrix.py`。
+
+数组、Redis、YCSB、XGBoost 的新矩阵见 [运行说明](../../docs/pebs/pebs-workload-matrix.md)，入口为 `pebs/run_workload_matrix.py`；使用普通用户先 `sudo -v`，支持 `--dry-run` 预览计划。下方 `pebs_perf_matrix.py` 是既有 Memcached 矩阵。
+
 [完整方法与结果](../../docs/pebs/pebs-performance-20261006.md) · [简明重析](../../docs/pebs/pebs-performance-summary-20261006.md)
 
 ```sh

@@ -4,12 +4,16 @@
 
 | 目录 | 内容 |
 |---|---|
+| `pebs/20261007-233523-workloads/` | 1323 个多负载矩阵样本；`analysis/` 保存可复现统计及 PNG/PDF 图表 |
+| `pebs/20261007-223941-workloads/` | 独立的 3 样本前置检查，不混入完整矩阵 |
 | `pebs/20261006/` | PEBS 采样修复、预检和 91 条正式测量 |
 | `baselines/` | 2026-09-24 添加 PEBS 前的多负载基线及续跑 |
 | `builds/` | 内核构建、安装、验收日志及当时的产物校验和 |
 | `dnet-61/` 及已有 CSV | 早期 Memcached、匿名内存、Redis、XGBoost 等实测结果 |
 
 [前 PEBS 基线报告](../../../docs/rdma/prepebs-baseline-20260924.md) · [历史页大小实验](../../../docs/rdma/dnet61-memcached-page-sweep-20260808.md)
+
+[2026-10-08 多负载评估](../../../docs/pebs/pebs-workloads-20261008.md) · [多负载审计](pebs/20261007-233523-workloads/analysis/audit.json)
 
 ## PEBS 2026-10-06
 

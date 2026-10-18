@@ -236,6 +236,7 @@ start_server() {
     current_server_pid=$!
   fi
   sudo_write "$current_server_pid" "$CGROUP/cgroup.procs"
+  enable_benchmark_pebs_pid "$current_server_pid"
 }
 
 assert_server_alive() {

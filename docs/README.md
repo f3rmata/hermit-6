@@ -7,6 +7,8 @@
 
 ## PEBS 设计与实测
 
+- [Memcached 满载采样开销测试](pebs/memcached-sampling-cost.md)
+
 - [PEBS 多负载采样开销与策略评估 2026-10-08](pebs/pebs-workloads-20261008.md)
 
 - [数组、Redis、YCSB、XGBoost 采样率矩阵运行说明](pebs/pebs-workload-matrix.md)

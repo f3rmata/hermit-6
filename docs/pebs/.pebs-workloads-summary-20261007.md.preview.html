@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10.1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>pebs-workloads-summary-20261007</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: 1.5em;}
+    div.column{flex: auto;}
+    @media screen {
+    div.columns{gap: min(4vw, 1.5em);}
+    div.column{overflow-x: auto;}
+    }
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+<style>
+  body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+         max-width: 60em; margin: 0 auto; padding: 1.2em 2em 4em;
+         color: #1f2328; background: #fff; line-height: 1.6; }
+  h1, h2, h3 { border-bottom: 1px solid #d0d7de; padding-bottom: .3em; }
+  a { color: #0969da; text-decoration: none; }
+  code { background: #f6f8fa; padding: .15em .4em; border-radius: 6px;
+         font-family: 'PT Mono', 'Noto Sans Mono CJK SC', monospace; }
+  pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  blockquote { color: #57606a; border-left: 4px solid #d0d7de;
+               margin-left: 0; padding-left: 1em; }
+  table { border-collapse: collapse; }
+  th, td { border: 1px solid #d0d7de; padding: 6px 13px; }
+  img { max-width: 100%; }
+  .org-src-container { background: #f6f8fa; }
+</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">pebs-workloads-summary-20261007</h1>
+</header>
+<h1 id="pebs-全负载扫描--验收与结论2026-10-07">PEBS 全负载扫描 ·
+验收与结论（2026-10-07）</h1>
+<blockquote>
+<p>2026-10-07 23:35 – 10-08 14:01，在 PEBS
+内核（<code>6.18.38-hermit-pebs #9</code>）上对 memcached
+之外的四类负载做全矩阵扫描。结果目录 <a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/">20261007-233523-workloads</a>。
+本文承接 <a
+href="pebs-performance-summary-20261006.md">pebs-performance-summary-20261006.md</a>。</p>
+</blockquote>
+<h2 id="1-验收结论全部通过">1. 验收结论：全部通过</h2>
+<table>
+<thead>
+<tr>
+<th>验收项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>规模</td>
+<td>1323 个样本 = 441 组 × 3 重复；每组 = 9 页档 × 7 配置</td>
+</tr>
+<tr>
+<td>完成/恢复</td>
+<td><code>completed=true</code>，<code>restore_errors=[]</code></td>
+</tr>
+<tr>
+<td>样本有效性</td>
+<td>1323/1323
+<code>exit_code=0</code>、<code>usable=true</code>、<code>validation_issues=[]</code></td>
+</tr>
+<tr>
+<td>数据正确性</td>
+<td>checksum_errors=0、target_errors=0、fallback=0、read_ok=8192、AUC=0.820776（0
+异常）</td>
+</tr>
+<tr>
+<td>perf 动态上限</td>
+<td>全程 2750
+未变（<code>perf_changed_cases=0</code>），throttled=0</td>
+</tr>
+<tr>
+<td>内核日志</td>
+<td>dmesg 前后无新增 BUG / Oops / WARNING / soft lockup</td>
+</tr>
+<tr>
+<td>采样丢失</td>
+<td>lost 共 70781（≈总采样 2.07 亿的 0.03%），xgboost 占 70732（54
+case）、anon-1t 占 49；不影响正确性</td>
+</tr>
+</tbody>
+</table>
+<p>配置矩阵：<code>off</code>（采样关 + 静态全 order
+mask）、<code>static-199/1999/19997</code>（采样开 + 静态决策）、
+<code>policy-199/1999/19997</code>（采样开 + 策略动态决策）。页档 4–2048
+KiB 共 9 档。</p>
+<h2 id="2-核心结论策略在这四类负载上几乎无收益">2.
+核心结论：策略在这四类负载上几乎无收益</h2>
+<p>与 memcached（policy-medium <strong>+124%</strong>
+吞吐、<strong>−91%</strong> RDMA 读流量）形成鲜明对比：这四类负载
+的采样/策略对运行时间和 RDMA 读流量的影响都近乎为零。</p>
+<p>时间为各页档中位数相对 <code>off</code> 的变化，三列对应 load 周期
+19997 / 1999 / 199：</p>
+<table>
+<thead>
+<tr>
+<th>负载</th>
+<th style="text-align: right;">static 时间变化</th>
+<th style="text-align: right;">policy 时间变化</th>
+<th style="text-align: right;">读流量变化(vs off)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>anon-1t-full</td>
+<td style="text-align: right;">−0.05% / +0.01% / +0.23%</td>
+<td style="text-align: right;">+0.32% / +0.44% / +0.89%</td>
+<td style="text-align: right;">≈0%</td>
+</tr>
+<tr>
+<td>anon-1t-chunk64k</td>
+<td style="text-align: right;">+0.06% / +0.07% / +0.18%</td>
+<td style="text-align: right;">+0.40% / +0.60% / +0.75%</td>
+<td style="text-align: right;">≈0%</td>
+</tr>
+<tr>
+<td>anon-8t-full</td>
+<td style="text-align: right;">−0.10% / +0.11% / −0.35%</td>
+<td style="text-align: right;">+0.27% / +0.63% / +0.47%</td>
+<td style="text-align: right;">≈0%</td>
+</tr>
+<tr>
+<td>anon-8t-chunk64k</td>
+<td style="text-align: right;">−0.16% / −0.09% / −0.03%</td>
+<td style="text-align: right;">+0.71% / +0.08% / +0.45%</td>
+<td style="text-align: right;">≈0%</td>
+</tr>
+<tr>
+<td>redis</td>
+<td style="text-align: right;">+1.80% / +2.25% / +2.58%</td>
+<td style="text-align: right;">+2.36% / +2.66% / +2.31%</td>
+<td style="text-align: right;">+0.14%</td>
+</tr>
+<tr>
+<td>ycsb</td>
+<td style="text-align: right;">+0.03% / +0.28% / −0.73%</td>
+<td style="text-align: right;">+0.60% / +0.00% / +1.14%</td>
+<td style="text-align: right;">≈0%</td>
+</tr>
+<tr>
+<td>xgboost</td>
+<td style="text-align: right;">+0.05% / +0.27% / +1.57%</td>
+<td style="text-align: right;">−0.08% / +0.28% / +1.45%</td>
+<td style="text-align: right;">≈0%</td>
+</tr>
+</tbody>
+</table>
+<p>三点结论：</p>
+<ol type="1">
+<li><strong>纯采样开销（static vs off）很低</strong>：anon ≈ 0，redis
++1.8~2.6%、xgboost ≤1.6%，与 memcached resident 阶段测到的 ~0.5–0.8% CPU
+量级一致。</li>
+<li><strong>策略收益（policy vs off）≈
+0</strong>：读流量（load_bytes）几乎不变，策略<strong>没有降低读放大</strong>。
+以 anon-1t-chunk64k 的 2048k 档为例，policy-199 的 decisions 仅 2
+次、large_load_pct 仍 100%， 没有把传输粒度降到 64 KiB（本可避免 32×
+读放大）。</li>
+<li><strong>根因是访问模式</strong>：这四类负载都是<strong>一次性/流式顺序访问</strong>（anon
+全扫、XGBoost 按列扫描、 Redis GETRANGE 扫描、YCSB uniform
+整值读），每个 region 只访问一次；PEBS 样本在访问时才产生， swap-in
+决策时没有"上一次访问"的样本可用，于是回退静态
+mask。策略收益依赖<strong>同一 region 被反复
+访问</strong>（时间局部性）——memcached 的热 key
+满足，这四类流式负载不满足。</li>
+</ol>
+<p><img
+src="../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig4-throughput-normalized.png"
+alt="逐负载吞吐对比（归一化）" /></p>
+<p><img
+src="../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig5-throughput-pagesize.png"
+alt="逐负载吞吐 vs 页档" /></p>
+<h2 id="3-与-memcached-的对照">3. 与 memcached 的对照</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>memcached（20261006）</th>
+<th>anon/redis/ycsb/xgboost（20261007）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>访问模式</td>
+<td>热 key 反复访问</td>
+<td>一次性顺序/流式扫描</td>
+</tr>
+<tr>
+<td>策略对吞吐</td>
+<td>+124%（vs off）</td>
+<td>≈0%</td>
+</tr>
+<tr>
+<td>策略对读流量</td>
+<td>−91%</td>
+<td>≈0%</td>
+</tr>
+<tr>
+<td>纯采样开销</td>
+<td>~0.5–0.8% CPU / −6.2% 饱和吞吐</td>
+<td>时间 +0~2.6%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>策略的价值高度依赖访问模式</strong>：它解决的是"同一 region
+被反复访问时按密度选传输粒度、削读放大"
+的问题，对无时间局部性的流式负载无效。这不是缺陷，而是策略的适用边界。</p>
+<h2 id="4-数据与复现">4. 数据与复现</h2>
+<ul>
+<li>汇总：<a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/aggregate.csv">aggregate.csv</a>、
+<a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/tables.md">tables.md</a>、
+<a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/samples.csv">samples.csv</a></li>
+<li>验收：<a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/audit.json">audit.json</a>、
+<a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/completion.json">completion.json</a></li>
+<li>驱动：<a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/source/run_workload_matrix.py">run_workload_matrix.py</a></li>
+<li>图表：<code>analysis/fig4-throughput-normalized.png</code>、<code>fig5-throughput-pagesize.png</code>（吞吐对比），
+<code>phase-time.png</code>、<code>policy-time-change.png</code>、<code>static-time-change.png</code>（运行时间）</li>
+<li>计划与配置：<a
+href="../../tools/rdma/results/pebs/20261007-233523-workloads/plan.json">plan.json</a></li>
+</ul>
+</body>
+</html>

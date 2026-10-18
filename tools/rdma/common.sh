@@ -327,6 +327,7 @@ build_bench_prefix() {
   BENCH_CMD_PREFIX=()
   if [ "$BENCH_NUMACTL" = "1" ] && [ -n "${BENCH_NUMA_NODE:-}" ] &&
      command -v numactl >/dev/null 2>&1; then
+    # shellcheck disable=SC2034  # consumed by sourced memcached scripts
     BENCH_CMD_PREFIX=(numactl "--cpunodebind=$BENCH_NUMA_NODE" "--membind=$BENCH_NUMA_NODE")
   fi
 }
@@ -815,9 +816,13 @@ wait_for_swap_stable() {
     fi
   done
 
+  # shellcheck disable=SC2034  # consumed by sourced memcached_bench.sh
   WAIT_LAST_STATUS=$status
+  # shellcheck disable=SC2034
   WAIT_LAST_SECONDS=$elapsed
+  # shellcheck disable=SC2034
   WAIT_LAST_SAMPLES=$samples
+  # shellcheck disable=SC2034
   WAIT_LAST_DELTA=$delta
   printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
     "$label" "$start_ts" "$now_ts" "$elapsed" "$status" "$samples" \
@@ -947,10 +952,25 @@ save_config() {
 # sweep invocations retain their original behaviour.
 configure_benchmark_pebs() {
   [ -n "${PEBS_BENCH_MODE:-}" ] || return 0
-  sudo_test -e "$CGROUP/memory.hermit_pebs" || rdma_die "missing memcg PEBS control"
-  local value=enabled
-  [ "$PEBS_BENCH_MODE" != off ] || value=disabled
-  sudo_write "$value" "$CGROUP/memory.hermit_pebs"
+  local dir
+  dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  [ -f "$dir/pebs/enable_pebs_pid.py" ] || \
+    rdma_die "missing pebs/enable_pebs_pid.py"
+}
+
+# Opt the workload's mm into PEBS history. cgroup is still used for the
+# memory limit and for process isolation; it is not the PEBS enable path.
+enable_benchmark_pebs_pid() {
+  [ -n "${PEBS_BENCH_MODE:-}" ] || return 0
+  [ "$PEBS_BENCH_MODE" != off ] || return 0
+  [ -n "$1" ] || rdma_die "enable_benchmark_pebs_pid needs a pid"
+  local dir mode=-1
+  dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  case "$PEBS_BENCH_MODE" in
+    policy) mode=1 ;;
+    static) mode=0 ;;
+  esac
+  sudo python3 "$dir/pebs/enable_pebs_pid.py" "$1" "$mode"
 }
 
 snapshot_benchmark_pebs() {
@@ -963,8 +983,8 @@ snapshot_benchmark_pebs() {
       printf '%s=' "$key"
       sudo_cat "/sys/kernel/debug/hermit/$key"
     done
-    printf 'memory.hermit_pebs='
-    sudo_cat "$CGROUP/memory.hermit_pebs"
+    printf 'pebs_all='
+    sudo_cat /sys/kernel/debug/hermit/pebs_all
     printf 'perf_event_max_sample_rate='
     cat /proc/sys/kernel/perf_event_max_sample_rate
     printf 'cpu.stat\n'

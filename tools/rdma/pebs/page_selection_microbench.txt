@@ -1,0 +1,110 @@
+PEBS page-selection microbench (dnet-61)
+
+Prepare only; the operator starts experiments. No peak/concurrency calibration.
+No kernel build, reboot, backend restart, perf-limit tuning, or existing-result overwrite.
+Do not run alongside other memory/RDMA experiments: THP and Hermit controls and
+RDMA/PEBS counters are global. The runner shares the memcached benchmark lock.
+
+Run from ~/hermit-6 as the normal SSH user, in tmux:
+
+sudo python3 tools/rdma/pebs/run_page_selection_microbench.py \
+  --user "$(id -un)" \
+  --output "$PWD/tools/rdma/results/pebs/$(date +%Y%m%d-%H%M%S)-page-selection"
+
+Preview (no root, no writes, no worker execution):
+python3 tools/rdma/pebs/run_page_selection_microbench.py \
+  --user "$(id -un)" --output /tmp/unused --dry-run
+
+After collecting the data, on a machine with Matplotlib:
+python3 tools/rdma/pebs/plot_page_selection_microbench.py \
+  tools/rdma/results/pebs/<run-directory>
+
+Creates a NEW analysis/ directory, epochs.csv/json, runs.json, summary.csv/json, REPORT.txt,
+per-scenario metrics.png and folios.png, and switch-timeline.png. Refuses to
+replace an existing analysis directory. No charts are produced before real data
+exist. Failed/incomplete runs remain in raw tables; overview aggregates require
+complete valid runs. The transition chart shows all available valid epochs.
+
+Defaults: 8 GiB aligned anonymous mapping, 1 worker on CPU 0, memory node 0,
+hermit_pebsd on CPU 0, 3 shuffled repeats, 5 pageout/access epochs per phase,
+4 access passes per epoch, 8 initial warmup passes. 147 processes / 945 epochs.
+The seed pairs address traversal across cases within each repeat. Runtime is
+not calibrated; complete mapping censuses can contribute substantial overhead.
+--workset-mb, --epochs, --passes, --warmup-passes, --repeats, --cpu,
+--sampler-cpus, --node, --cases and --scenarios are explicit fixed inputs.
+If changing workload parameters, use a new output directory and report them.
+
+Scenarios (independent of requested folio size):
+- sparse: 1 of 512 base pages per 2 MiB region (0.1953125%).
+- density16/64/256/dense: 16/64/256/512 pages (3.125/12.5/50/100%).
+- mixed: alternating regions with 1 and 512 selected pages (50.09765625% overall).
+- switch: sparse -> dense -> sparse, with the same process, virtual addresses,
+  mapping, cgroup and policy history. No warmup/reset at phase transitions.
+Regions are visited in a seeded shuffled order; selected subpages are contiguous
+from the start of each region. Each pass reads one uint64 per 64-byte cache line
+and updates one checksum word per selected 4 KiB page. Reported page coverage
+is 4096 * selected pages, NOT bytes of executed loads, and is not multiplied by
+passes. Actual read instruction count and passes are also saved.
+
+Cases:
+- fixed-4k/64k/512k/2048k: PEBS off, only the requested THP size enabled
+  (or MADV_NOHUGEPAGE for 4 KiB), RDMA mask = requested order plus order 0.
+- all-off/sample-only/dynamic: identical THP candidates (16..2048 KiB),
+  MADV_HUGEPAGE and RDMA mask 0x3fd; PEBS off/mode 0/mode 1 respectively.
+  sample-only vs all-off measures sampling + consumption + history overhead.
+  dynamic vs sample-only observes policy effect at matched sampling settings.
+PEBS adaptive=0, load period=1999, store period=1500003, force_order=0.
+Fixed requests allow allocation fallback; they do NOT guarantee actual folios.
+The runner saves/restores THP enabled controls and modified Hermit controls.
+Other allocation tunables are left unchanged. It does not force a policy winner.
+
+Protocol:
+1. Fresh process/cgroup per case, fully populate every cache line. Cgroup
+   memory.high=max and memory.max=workset+512 MiB (not pressure target).
+2. Census loaded folios. Start PEBS only after population, avoiding dense
+   initialization in region history. Warm up the first scenario density.
+3. For every epoch: census -> counters -> MADV_PAGEOUT over the full mapping ->
+   wait for three unchanged posted-WR counter readings (100 ms apart) -> counters
+   -> evicted census -> counters -> timed accesses -> counters -> final census.
+   Retain all phases/history/mapping. Do not repopulate or collapse between epochs.
+4. Stop PEBS, exit worker, remove cgroup; restore original controls on exit.
+   SIGKILL/power loss cannot guarantee restoration; restore.json records checks.
+
+Raw artifacts:
+manifest.json: inputs, shuffled plan, source hashes, policy controls, environment.
+source/: exact scripts and C source; page-selection: the compiled binary.
+runs: config.json, worker.jsonl, stderr.log, warmup.json, pages-loaded/.
+epochs: before/, after-pageout/, before-access/, after-access/ include raw
+WR/order/PEBS counters, cgroup memory/events, proc stat/status, perf controls,
+vmstat and monotonic timestamps. pages-before/evicted/after contain maps,
+smaps and mapping-only pagemap+kpageflags physical folio distributions.
+result.json: counter differences, worker timings, IO settling time, checksum,
+validity and quality notes. Missing counters and counter resets fail explicitly.
+
+Interpretation:
+- Controlled explicit reclaim tests page selection, not steady memory-pressure
+  application throughput. Pageout call and access times exclude censuses and
+  counter collection. Counter intervals include controller/pipe overhead.
+- Folio snapshots are non-atomic, report mapped bytes and distinct observed
+  folios; swapped pages have no inferred old folio size. Metadata reads can
+  perturb caches, delay the next phase and affect history cooling. They are not
+  free instrumentation. Time-series includes these pauses between epochs.
+- PEBS counters/events are global on all online CPUs. Sampler affinity only
+  constrains ring consumption. Positive sampled counts do not prove target
+  coverage; zero/lost/throttled samples are retained and flagged. Ring consumption
+  is asynchronous. No attribution or no-loss guarantee is inferred.
+- RDMA WR counts/bytes are actual posted traffic including retries; raw WR size
+  distribution is distinct from physical folios. Concurrent activity contaminates
+  counters. Stable posted counts do not prove hardware completion.
+- MADV_PAGEOUT is best effort. Record incomplete eviction and no-RDMA epochs,
+  never fill missing data with zero or infer byte amplification from requested
+  size. RDMA bytes / page coverage is an observed ratio, not pure amplification.
+- Epochs after the first inherit changed resident/folio distributions. In the
+  switch case, a sparse phase may split folios and constrain later dense phases;
+  that is measured behavior, not evidence of a guaranteed recovery capability.
+- Compare cases within the same scenario/repeat; densities perform different work.
+  Report median and min-max over independent runs, not confidence intervals from
+  repeated epochs. No expected ranking, winner selection or peak checks.
+
+Offline tests (no custom kernel needed):
+python3 tools/rdma/tests/test_page_selection_microbench.py

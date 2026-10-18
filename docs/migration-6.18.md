@@ -19,7 +19,9 @@ tracking (`mm/hermit_backend.c`), and stable statistics/ABI
 
 Linux 6.18 folio APIs are used throughout. Backend I/O accepts order 0 through
 `PMD_ORDER`; `CONFIG_HERMIT` selects `ARCH_WANTS_THP_SWAP` so THP swap support
-can be enabled. The memcg reclaim call uses the 6.18 five-argument
+can be enabled. `CONFIG_HERMIT` does not depend on `CONFIG_MEMCG`: PEBS
+history is owned by `mm_struct`, and cgroups are an optional limit/reclaim
+layer. When MEMCG is enabled, the reclaim path uses the 6.18 five-argument
 `try_to_free_mem_cgroup_pages()` interface.
 
 ## Authoritative copy protocol
@@ -80,7 +82,11 @@ atomic compare-and-exchange and rolled back exactly once when `ib_post_send()`
 fails. `max_order` is a read-only load-time module parameter, preventing the
 advertised capability mask from diverging after registration.
 
-## Memcg reclaim
+## Optional memcg reclaim
+
+This section only applies when `CONFIG_MEMCG=y`. PEBS and the transfer-order
+policy do not require it; without MEMCG, standard kswapd/direct reclaim still
+enters the Hermit swap path, and PEBS is enabled per pid or via `pebs_all`.
 
 When `apt_reclaim=Y`, a non-root memcg with a finite `memory.max` schedules
 asynchronous reclaim before a charge reaches the hard limit. The target margin

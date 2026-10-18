@@ -23,6 +23,8 @@
 
 ![纯采样开销](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig2-overhead.png)
 
+![pressure 满载吞吐对比（所有配置）](../../tools/rdma/results/pebs/20261011-185459-pressure-fixed-load/pressure/measurement/fig-pressure-qps.png)
+
 ### 采样频率影响
 
 三档固定频率（low≈820 / medium≈900 / high≈1500 samples/s）对原始吞吐几乎无差异
@@ -78,7 +80,7 @@ adaptive 的采样率是 high 的 8 倍多（~12800 vs ~1500/s），但读流量
 ## 流式负载上策略优化不明显
 
 把同样的 off / static / policy 矩阵搬到另外四类负载（anon 数组扫描 4 组、Redis、YCSB、
-XGBoost，共 1323 个样本），结论完全反转：所有配置的吞吐都贴着 1.0（下图为相对 off 的
+XGBoost，共 1323 个样本）：所有配置的吞吐都贴着 1.0（下图为相对 off 的
 归一化吞吐，各负载 × 各配置都在 ±3.5% 以内），策略没有降低读放大。
 
 ![逐负载吞吐对比（归一化）](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig4-throughput-normalized.png)

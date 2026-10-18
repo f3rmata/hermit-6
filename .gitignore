@@ -10,3 +10,4 @@ docs/.previews/
 # Python bytecode
 __pycache__/
 *.py[cod]
+docs/pebs/.pebs-conclusion.md.preview.html

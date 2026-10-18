@@ -281,6 +281,7 @@ for kb in $PAGE_SIZES_KB; do
     taskset -c "$BENCH_CPU" python3 "$WORKER" > "$log" 2>&1 &
     current_pid=$!
     sudo_write "$current_pid" "$CGROUP/cgroup.procs"
+    enable_benchmark_pebs_pid "$current_pid"
     wait_for_log '^WAITING ' "$log" "$READY_TIMEOUT_SEC"
     kill -USR1 "$current_pid"
     wait_for_log '^READY ' "$log" "$READY_TIMEOUT_SEC"
