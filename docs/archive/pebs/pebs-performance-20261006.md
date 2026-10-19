@@ -1,14 +1,14 @@
 # PEBS 实机性能评估 20261006
 
-修复版 `6.18.38-hermit-pebs #9` 已在 dnet-61 启动并完成三阶段 **91/91 条有效正式测量**。测试时间为 2026-10-06 15:56:37–18:04:11（UTC+8），18:05:35 独立收尾验收通过。此前零样本修复见 [采样修复与验证](pebs-sampling-fix-20261006.md)；旧内核零样本试跑、装载 OOM 和短时预检均未混入正式统计。
+修复版 `6.18.38-hermit-pebs #9` 已在 dnet-61 启动并完成三阶段 **91/91 条有效正式测量**。测试时间为 2026-10-06 15:56:37–18:04:11（UTC+8），18:05:35 独立收尾验收通过。此前零样本修复见 [采样修复与验证](../../../tools/rdma/results/pebs/20261006/sampling-fix/)；旧内核零样本试跑、装载 OOM 和短时预检均未混入正式统计。
 
 当前策略在本次 Memcached 压力负载下获得了明确的端到端收益：中频策略相对关闭采样、静态全 order mask 的五轮配对吞吐提升中位数 **123.76%**，范围 **117.39%–144.35%**；相对静态 4 KiB 为 **223.10%**，范围 **204.44%–250.32%**。收益同时伴随 RDMA 读流量/请求下降，而不是只改变了配置开关。
 
 采样成本取决于场景：无换页时三档纯采样的 CPU/请求配对增量中位数约 **0.52%–0.79%**；饱和换页负载下，中频纯采样的吞吐配对变化中位数为 **−6.20%**，范围 **−20.07% 至 +3.49%**。因此不能将当前实现概括为“所有场景开销低于 1%”。中频策略在固定 30000 QPS 下仍有明显尾延迟波动，不能宣称各项性能都稳定改善。
 
-[完整三阶段统计](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md) · [总览 PDF](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/overview.pdf) · [采样率图 PDF](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-cost.pdf)
+[完整三阶段统计](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md) · [总览 PDF](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/overview.pdf) · [采样率图 PDF](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-cost.pdf)
 
-![性能总览](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/overview.png)
+![性能总览](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/overview.png)
 
 ## 采样本身的开销
 
@@ -75,7 +75,7 @@ resident 全部 21 次测量的 RDMA 读写字节与换页策略决策均为零�
 
 ## 采样周期与策略效果
 
-![实际采样率与性能成本](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-cost.png)
+![实际采样率与性能成本](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-cost.png)
 
 固定周期组仅改变 load 阈值，store 保持 1500003；因此 load 周期变化 100 倍，实际可用样本率不必变化 100 倍。统计未按 load/store 事件拆分，不能据此精确推算两种事件各自的成本。
 
@@ -141,15 +141,15 @@ pressure 日志新增 **9 次 `perf: interrupt took too long`**，全局 `kernel
 
 样本仅覆盖这台机器、800000 个 1 KiB value 的 Memcached 工作集及上述参数，未覆盖 Redis、其他容量、并发扫描或所有页档。CPU governor/频率未由本脚本单独固定；少量重复及 min–max 不能视作统计显著性或普遍性能保证。旧的 70% memory.max 基线与本次 memory.high 压力条件不同，不作跨实验百分比归因。
 
-18:05:35 独立验收确认内核/模块 SHA256 与测试前一致；采样关闭，memcached、mutilate、hermit_pebsd 均退出，测试 cgroup 已清理，Hermit 和 THP 参数恢复到本次矩阵开始前设置。RDMA 模块与 swap 保持测试准备后的启用状态，swap 使用量为 4 KiB。perf 自动调整后的全局上限仍为 2750，`perf_cpu_time_max_percent=25`，未将其伪称为“所有系统状态都恢复”。证据见 [final-audit.json](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/final-audit.json)。
+18:05:35 独立验收确认内核/模块 SHA256 与测试前一致；采样关闭，memcached、mutilate、hermit_pebsd 均退出，测试 cgroup 已清理，Hermit 和 THP 参数恢复到本次矩阵开始前设置。RDMA 模块与 swap 保持测试准备后的启用状态，swap 使用量为 4 KiB。perf 自动调整后的全局上限仍为 2750，`perf_cpu_time_max_percent=25`，未将其伪称为“所有系统状态都恢复”。证据见 [final-audit.json](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/final-audit.json)。
 
 ## 数据、图表与复现
 
-- [完整汇总及各阶段链接](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md)
-- [pressure CSV](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/pressure/summary.csv)、[resident CSV](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/resident/summary.csv)、[saturation CSV](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/saturation/summary.csv)
-- [实际采样周期与频率](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-frequencies.csv)
-- [执行脚本快照](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/driver.py)、[三阶段入口](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/campaign.sh)、[内核补丁](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/kernel.patch)
-- [完整归档](../../tools/rdma/results/pebs/20261006/pebs-performance-20261006.tar.gz)、[归档 SHA256](../../tools/rdma/results/pebs/20261006/pebs-performance-20261006.tar.gz.sha256)
+- [完整汇总及各阶段链接](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md)
+- [pressure CSV](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/pressure/summary.csv)、[resident CSV](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/resident/summary.csv)、[saturation CSV](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/saturation/summary.csv)
+- [实际采样周期与频率](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-frequencies.csv)
+- [执行脚本快照](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/driver.py)、[三阶段入口](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/campaign.sh)、[内核补丁](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/kernel.patch)
+- [完整归档](../../../tools/rdma/results/pebs/20261006/pebs-performance-20261006.tar.gz)、[归档 SHA256](../../../tools/rdma/results/pebs/20261006/pebs-performance-20261006.tar.gz.sha256)
 
 远端结果目录为 `/home/xwz/hermit-baselines/pebs-campaign-20261006`。本地每个 case 保留装载/预热/测量日志、before/after 内核与进程计数、memcached stats、配置快照；每阶段保留 manifest、内核日志、恢复记录、汇总 CSV/JSON、PNG/PDF。短时预检独立保留，不进入正式矩阵。
 

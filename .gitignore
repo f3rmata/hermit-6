@@ -1,13 +1,11 @@
-docs/research/blowfish-paper-analysis.md
-tools/rdma/plots/plot_page_sweep.py
-tools/rdma/plots/plot_page_size_throughput_prediction.py
-tools/rdma/plots/plot_measured_peak_by_page.py
-tools/rdma/plots/plot_measured_hermit_page_sweep.py
-
-# Downloaded datasets used by benchmarks
 # Generated documentation previews
 docs/.previews/
-# Python bytecode
+docs/**/*.preview.html
+docs/**/.*.preview.html
+docs/pebs/*.pdf
+
+# Python caches
 __pycache__/
 *.py[cod]
-docs/pebs/.pebs-conclusion.md.preview.html
+.pytest_cache/
+.ruff_cache/

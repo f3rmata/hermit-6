@@ -24,7 +24,7 @@ Linux 源码树内的 RDMA core。
 - PEBS 页面大小策略（=mm/hermit_pebs.c=）：Intel PEBS 采样 + 2 MiB region
   热度表 + 代价模型，在 swap-out/swap-in 路径按访问局部性自动选择传输
   folio 粒度（syscall 473/474、debugfs =pebs_all= / =pebs_*=）。PEBS 历史
-  归属 =mm=，不依赖 cgroup；详见 =docs/pebs/pebs-order-policy.md=。
+  归属 =mm=，不依赖 cgroup；详见 =docs/pebs/design.md=。
 
 详细迁移记录见 =docs/migration-6.18.md=。=docs/archive/plan/= 下的 6.6 文档作为历史
 记录保留。

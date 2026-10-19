@@ -1,3 +1,34 @@
+## 固定 cgroup 上限的多负载测试
+
+`run_anon_swapout_sweep.sh`、`run_redis_page_sweep.sh`、`run_ycsb_page_sweep.sh` 和
+`run_xgboost_page_sweep.sh` 现在在读取、扫描或训练阶段保持换出阶段设定的
+`memory.max`，不再恢复为 `max`。`pebs/run_workload_matrix.py` 调用同一组脚本。
+数据准备阶段仍可不设限；anon 的 `parallel-fault` 模式在填充前就设置限额。
+
+默认比例仍为 70%：anon 按 `WORKSET_MB` 计算（可用 `LIMIT_MB` 指定），
+其余三类按加载后的 cgroup 驻留量计算。限额确定后，在该轮测量中保持不变。
+不同 case 的初始驻留量可能不同，比较时应核对 CSV 的 `limit_mb`；固定上限不等于
+所有 case 自动获得相同字节数的预算，也不保证短负载已经进入稳态。
+
+- 测量期间允许正常换出，CSV 继续记录 `swapin_pswpout_delta`、
+  `bench_pswpout_delta` 或 `train_pswpout_delta`。OOM、数据校验、无有效换入和
+  矩阵中的后端错误检查仍保留。
+- 每轮记录 `memory-policy.txt`（`fixed-max-v1`）以及测量前后的
+  `memory-max-*`、`memory-high-*`、`memory-current-*`、`memory-swap-current-*`
+  快照，并核验 `memory.max` 与目标值相同。
+- 矩阵的 plan/case、汇总 CSV、审计和图表标记 `memory_policy`。历史无标记的矩阵
+  按 `released-max-v1` 解读，不能直接和新结果合并为同条件对照。
+- 应用耗时和吞吐现在包含受限容量下的回收与换入竞争。原有基于初始换出量计算的
+  normalized/measured read amplification 也会受到重复换入影响，不再代表纯空间读放大；
+  应同时查看实际读取字节、测量阶段换出增量和应用性能。
+
+离线检查测试计划（不启动负载）：
+
+```sh
+python3 tools/rdma/pebs/run_workload_matrix.py --dry-run
+```
+
+Memcached 的独立测试入口及显式 `MADV_PAGEOUT` 微基准不属于上述四条路径。
 
 ## Memcached 纯 4 KiB 对照
 

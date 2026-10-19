@@ -17,13 +17,14 @@
 
 ## PEBS
 
-[Memcached 满载采样开销测试](../../docs/pebs/memcached-sampling-cost.md)：`pebs/run_memcached_sampling_cost.py` 自动校准并发，再比较同页大小的采样开关。
+当前设计、实测结论和操作步骤见 [PEBS 设计](../../docs/pebs/design.md)、[PEBS 评估](../../docs/pebs/evaluation.md) 和 [PEBS 实验手册](../../docs/pebs/runbook.md)。
 
-[2026-10-08 多负载实测与图表](../../docs/pebs/pebs-workloads-20261008.md)：1323 个样本，离线汇总入口 `pebs/summarize_workload_matrix.py`。
+- Memcached 采样开销：`pebs/run_memcached_sampling_cost.py`，固定并发，比较同页大小的采样开关。
+- 多负载矩阵：`pebs/run_workload_matrix.py`，1323 个样本，PEBS 按工作负载 pid 启用。
+- 页面选择微基准：`pebs/run_page_selection_microbench.py`。
+- 离线汇总：`pebs/summarize_workload_matrix.py`。
 
-数组、Redis、YCSB、XGBoost 的新矩阵见 [运行说明](../../docs/pebs/pebs-workload-matrix.md)，入口为 `pebs/run_workload_matrix.py`；使用普通用户先 `sudo -v`，支持 `--dry-run` 预览计划。下方 `pebs_perf_matrix.py` 是既有 Memcached 矩阵。
-
-[完整方法与结果](../../docs/pebs/pebs-performance-20261006.md) · [简明重析](../../docs/pebs/pebs-performance-summary-20261006.md)
+旧版 Memcached 矩阵 `pebs_perf_matrix.py` 保留用于复现 2026-10-06 的条件；当前实验优先使用上面的入口。
 
 ```sh
 python3 tools/rdma/pebs/pebs_perf_matrix.py --help
@@ -39,7 +40,7 @@ python3 tools/rdma/pebs/summarize_pebs_campaign.py tools/rdma/results/pebs/20261
 
 - [Memcached 与匿名内存部署及测试](../../docs/rdma/dnet58-dnet61-memcached-rdma.md)
 - [Redis](../../docs/rdma/redis-hermit-6.18.md) · [XGBoost 与 HIGGS](../../docs/rdma/xgboost-hermit-6.18.md)
-- [添加 PEBS 前的基线记录](../../docs/rdma/prepebs-baseline-20260924.md)
+- [添加 PEBS 前的基线记录](../../docs/archive/rdma/prepebs-baseline-20260924.md)
 
 `baseline/` 的运行及续跑脚本对应特定旧内核、原始输出目录和源码快照，保留其版本检查；它们不是当前 PEBS 内核的通用测试入口。已归档的 `driver.py`、`source/` 和内核补丁保留实验时内容，不随当前工具目录改写。
 

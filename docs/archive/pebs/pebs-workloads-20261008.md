@@ -6,9 +6,9 @@
 
 ## 数据和实验条件
 
-- [原始结果目录](../../tools/rdma/results/pebs/20261007-233523-workloads/)、[执行计划](../../tools/rdma/results/pebs/20261007-233523-workloads/plan.json)、[完成及恢复记录](../../tools/rdma/results/pebs/20261007-233523-workloads/completion.json)。前置 3 样本检查保存在独立目录，不混入本报告。
+- [原始结果目录](../../../tools/rdma/results/pebs/20261007-233523-workloads/)、[执行计划](../../../tools/rdma/results/pebs/20261007-233523-workloads/plan.json)、[完成及恢复记录](../../../tools/rdma/results/pebs/20261007-233523-workloads/completion.json)。前置 3 样本检查保存在独立目录，不混入本报告。
 - [运行方法及 baseline 参数映射](pebs-workload-matrix.md)：7 种负载配置 × 9 种页大小 × 7 种采样/策略配置 × 3 次重复。
-- dnet-61，`6.18.38-hermit-pebs #9`，2026-10-06 构建，RDMA rswap 后端。应用与模块记录见 [host.json](../../tools/rdma/results/pebs/20261007-233523-workloads/host.json)。
+- dnet-61，`6.18.38-hermit-pebs #9`，2026-10-06 构建，RDMA rswap 后端。应用与模块记录见 [host.json](../../../tools/rdma/results/pebs/20261007-233523-workloads/host.json)。
 - load period 为 19997、1999、199，store period 固定 1500003；adaptive=0、force_order=0。period 是事件间隔，不是每秒采样次数，数值越小采样越密。
 - 每轮只允许 4 KiB 与当前所选页大小，使用独立进程和 cgroup；采样覆盖填充、换出及读取/训练。每个负载、页大小、重复内的配置顺序随机化。
 - 固定本地内存比例 70%、STHD=16、reclaim_mode=0、headroom=2048。数组为 parallel-fault 换出；其余负载填充后降低 memory.max，测量读取/训练前恢复 memory.max。
@@ -23,7 +23,7 @@
 - 策略附加变化：`100 × (T_policy / T_static − 1)`，比较相同采样间隔。
 - 策略净变化：`100 × (T_policy / T_off − 1)`。
 
-以上均为**正值变慢，负值变快**。汇总表再取 9 个页大小百分比的中位数；这是跨配置摘要，不是统一负载加权收益，也不是配对重复百分比的中位数。图中的 min–max 是 3 次重复范围，不是置信区间。几乎为零的变化不应解释为稳定加速；页大小间的异质性应结合逐格图和 [完整统计 CSV](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/aggregate.csv) 阅读。
+以上均为**正值变慢，负值变快**。汇总表再取 9 个页大小百分比的中位数；这是跨配置摘要，不是统一负载加权收益，也不是配对重复百分比的中位数。图中的 min–max 是 3 次重复范围，不是置信区间。几乎为零的变化不应解释为稳定加速；页大小间的异质性应结合逐格图和 [完整统计 CSV](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/aggregate.csv) 阅读。
 
 ## 仅采样开销与策略净变化
 
@@ -46,19 +46,19 @@
 
 表中的 static 为采样开销，policy 为相对 off 的净变化。包括所有请求页大小；Redis/YCSB 的 2048 KiB 实际为 4 KiB 传输，不能据此推断有效 2 MiB 大页的性能。
 
-![仅采样耗时变化](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/static-time-change.png)
+![仅采样耗时变化](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/static-time-change.png)
 
 Redis 的 static 在各页大小上均显示正耗时增量；XGBoost 高频档的增加也较一致。YCSB 的低频汇总虽接近零，但逐页存在约 −7% 至 +7% 的变化，不能只根据汇总数声称“没有开销”。数组的多数差异较小，3 次重复不足以支持对小幅收益的强结论。
 
-![策略净耗时变化](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/policy-time-change.png)
+![策略净耗时变化](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/policy-time-change.png)
 
 中频 policy 相对同频 static 的跨页耗时变化中位数为：单线程全扫描 +0.35%、单线程 chunk64k +0.24%、8 线程全扫描 +0.16%、8 线程 chunk64k +0.32%、Redis +0.16%、YCSB −0.01%、XGBoost −0.10%。这些值表明本轮策略的额外收益很小，尚不能证明稳定优化效果。
 
-![中频各负载绝对耗时与重复范围](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/phase-time.png)
+![中频各负载绝对耗时与重复范围](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/phase-time.png)
 
 ## 采样质量和大页有效性
 
-[审计 JSON](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/audit.json) 给出以下记录：
+[审计 JSON](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/audit.json) 给出以下记录：
 
 | 检查项 | 结果 | 解释 |
 |---|---:|---|
@@ -99,4 +99,4 @@ python3 tools/rdma/pebs/summarize_workload_matrix.py \
   tools/rdma/results/pebs/20261007-233523-workloads
 ```
 
-脚本从原始 case/status JSON 与负载 CSV 重新生成 `analysis/samples.csv`、`aggregate.csv`、`audit.json`、`tables.md` 和三组 PNG/PDF，不修改原始测量文件。PDF 下载：[仅采样](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/static-time-change.pdf)、[策略净变化](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/policy-time-change.pdf)、[绝对耗时](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/phase-time.pdf)。
+脚本从原始 case/status JSON 与负载 CSV 重新生成 `analysis/samples.csv`、`aggregate.csv`、`audit.json`、`tables.md` 和三组 PNG/PDF，不修改原始测量文件。PDF 下载：[仅采样](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/static-time-change.pdf)、[策略净变化](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/policy-time-change.pdf)、[绝对耗时](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/phase-time.pdf)。

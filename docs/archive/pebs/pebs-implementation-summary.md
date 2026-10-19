@@ -52,7 +52,7 @@ flowchart TD
 - **常规回收**：全局内存压力触发 kswapd、直接回收，或 memcg 达到限制。
 - **Hermit 主动回收**（仅 `CONFIG_MEMCG=y`）：开启 `apt_reclaim` 后，在 memcg 剩余空间小于 `reclaim_headroom_pages` 时提前排队执行 work，调用 `try_to_free_mem_cgroup_pages()`。`reclaim_mode=1` 时可使用多个 worker。PEBS 本身按 mm 工作，不依赖这一项。
 
-因此，当前 **PEBS 不直接决定淘汰哪些页**；选页仍由 Linux 回收扫描负责。入口见 [memcontrol.c](../../linux-stable/mm/memcontrol.c:1335)。
+因此，当前 **PEBS 不直接决定淘汰哪些页**；选页仍由 Linux 回收扫描负责。入口见 [memcontrol.c](../../../linux-stable/mm/memcontrol.c:1335)。
 
 **2. 选中 folio 后，先建立 swap 身份**
 
@@ -75,7 +75,7 @@ pageout()
 
 **3. swap-out 如何进入 Hermit**
 
-[swap_writeout()](../../linux-stable/mm/page_io.c:250) 的处理顺序是：
+[swap_writeout()](../../../linux-stable/mm/page_io.c:250) 的处理顺序是：
 
 ```text
 能否直接释放不再需要的 swap？
@@ -119,7 +119,7 @@ swap offset
 
 这是单边 RDMA；每次页读写无需服务器应用线程接收请求再复制数据。
 
-目前 [rswap_submit_folio()](../../remoteswap/client/rswap_rdma_ops.c:335) 只有两种实际传输形式：
+目前 [rswap_submit_folio()](../../../remoteswap/client/rswap_rdma_ops.c:335) 只有两种实际传输形式：
 
 | 条件 | 实际 WR |
 |---|---|
@@ -148,7 +148,7 @@ bypass_swapcache 开启
 
 当前代码的 Hermit direct **已不要求本地设备设置 `SWP_SYNCHRONOUS_IO`**，这点 README 尚未同步。
 
-direct 路径在 [memory.c](../../linux-stable/mm/memory.c:4785) 中执行：
+direct 路径在 [memory.c](../../../linux-stable/mm/memory.c:4785) 中执行：
 
 ```text
 alloc_swap_folio()       选择并分配读回 folio
@@ -199,7 +199,7 @@ order-9 远端 extent 在满足配置、对齐和连续 PTE 等条件时，可�
   → 应用重试访存指令
 ```
 
-槽位未必在读回瞬间释放；它还可能被其他 PTE 或 swapcache 引用。最终释放时，[swap_range_free()](../../linux-stable/mm/swapfile.c:1261) 逐槽清除 Hermit 标记。远端内存无需逐页发送释放 RPC，原位置可在槽位复用时覆盖。
+槽位未必在读回瞬间释放；它还可能被其他 PTE 或 swapcache 引用。最终释放时，[swap_range_free()](../../../linux-stable/mm/swapfile.c:1261) 逐槽清除 Hermit 标记。远端内存无需逐页发送释放 RPC，原位置可在槽位复用时覆盖。
 
 最后更正上一条分析中的一个边界：**已发起的远端读取失败会留下非 uptodate folio，缺页路径可返回 SIGBUS；但当前普通读取代码在 backend 消失时会落到本地读取。** 对 remote-only entry，本地副本可能无效，因此这条异常分支仍有正确性风险，也说明必须先成功 `swapoff` 再卸载 backend。
 

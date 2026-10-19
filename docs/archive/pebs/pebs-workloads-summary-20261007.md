@@ -2,7 +2,7 @@
 
 > 2026-10-07 23:35 – 10-08 14:01，在 PEBS 内核（`6.18.38-hermit-pebs #9`）上对
 > memcached 之外的四类负载做全矩阵扫描。结果目录
-> [20261007-233523-workloads](../../tools/rdma/results/pebs/20261007-233523-workloads/)。
+> [20261007-233523-workloads](../../../tools/rdma/results/pebs/20261007-233523-workloads/)。
 > 本文承接 [pebs-performance-summary-20261006.md](pebs-performance-summary-20261006.md)。
 
 ## 1. 验收结论：全部通过
@@ -49,9 +49,9 @@
    swap-in 决策时没有"上一次访问"的样本可用，于是回退静态页档。策略收益依赖**同一 region 被反复
    访问**（时间局部性）——memcached 的热 key 满足，这四类流式负载不满足。
 
-![逐负载吞吐对比（归一化）](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig4-throughput-normalized.png)
+![逐负载吞吐对比（归一化）](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig4-throughput-normalized.png)
 
-![逐负载吞吐 vs 页档](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig5-throughput-pagesize.png)
+![逐负载吞吐 vs 页档](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig5-throughput-pagesize.png)
 
 ## 3. 与 memcached 的对照
 
@@ -67,12 +67,12 @@
 
 ## 4. 数据与复现
 
-- 汇总：[aggregate.csv](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/aggregate.csv)、
-  [tables.md](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/tables.md)、
-  [samples.csv](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/samples.csv)
-- 验收：[audit.json](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/audit.json)、
-  [completion.json](../../tools/rdma/results/pebs/20261007-233523-workloads/completion.json)
-- 驱动：[run_workload_matrix.py](../../tools/rdma/results/pebs/20261007-233523-workloads/source/run_workload_matrix.py)
+- 汇总：[aggregate.csv](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/aggregate.csv)、
+  [tables.md](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/tables.md)、
+  [samples.csv](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/samples.csv)
+- 验收：[audit.json](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/audit.json)、
+  [completion.json](../../../tools/rdma/results/pebs/20261007-233523-workloads/completion.json)
+- 驱动：[run_workload_matrix.py](../../../tools/rdma/results/pebs/20261007-233523-workloads/source/run_workload_matrix.py)
 - 图表：`analysis/fig4-throughput-normalized.png`、`fig5-throughput-pagesize.png`（吞吐对比），
   `phase-time.png`、`policy-time-change.png`、`static-time-change.png`（运行时间）
-- 计划与配置：[plan.json](../../tools/rdma/results/pebs/20261007-233523-workloads/plan.json)
+- 计划与配置：[plan.json](../../../tools/rdma/results/pebs/20261007-233523-workloads/plan.json)

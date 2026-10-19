@@ -1,5 +1,8 @@
 # Intel PEBS：原理、采集数据与用法
 
+> 本文是背景资料，只介绍 PEBS 机制和一般性用法；当前 Hermit 的 mm 作用域实现见
+> [design.md](design.md)，实测见 [evaluation.md](evaluation.md)。
+>
 > 本文整理 Intel PEBS（Precise Event-Based Sampling，精确事件采样）的工作
 > 原理、它具体采集哪些数据、以及在 Linux 上如何用 `perf` 采集与解读这些
 > 数据。最后结合本项目（Hermit / RDMA swap / 内存分层）讨论 PEBS 如何用于
@@ -201,7 +204,7 @@ Intel PEBS 在 AMD 上的对应物是 **IBS（Instruction-Based Sampling）**，
 
 ## 6. 对本项目（Hermit / RDMA swap）的启发
 
-`docs/rdma/dnet61-memcached-page-sweep-20260808.md` 里留了一句设想：
+[dnet61-memcached-page-sweep-20260808.md](../archive/rdma/dnet61-memcached-page-sweep-20260808.md) 里留了一句设想：
 
 > 可以参考 Memory tiering 的 PEBS 等性能监测设施，调节 swap-in/swap-out 的
 > 页面大小等参数，在提高吞吐量和避免写放大之间做 tradeoff。
@@ -248,8 +251,9 @@ PEBS 的独特价值在于：它不止给「热不热」，还给「这次访问
 
 ### 6.4 落地时的注意点
 
-- PEBS 给出的是**线性地址**，内核层做页粒度分析需要虚拟→物理转换，用户态做
-  则需要先拿到进程地址空间映射（`/proc/<pid>/maps` + pagemap）。
+- PEBS 给出的是**线性地址**。当前 Hermit 直接按虚拟 2 MiB region 聚合，不做
+  物理页转换；若要按物理 folio 分析，则需要 `/proc/<pid>/pagemap` 或内核页表
+  转换，并处理进程生命周期。
 - 采样率很低（例如 1/100000），单页样本可能稀疏，需要足够长采集窗口或对
   区域（folio）聚合，不能期望逐页精确计数。
 - 多进程/多线程环境下要按 tid 归属样本，且注意 KPTI / 内核态样本归属。

@@ -8,7 +8,7 @@
 > `mm/htmm_sampler.c`、`mm/htmm_core.c`、`mm/htmm_migrater.c` 与
 > `include/linux/htmm.h`。
 >
-> 本文与 [pebs-analysis.md](../pebs/pebs-analysis.md) 配套：那篇讲 PEBS 机制本身，
+> 本文与 [PEBS 背景](../pebs/background.md) 配套：那篇讲 PEBS 机制本身，
 > 这篇讲一个把它落地到内存分层的完整实例，并讨论它对本项目（Hermit / RDMA
 > swap）的借鉴意义。
 
@@ -56,7 +56,7 @@ CXL 模拟的远端 DRAM）。它要解决两个问题：
 关键设计：**用 LLC load miss 且带 `0x1d3/0x2d3/0x80d1` 这类数据来源区分的事件，
 直接区分「这次 load 的数据来自 DRAM / NVM / 远端」**。也就是说 MEMTIS 不靠
 事后推断，而是让硬件在采样时就把命中层级写进 Data Source 字段。这也正是
-`pebs-analysis.md` §3.3 里 `mem_lvl` 的 `Local RAM` / `Remote RAM` 语义的内核级
+`background.md` §3.3 里 `mem_lvl` 的 `Local RAM` / `Remote RAM` 语义的内核级
 用法。
 
 每个样本只取三个字段（`htmm_sampler.c` 的 `htmm_event`）：
@@ -284,7 +284,7 @@ nr_split *= htmm_gamma; nr_split /= 10;             /* × 缩放因子 0.4 */
 
 ## 8. 与 PEBS 文档的衔接
 
-MEMTIS 是 `pebs-analysis.md` §6 设想的**现成实现**，对应关系：
+MEMTIS 是 `background.md` §6 设想的**现成实现**，对应关系：
 
 | PEBS 文档的概念 | MEMTIS 的实现 |
 | --- | --- |
@@ -294,7 +294,7 @@ MEMTIS 是 `pebs-analysis.md` §6 设想的**现成实现**，对应关系：
 | 低开销采样 | 自适应采样周期（质数表 + CPU 软配额） |
 | 指导「大页 vs 小页」 | §5 的 skewness → 拆分判定 |
 
-这印证了 `pebs-analysis.md` 的核心判断：**PEBS 的价值不止「热不热」，而是
+这印证了 `background.md` 的核心判断：**PEBS 的价值不止「热不热」，而是
 「访问频率 + 命中层级」，足以支撑页面粒度的放置决策**。
 
 ## 9. 对 Hermit / RDMA swap 的借鉴
@@ -314,7 +314,7 @@ MEMTIS 与 Hermit 是两种机制（NUMA 迁移 vs swap），但「传输/放置
 
 1. **用 PEBS DLA 在线测 `f`**：当前 page-sweep 靠离线 `read_amp` / `large_load_%`
    估算读放大，改用 PEBS 采样可对每个 folio 直接统计「被访问子页比例」，把
-   倒 U 拐点从事后拟合变成在线可观测（详见 `pebs-analysis.md` §6.3）。
+   倒 U 拐点从事后拟合变成在线可观测（详见 `background.md` §6.3）。
 2. **把 `remote_order_mask` 从「全局位图」变成「按热度选择」**：对访问均匀
    （skewness 低、`f≈1`）的 extent 用大 order，对访问稀疏的用 4 KiB，正是
    MEMTIS「整页 vs 拆分」的 swap 版。
@@ -350,4 +350,4 @@ MEMTIS 与 Hermit 是两种机制（NUMA 迁移 vs swap），但「传输/放置
   - `linux/mm/htmm_core.c` —— 页面分类 / 冷却 / 阈值自适应 / 拆分判定
   - `linux/mm/htmm_migrater.c` —— 降级 / 提升迁移
   - `linux/include/linux/htmm.h` —— 事件码、周期表、延迟常量
-- 本项目配套：[pebs-analysis.md](../pebs/pebs-analysis.md)（PEBS 原理与用法）
+- 本项目配套：[PEBS 背景](../pebs/background.md)（PEBS 原理与用法）

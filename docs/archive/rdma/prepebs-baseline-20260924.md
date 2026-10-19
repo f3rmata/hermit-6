@@ -12,7 +12,7 @@
 `/home/xwz/hermit-baselines/20260924-prepebs-memcached-continuation`。
 
 默认配置的 Memcached 结果用于稳定性记录。另按
-[历史 70% hard-limit 配置](../migration-6.18.md#memcg-reclaim)补测
+[历史 70% hard-limit 配置](../../migration-6.18.md#memcg-reclaim)补测
 `reclaim_mode=1`、`reclaim_headroom_pages=65536`、`sthd_cnt=16`，
 其余负载参数不变，结果单独保存为 `20260924-prepebs-memcached-tuned`。
 推荐配置于 19:57:08 启动；4–64 KiB 的 36 个样本完整通过，随后跳板 SSH 连接
@@ -241,13 +241,13 @@ srcversion 与测试前一致，全部执行脚本快照校验通过。旧版 rs
 `state/recovery.json` 记录恢复来源；这是本地补存证据，不伪装成原运行成功清理。
 各原始运行的 driver.sh／source 快照用于追溯当时实际执行版本。
 
-[汇总图](../../tools/rdma/results/baselines/20260924-prepebs-full/baseline.png) ·
-[PDF](../../tools/rdma/results/baselines/20260924-prepebs-full/baseline.pdf) ·
-[聚合 CSV](../../tools/rdma/results/baselines/20260924-prepebs-full/aggregate.csv) ·
-[验收 JSON](../../tools/rdma/results/baselines/20260924-prepebs-full/validation.json) ·
-[Memcached folio 与 OOM 核验](../../tools/rdma/results/baselines/20260924-prepebs-full/memcached-tuned-audit.json) ·
-[环境恢复记录](../../tools/rdma/results/baselines/20260924-prepebs-full/state/final-audit.txt) ·
-[完整归档](../../tools/rdma/results/baselines/prepebs-baseline-20260924.tar.gz)
+[汇总图](../../../tools/rdma/results/baselines/20260924-prepebs-full/baseline.png) ·
+[PDF](../../../tools/rdma/results/baselines/20260924-prepebs-full/baseline.pdf) ·
+[聚合 CSV](../../../tools/rdma/results/baselines/20260924-prepebs-full/aggregate.csv) ·
+[验收 JSON](../../../tools/rdma/results/baselines/20260924-prepebs-full/validation.json) ·
+[Memcached folio 与 OOM 核验](../../../tools/rdma/results/baselines/20260924-prepebs-full/memcached-tuned-audit.json) ·
+[环境恢复记录](../../../tools/rdma/results/baselines/20260924-prepebs-full/state/final-audit.txt) ·
+[完整归档](../../../tools/rdma/results/baselines/prepebs-baseline-20260924.tar.gz)
 
 从项目根目录重新生成统计和图表：
 

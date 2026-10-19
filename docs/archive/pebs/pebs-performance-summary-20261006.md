@@ -5,7 +5,7 @@
 
 > 对 `docs/pebs/pebs-performance-20261006.md` 同一份数据的重析与重排，聚焦四个问题：
 > ① PEBS 开/关的吞吐、② 不同采样频率的影响、③ 纯采样开销、④ 优化策略的收益。
-> 数值全部取自 [SUMMARY.md](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md) 与各阶段 `summary.csv`，
+> 数值全部取自 [SUMMARY.md](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md) 与各阶段 `summary.csv`，
 > 中位数为点估计、方括号为 5 次重复的 min–max（不是置信区间）。
 
 ## 0. 先看结论
@@ -61,7 +61,7 @@
 换言之：PEBS 采样单独看是 −6%，但它为策略提供的信息把吞吐拉高了 +124%（相对 off）、
 +136%（相对 static），净效果远大于采样成本本身。
 
-![不限速吞吐](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig1-throughput.png)
+![不限速吞吐](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig1-throughput.png)
 
 ---
 
@@ -107,7 +107,7 @@ CPU（+0.52%～+0.79%）和尾延迟（+6.0%～+7.3%，绝对增量 1.3–1.6 µ
 > 结论：选采样频率的判据不是“哪个开销更低”（三档开销都 <1%），而是“哪个能给策略足够覆盖”。
 > low 不足以支撑策略；medium/high/adaptive 都能支撑。就本次负载，high 在压力场景尾延迟最稳（read p99 612 µs）。
 
-![采样率与 RDMA 读流量](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig3-frequency.png)
+![采样率与 RDMA 读流量](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig3-frequency.png)
 
 > low/medium/high/adaptive 背后的采样周期实现（周期表、固定档覆盖、2 秒自适应窗口）见文末「附录 8」。
 
@@ -128,7 +128,7 @@ CPU（+0.52%～+0.79%）和尾延迟（+6.0%～+7.3%，绝对增量 1.3–1.6 µ
 CPU 开销 **0.5%–0.8%**，尾延迟绝对增量 **1.3–1.6 µs**。这是 PEBS 硬件采样 + ring 消费 +
 region 维护的总成本，采样线程 CPU 只是其中一部分。
 
-![纯采样开销](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig2-overhead.png)
+![纯采样开销](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig2-overhead.png)
 
 ### 4.2 换页压力（pressure，固定 30000 QPS）
 
@@ -200,10 +200,10 @@ medium 的 +136% 吞吐不能直接套用到 high 的配置上，high 的饱和�
 
 ## 7. 数据与复现
 
-- 完整数据与配对统计：[SUMMARY.md](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md)
+- 完整数据与配对统计：[SUMMARY.md](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md)
 - 原始 CSV：`pressure/resident/saturation/summary.csv`（同目录下）
-- 采样频率快照：[sampling-frequencies.csv](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-frequencies.csv)
-- 本文图表脚本：[tools/rdma/pebs/plot_pebs_clean.py](../../tools/rdma/pebs/plot_pebs_clean.py)
+- 采样频率快照：[sampling-frequencies.csv](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/sampling-frequencies.csv)
+- 本文图表脚本：[tools/rdma/pebs/plot_pebs_clean.py](../../../tools/rdma/pebs/plot_pebs_clean.py)
 - 完整原始记录（含全部 caveat 与验收细节）：[pebs-performance-20261006.md](pebs-performance-20261006.md)
 
 ---

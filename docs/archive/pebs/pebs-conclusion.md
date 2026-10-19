@@ -21,9 +21,9 @@
 的成本很小：无换页时整机 CPU/请求只多 0.5%–0.8%，读尾延迟绝对增量 1.3–1.6 µs。
 换页饱和负载下，纯采样让 memcached 吞吐从 63.4k 掉到 59.5k QPS，约 −6%。
 
-![纯采样开销](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig2-overhead.png)
+![纯采样开销](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig2-overhead.png)
 
-![pressure 满载吞吐对比（所有配置）](../../tools/rdma/results/pebs/20261011-185459-pressure-fixed-load/pressure/measurement/fig-pressure-qps.png)
+![pressure 满载吞吐对比（所有配置）](../../../tools/rdma/results/pebs/20261011-185459-pressure-fixed-load/pressure/measurement/fig-pressure-qps.png)
 
 ### 采样频率影响
 
@@ -34,7 +34,7 @@
 下图中横轴是实际采样率、纵轴是 RDMA 读流量（绝对值，越低越好）：
 adaptive 的采样率是 high 的 8 倍多（~12800 vs ~1500/s），但读流量没有进一步下降，说明**收益达到覆盖阈值后即饱和，不随采样率线性增长**。
 
-![采样率与 RDMA 读流量](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig3-frequency.png)
+![采样率与 RDMA 读流量](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig3-frequency.png)
 
 <!-- ### 为什么提高频率几乎不影响性能 -->
 
@@ -66,16 +66,16 @@ adaptive 的采样率是 high 的 8 倍多（~12800 vs ~1500/s），但读流量
 策略相对纯静态 off 是 **+124%**（相对同频 static 是 +136%，相对只允许 4 KiB 的原始设置是
 +223%），同时 read p99 减半、单位请求 CPU 降 ~58%、RDMA 读流量降 ~92%。收益来自于策略按访问密度选定合适的传输粒度。
 
-![不同策略下 4 KiB 与 64 KiB 读取字节占比](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig-wr-size.png)
+![不同策略下 4 KiB 与 64 KiB 读取字节占比](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig-wr-size.png)
 
 <!-- 上面是“传输 WR 粒度”（large_wr_read_pct）。下面这张是“实际分配的 folio 大小” -->
 <!-- （换入侧 large_load_pct）。关键差别在 off-original：它的 folio 仍分配 64 KiB（~98%）， -->
 <!-- 只是 remote_order_mask=0x1 把传输切成 4 KiB 基页——所以它慢在“传输粒度”，不是“分配粒度”。 -->
 <!-- policy（尤其 high/adaptive）则连换入的 folio 分配本身都缩到 4 KiB（大 folio 占比降到 ~11%）。 -->
 
-<!-- ![不同策略下实际分配的 folio 大小对比](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig-folio-size.png) -->
+<!-- ![不同策略下实际分配的 folio 大小对比](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig-folio-size.png) -->
 
-![memcached 不限速吞吐](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig1-throughput.png)
+![memcached 不限速吞吐](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/fig1-throughput.png)
 
 ## 流式负载上策略优化不明显
 
@@ -83,11 +83,11 @@ adaptive 的采样率是 high 的 8 倍多（~12800 vs ~1500/s），但读流量
 XGBoost，共 1323 个样本）：所有配置的吞吐都贴着 1.0（下图为相对 off 的
 归一化吞吐，各负载 × 各配置都在 ±3.5% 以内），策略没有降低读放大。
 
-![逐负载吞吐对比（归一化）](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig4-throughput-normalized.png)
+![逐负载吞吐对比（归一化）](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig4-throughput-normalized.png)
 
 逐页档的绝对吞吐曲线中：off、static-199、policy-199 三条线几乎重合。
 
-![逐负载吞吐 vs 页档](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig5-throughput-pagesize.png)
+![逐负载吞吐 vs 页档](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/fig5-throughput-pagesize.png)
 
 根因是**访问模式**：这四类负载都是一次性/流式顺序访问，每个 region 只碰一次。PEBS 样本
 在访问时才会产生，swap-in 决策时没有"上一次访问"的样本可用，
@@ -95,9 +95,9 @@ XGBoost，共 1323 个样本）：所有配置的吞吐都贴着 1.0（下图为
 
 <!-- ## 数据与图表 -->
 
-<!-- - memcached 三阶段（2026-10-06）：[完整统计](../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md) · -->
+<!-- - memcached 三阶段（2026-10-06）：[完整统计](../../../tools/rdma/results/pebs/20261006/pebs-campaign-20261006/SUMMARY.md) · -->
 <!--   [简明重析](pebs-performance-summary-20261006.md) -->
 <!-- - 全负载扫描（2026-10-07）：[验收与结论](pebs-workloads-summary-20261007.md) · -->
-<!--   [aggregate.csv](../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/aggregate.csv) -->
-<!-- - 图表脚本：[plot_pebs_clean.py](../../tools/rdma/pebs/plot_pebs_clean.py) · -->
-<!--   [plot_pebs_workloads.py](../../tools/rdma/pebs/plot_pebs_workloads.py) -->
+<!--   [aggregate.csv](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/aggregate.csv) -->
+<!-- - 图表脚本：[plot_pebs_clean.py](../../../tools/rdma/pebs/plot_pebs_clean.py) · -->
+<!--   [plot_pebs_workloads.py](../../../tools/rdma/pebs/plot_pebs_workloads.py) -->

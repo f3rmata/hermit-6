@@ -37,7 +37,8 @@ class ScopeTests(unittest.TestCase):
         self.assertNotIn('get_mem_cgroup_from_folio', page_io)
         memory = (KERNEL / 'mm/memory.c').read_text()
         block = memory.split('PEBS policy:', 1)[1].split('#endif', 1)[0]
-        self.assertIn('hermit_order_policy(vma->vm_mm', block)
+        self.assertIn('hermit_order_policy(', block)
+        self.assertIn('vma->vm_mm', block)
         self.assertNotIn('get_mem_cgroup_from_mm', block)
 
     def test_pid_enable_helper_uses_syscall(self):

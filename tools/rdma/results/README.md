@@ -7,19 +7,24 @@
 | `pebs/20261007-233523-workloads/` | 1323 个多负载矩阵样本；`analysis/` 保存可复现统计及 PNG/PDF 图表 |
 | `pebs/20261007-223941-workloads/` | 独立的 3 样本前置检查，不混入完整矩阵 |
 | `pebs/20261006/` | PEBS 采样修复、预检和 91 条正式测量 |
+| `pebs/20261011-185459-pressure-fixed-load/` | Memcached pressure 固定并发对照 |
+| `pebs/20261011-214215-memcached-natural-pages/` | 自然页分配校准与 resident |
+| `pebs/20261012-131002-natural-pages-pressure-c32/` | 自然页分配 pressure |
+| `pebs/20261012-150657-thp-all/` | 全 THP/mTHP resident |
+| `pebs/20261012-170017-thp-all-pressure/` | 全 THP/mTHP pressure |
 | `baselines/` | 2026-09-24 添加 PEBS 前的多负载基线及续跑 |
 | `builds/` | 内核构建、安装、验收日志及当时的产物校验和 |
 | `dnet-61/` 及已有 CSV | 早期 Memcached、匿名内存、Redis、XGBoost 等实测结果 |
 
-[前 PEBS 基线报告](../../../docs/rdma/prepebs-baseline-20260924.md) · [历史页大小实验](../../../docs/rdma/dnet61-memcached-page-sweep-20260808.md)
+[前 PEBS 基线报告](../../../docs/archive/rdma/prepebs-baseline-20260924.md) · [历史页大小实验](../../../docs/archive/rdma/dnet61-memcached-page-sweep-20260808.md)
 
-[2026-10-08 多负载评估](../../../docs/pebs/pebs-workloads-20261008.md) · [多负载审计](pebs/20261007-233523-workloads/analysis/audit.json)
+[PEBS 评估](../../../docs/pebs/evaluation.md) · [实验手册](../../../docs/pebs/runbook.md) · [多负载审计](pebs/20261007-233523-workloads/analysis/audit.json)
 
 ## PEBS 2026-10-06
 
 修复版 `6.18.38-hermit-pebs #9` 在 dnet-61 的测试结果，按日期保存在 `pebs/20261006/`。
 
-- [性能评估报告](../../../docs/pebs/pebs-performance-20261006.md)
+- [PEBS 评估](../../../docs/pebs/evaluation.md)
 - [三阶段统计](pebs/20261006/pebs-campaign-20261006/SUMMARY.md)：pressure 50、resident 21、saturation 20，共 91 条有效正式测量。
 - [性能总览图](pebs/20261006/pebs-campaign-20261006/overview.png) · [采样频率图](pebs/20261006/pebs-campaign-20261006/sampling-cost.png)
 - [完整归档](pebs/20261006/pebs-performance-20261006.tar.gz) · [归档 SHA256](pebs/20261006/pebs-performance-20261006.tar.gz.sha256)
