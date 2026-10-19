@@ -12,4 +12,4 @@
 | `dnet61-memcached-page-sweep-20260808.md` | 2026-08 的 Memcached/Redis 页大小 sweep |
 | `prepebs-baseline-20260924.md` | 添加 PEBS 前的多负载 baseline |
 
-这些结果保留了当时的机器、内核和 cgroup 配置；当前内核与 PEBS 实现已经变化，跨轮比较前需要重新核对基线。
+这些结果保留了当时的机器、内核和 cgroup 配置；当前内核与 PEBS 实现已经变化，跨轮比较前需要重新核对基线。报告中的图片位于本目录的 `assets/` 下，相对链接已按该位置更新。

@@ -164,20 +164,20 @@ Memcached 0–7 核、Mutilate 8–15 核、每档负载重复 3 次取中位数
 |   1 MiB |              943.1 |                       6.8 |                      670.1 |
 |   2 MiB |              938.5 |                       5.7 |                      679.2 |
 
-![swap-in 修复后不同页大小的峰值吞吐](../../assets/dnet61-memcached-page-sweep-20260812/memcached-peak-throughput.png)
+![swap-in 修复后不同页大小的峰值吞吐](assets/dnet61-memcached-page-sweep-20260812/memcached-peak-throughput.png)
 
 local 峰值稳定在 937.5–945.5 KQPS；cgroup-local 只有 4.1–6.9 KQPS，处于严重 thrashing。
 cgroup-Hermit 为 186.3–685.4 KQPS，并呈明显 U 形：64–256 KiB 实际大量换入高阶 folio，随机小对象只消费其中少数子页，导致 swap-in 读放大；同时 swap-out 若按完整 folio 传输也会产生写放大。1–2 MiB 组则主要退化为 4 KiB load，因此其高吞吐不能当作 1–2 MiB 协议收益。
 
 > 目前Linux内核还没有为2MiB的大页做swapin的单独路径优化，所以测试时所有2MiB的大页都会被拆分成4KiB的小页，导致退化
 
-![500 KQPS offered load 下的 read p99](../../assets/dnet61-memcached-page-sweep-20260812/memcached-read-p99-500k.png)
+![500 KQPS offered load 下的 read p99](assets/dnet61-memcached-page-sweep-20260812/memcached-read-p99-500k.png)
 
-![memcached 实际高阶 RDMA load 字节占比](../../assets/dnet61-memcached-page-sweep-20260812/memcached-high-order-load-share.png)
+![memcached 实际高阶 RDMA load 字节占比](assets/dnet61-memcached-page-sweep-20260812/memcached-high-order-load-share.png)
 
 逐 order 前后快照表明，16–256 KiB 的目标 order load 字节占比为84.2%–98.1%；512 KiB 降至 20.4%，1 MiB 仅 0.15%，2 MiB 为 0%。因此本轮memcached在随机访问模式没有表现出协议性能收益；更适合用顺序或空间局部性更强的匿名内存 workload 衡量大 WR 收益。
 
-<!-- ![专项 mTHP swap-in 修复前后对比](../../assets/dnet61-memcached-page-sweep-20260812/mthp-swapin-before-after.png)
+<!-- ![专项 mTHP swap-in 修复前后对比](assets/dnet61-memcached-page-sweep-20260812/mthp-swapin-before-after.png)
 
 专项测试顺序换入固定 512 MiB 匿名区域。修复前所有配置均退化成 131072 次4 KiB load；修复后 16 KiB–1 MiB 均完全使用目标 order，耗时由约0.69–0.74 s 降至 0.091–0.296 s，提升 2.47–7.68 倍。 -->
 
@@ -186,7 +186,7 @@ cgroup-Hermit 为 186.3–685.4 KQPS，并呈明显 U 形：64–256 KiB 实际�
 用mmap分配匿名内存，再按指定mTHP大小分配并顺序写入内存。
 再把专用 cgroup 的 `memory.max` 从 `max` 降至 11468 MiB，每轮通过 RDMA 换出约5 GiB；换出稳定后将上限恢复为 `max`，顺序扫描完整映射触发 swap-in，记录时间和吞吐数据。
 
-![顺序匿名内存大页 RDMA swap-out 和 swap-in](../../assets/dnet61-anon-swapio-20260813/anon-swapio-throughput-by-page.png)
+![顺序匿名内存大页 RDMA swap-out 和 swap-in](assets/dnet61-anon-swapio-20260813/anon-swapio-throughput-by-page.png)
 
 表中采用 3 次测试的中位数。swap-in 吞吐以实际远端读回字节为分子，以顺序扫描完整 16 GiB 映射的时间为分母：
 
@@ -312,7 +312,7 @@ Memcached的测试时吞吐随页面大小提升而下降
 - random + high locality
 - random + low locality
 
-![Sparse/Random 匿名内存传输收益与读放大](../../assets/dnet61-anon-sparse-20260820/anon-sparse-benefit-summary.png)
+![Sparse/Random 匿名内存传输收益与读放大](assets/dnet61-anon-sparse-20260820/anon-sparse-benefit-summary.png)
 
 ### 结果分析
 
