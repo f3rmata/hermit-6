@@ -27,7 +27,7 @@
 | --- | --- |
 | `tools/rdma/xgboost_train.py` | 信号驱动的 XGBoost worker |
 | `tools/rdma/run_xgboost_page_sweep.sh` | Hermit 大页 page-size sweep |
-| `tools/rdma/run_xgboost_native_sweep.sh` | 原生 local swap / 无 swap 基线 |
+| `tools/rdma/baseline/run_xgboost_native_sweep.sh` | 原生 local swap / 无 swap 基线 |
 
 ## 3. 依赖
 
@@ -95,11 +95,11 @@ unzip tools/rdma/data/HIGGS.zip -d tools/rdma/data
 cd tools/rdma
 
 # 无限内存的理想本地基线
-MODE=local WORKSET_MB=16384 ./run_xgboost_native_sweep.sh
+MODE=local WORKSET_MB=16384 ./baseline/run_xgboost_native_sweep.sh
 
 # cgroup + 本地 swap 基线
 MODE=cgroup-linux WORKSET_MB=16384 LOCAL_RATIO_PCT=70 \
-  ./run_xgboost_native_sweep.sh
+  ./baseline/run_xgboost_native_sweep.sh
 ```
 
 原生脚本使用同一个 worker 和 THP page-size sweep，但不接触 Hermit

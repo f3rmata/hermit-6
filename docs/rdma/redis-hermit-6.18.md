@@ -35,7 +35,7 @@ swap-out 的主体因此是 Redis 的 value、字典和 allocator 元数据。
 | --- | --- |
 | `tools/rdma/redis_bench.py` | 信号驱动的 Redis 大 value 加载/扫描 harness（纯 stdlib，无需 redis Python 包） |
 | `tools/rdma/run_redis_page_sweep.sh` | Hermit 大页 page-size sweep |
-| `tools/rdma/run_redis_native_sweep.sh` | 原生 local swap / 无 swap 基线 |
+| `tools/rdma/baseline/run_redis_native_sweep.sh` | 原生 local swap / 无 swap 基线 |
 
 ## 3. 依赖
 
@@ -120,11 +120,11 @@ python3 tools/rdma/plots/plot_redis_swapio.py \
 cd ~/hermit-6/tools/rdma
 
 # 无限内存的理想本地基线
-MODE=local REDIS_WORKSET_MB=16384 ./run_redis_native_sweep.sh
+MODE=local REDIS_WORKSET_MB=16384 ./baseline/run_redis_native_sweep.sh
 
 # cgroup + 本地 swap 基线
 MODE=cgroup-linux REDIS_WORKSET_MB=16384 LOCAL_RATIO_PCT=70 \
-  ./run_redis_native_sweep.sh
+  ./baseline/run_redis_native_sweep.sh
 ```
 
 ## 6. 指标

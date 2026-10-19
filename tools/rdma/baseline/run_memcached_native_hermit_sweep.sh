@@ -2,14 +2,14 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
 usage() {
   cat <<'USAGE'
 usage:
-  RSWAP_SERVER_IP=172.16.0.58 ./run_memcached_native_hermit_sweep.sh
+  RSWAP_SERVER_IP=172.16.0.58 ./baseline/run_memcached_native_hermit_sweep.sh
 
 Run a strict two-phase page-size comparison:
   1. native local and local-cgroup with rswap_client unloaded;

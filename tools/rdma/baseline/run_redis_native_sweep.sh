@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 requested_mode=${MODE-}
 requested_run_id=${RUN_ID-}
 requested_result_dir=${RESULT_DIR-}
@@ -12,8 +12,8 @@ source "$SCRIPT_DIR/common.sh"
 usage() {
   cat <<'USAGE'
 usage:
-  MODE=local ./run_redis_native_sweep.sh
-  MODE=cgroup-linux LOCAL_RATIO_PCT=70 ./run_redis_native_sweep.sh
+  MODE=local ./baseline/run_redis_native_sweep.sh
+  MODE=cgroup-linux LOCAL_RATIO_PCT=70 ./baseline/run_redis_native_sweep.sh
 
 Native local / local-swap Redis large-value page-size baseline. The script
 uses the same Redis server and Python harness as the Hermit sweep, but never
@@ -67,9 +67,7 @@ esac
 PAGE_SIZES_KB=${PAGE_SIZES_KB:-"4 16 32 64 128 256 512 1024 2048"}
 REDIS_WORKSET_MB=${REDIS_WORKSET_MB:-16384}
 REDIS_VALUE_SIZE=${REDIS_VALUE_SIZE:-2097152}
-if [ -n "${REDIS_SCAN_CHUNK:-}" ]; then
-  REDIS_SCAN_CHUNK=${REDIS_SCAN_CHUNK}
-else
+if [ -z "${REDIS_SCAN_CHUNK:-}" ]; then
   if [ "$REDIS_VALUE_SIZE" -ge 65536 ]; then
     REDIS_SCAN_CHUNK=65536
   else

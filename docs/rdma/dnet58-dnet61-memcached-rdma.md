@@ -591,7 +591,7 @@ tools/rdma/run_memcached_page_sweep.sh
 - `<size>/<mode>/page-state-before.txt`、`page-state-after.txt`：实际 THP/mTHP 统计、
   `AnonHugePages` 和 Hermit `order_stats` 快照。
 
-该脚本及 `run_memcached_compare.sh` 都用 `EXIT/INT/TERM` trap 停止本次启动的
+该脚本及 `baseline/run_memcached_compare.sh` 都用 `EXIT/INT/TERM` trap 停止本次启动的
 memcached，因此正常结束、错误和 Ctrl-C 不会遗留本次 PID 或端口。对旧版本遗留
 进程，先确认监听者再按其 PID 停止，避免误杀其他服务：
 
@@ -603,7 +603,7 @@ sudo kill <确认属于-memcached-的PID>
 ### 6.5 自动完成 native 与 Hermit 两阶段对比
 
 若 `local` / `local-cgroup` 需要作为严格 native-swap 基线，使用
-`run_memcached_native_hermit_sweep.sh`。它先执行所有页大小的 native 两组，随后
+`baseline/run_memcached_native_hermit_sweep.sh`。它先执行所有页大小的 native 两组，随后
 通过 `manage_rswap_client.sh install` 安装 RDMA client，再执行所有页大小的
 `hermit-cgroup` 组。模块只切换一次，而不是每个页大小切换一次。
 
@@ -622,7 +622,7 @@ export RECLAIM_HEADROOM_PAGES=131072
 
 # 测试结束后保留 Hermit client；改为 unload 则会 swapoff、卸载模块并重新启用本地 swap。
 export FINAL_ACTION=leave-hermit
-tools/rdma/run_memcached_native_hermit_sweep.sh
+tools/rdma/baseline/run_memcached_native_hermit_sweep.sh
 ```
 
 > **页大小限制**：`/swapfile` 是 swap 文件（`S_ISREG`），内核 swap 槽位分配器
@@ -639,7 +639,7 @@ tools/rdma/run_memcached_native_hermit_sweep.sh
 > export RSWAP_SWAP_DEV=/dev/loopN   # 上一步打印的设备
 > ```
 >
-> 之后再运行 `run_memcached_native_hermit_sweep.sh`。`get_swap_stats` 的签名已
+> 之后再运行 `baseline/run_memcached_native_hermit_sweep.sh`。`get_swap_stats` 的签名已
 > 从 `int*` 改为 `long*`。
 
 该脚本会在开始前先 `swapoff` 当前 swapfile 并卸载 `rswap_client`，所以确保没有

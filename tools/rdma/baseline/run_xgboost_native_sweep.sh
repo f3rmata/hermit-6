@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 requested_mode=${MODE-}
 requested_run_id=${RUN_ID-}
 requested_result_dir=${RESULT_DIR-}
@@ -12,8 +12,8 @@ source "$SCRIPT_DIR/common.sh"
 usage() {
   cat <<'USAGE'
 usage:
-  MODE=local ./run_xgboost_native_sweep.sh
-  MODE=cgroup-linux LOCAL_RATIO_PCT=70 ./run_xgboost_native_sweep.sh
+  MODE=local ./baseline/run_xgboost_native_sweep.sh
+  MODE=cgroup-linux LOCAL_RATIO_PCT=70 ./baseline/run_xgboost_native_sweep.sh
 
 Native local / local-swap XGBoost page-size baseline. The script uses the
 same signal-driven XGBoost worker and THP page-size sweep as the Hermit
@@ -317,10 +317,8 @@ for kb in $PAGE_SIZES_KB; do
 
     pswpin_before=$(read_vmstat_key pswpin)
     train_pswpout_before=$(read_vmstat_key pswpout)
-    train_start_ns=$(date +%s%N)
     kill -USR2 "$current_pid"
     wait_for_log '^TRAIN ' "$log" "$TRAIN_TIMEOUT_SEC" 1
-    train_end_ns=$(date +%s%N)
     pswpin_after=$(read_vmstat_key pswpin)
     train_pswpout_after=$(read_vmstat_key pswpout)
     if [ "$MODE" = cgroup-linux ]; then

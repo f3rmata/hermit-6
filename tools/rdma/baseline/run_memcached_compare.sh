@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
@@ -15,8 +15,8 @@ This runs the selected modes on the currently booted kernel. To compare
 Hermit 5.14 and Hermit 6.6, run it once after booting each kernel and set
 KERNEL_TAG explicitly if auto-detection is not enough:
 
-  KERNEL_TAG=hermit-5 MODES="local cgroup-linux cgroup-hermit" ./run_memcached_compare.sh
-  KERNEL_TAG=hermit-6 MODES="local cgroup-linux cgroup-hermit" ./run_memcached_compare.sh
+  KERNEL_TAG=hermit-5 MODES="local cgroup-linux cgroup-hermit" ./baseline/run_memcached_compare.sh
+  KERNEL_TAG=hermit-6 MODES="local cgroup-linux cgroup-hermit" ./baseline/run_memcached_compare.sh
 
 Important environment:
   MODES="local cgroup-linux cgroup-hermit"

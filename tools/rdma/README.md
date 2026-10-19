@@ -4,11 +4,11 @@
 
 | 位置 | 用途 |
 |---|---|
-| 根目录 `run_*.sh`、`memcached*.sh` | 通用匿名内存、Memcached、Redis、XGBoost、YCSB 基准入口，保留已有调用路径 |
+| 根目录 `run_*.sh`、`memcached*.sh` | Hermit page sweep 入口（anon/memcached/redis/xgboost/ycsb）与 Memcached 控制/负载脚本 |
 | `common.sh`、`create_cgroup.sh` | 共享配置、结果根目录与 cgroup 支持 |
 | `anon_seq_workset.c`、`redis_bench.py`、`xgboost_train.py` | 负载程序，供基准脚本调用 |
 | [pebs/](pebs/) | PEBS 开关、频率矩阵与正式结果汇总 |
-| [baseline/](baseline/) | 添加 PEBS 前的基线运行、续跑、恢复检查及分析 |
+| [baseline/](baseline/) | native local/cgroup-linux sweep、PEBS 前基线、续跑与恢复检查 |
 | [plots/](plots/) | 其他基准的离线绘图与分析，通常从参数读取 CSV |
 | [tests/](tests/) | 无需 RDMA 服务器的源码回归测试 |
 | [notebooks/](notebooks/) | 历史 Memcached 交互分析 |
