@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize a completed baseline-matched workload matrix without changing raw data."""
+"""Summarize a completed workload matrix, retaining its memory-budget protocol."""
 import argparse
 import collections
 import csv
@@ -23,10 +23,13 @@ def main():
     args = parser.parse_args()
     root = args.run
     plan = json.loads((root/'plan.json').read_text())
+    memory_policy = plan.get('memory_policy', 'released-max-v1')
     completion = json.loads((root/'completion.json').read_text())
     rows = []
     for directory in sorted(root.glob('[0-9]*')):
         case = json.loads((directory/'case.json').read_text())
+        if case.get('memory_policy', 'released-max-v1') != memory_policy:
+            raise ValueError(f'Mixed memory-budget protocols: {directory}')
         status = json.loads((directory/'status.json').read_text())
         with next((directory/'results').glob('*summary.csv')).open() as f:
             records = list(csv.DictReader(f))
@@ -39,6 +42,7 @@ def main():
         def decisions(state):
             return sum(int(v) for v in re.findall(r'^\s*\d+:\s*(\d+)',state['controls']['pebs_order_stats'],re.M))
         rows.append(dict(suite=case['suite'],page_kb=case['page_kb'],case=case['case'],repeat=case['repeat'],
+            memory_policy=memory_policy,
             metric=metric,seconds=float(record[metric]),large_load_pct=float(record['large_load_pct']),
             load_bytes=float(record['total_load_bytes']),store_bytes=float(record['total_store_bytes']),
             sampled=status['pebs_delta']['sampled'],lost=status['pebs_delta']['lost'],
@@ -56,7 +60,7 @@ def main():
     for (suite,page,case), group in sorted(groups.items()):
         off = groups[suite,page,'off']
         static = groups[suite,page,case.replace('policy-','static-')]
-        aggregate.append(dict(suite=suite,page_kb=page,case=case,n=len(group),
+        aggregate.append(dict(suite=suite,page_kb=page,case=case,n=len(group),memory_policy=memory_policy,
             median_sec=med(group),min_sec=min(r['seconds'] for r in group),max_sec=max(r['seconds'] for r in group),
             time_change_vs_off_pct=100*(med(group)/med(off)-1),
             time_change_vs_static_pct=100*(med(group)/med(static)-1),
@@ -64,7 +68,7 @@ def main():
             large_load_pct=med(group,'large_load_pct'),lost_cases=sum(r['lost']>0 for r in group),
             policy_decisions=sum(r['decisions'] for r in group)))
     write_csv(out/'aggregate.csv',aggregate)
-    audit=dict(samples=len(rows),groups=len(groups),restore_errors=completion['restore_errors'],
+    audit=dict(samples=len(rows),groups=len(groups),memory_policy=memory_policy,restore_errors=completion['restore_errors'],
         sampled=sum(r['sampled'] for r in rows),lost_counter_delta=sum(r['lost'] for r in rows),
         lost_cases=sum(r['lost']>0 for r in rows),throttled=sum(r['throttled'] for r in rows),
         perf_rates=sorted(set(r['perf_rate'] for r in rows)),perf_changed_cases=sum(r['perf_changed'] for r in rows))
@@ -72,7 +76,7 @@ def main():
     suites = list(dict.fromkeys(row['suite'] for row in rows))
     periods = list(dict.fromkeys(r['load_period'] for r in plan['plan'] if r['mode'] is not None))
     periods.sort(reverse=True)
-    lines=['| 负载 | 模式 | '+ ' | '.join(map(str,periods))+' |','|---|---|'+ '|'.join(['---:']*len(periods))+'|']
+    lines=[f'Memory policy: `{memory_policy}`', '', '| 负载 | 模式 | '+ ' | '.join(map(str,periods))+' |','|---|---|'+ '|'.join(['---:']*len(periods))+'|']
     for suite in suites:
         for mode in ('static','policy'):
             values=[statistics.median(r['time_change_vs_off_pct'] for r in aggregate if r['suite']==suite and r['case']==f'{mode}-{p}') for p in periods]
@@ -97,7 +101,7 @@ def main():
             for y in range(len(suites)):
                 for x in range(len(pages)): ax.text(x,y,f'{matrix[y,x]:+.1f}',ha='center',va='center',fontsize=7)
         fig.colorbar(im,ax=list(axes[0]),label='Time change vs off (%) / positive = slower',shrink=.8)
-        fig.suptitle(f'{mode}: median of 3 repetitions per cell; Redis/YCSB 2048 KiB actually use 4 KiB')
+        fig.suptitle(f'{mode}: {memory_policy}; median per cell (verify actual folio sizes)')
         for ext in ('png','pdf'):fig.savefig(out/f'{mode}-time-change.{ext}',dpi=180)
         plt.close(fig)
     fig,axes=plt.subplots(2,4,figsize=(16,8),layout='constrained')
@@ -108,7 +112,7 @@ def main():
             ax.errorbar(range(len(pages)),centers,yerr=[centers-np.array([r['min_sec'] for r in data]),np.array([r['max_sec'] for r in data])-centers],label=case,marker='.',capsize=2)
         ax.set_title(suite);ax.set_xticks(range(len(pages)),pages,rotation=60);ax.set_ylabel('Measured phase time (s)');ax.grid(alpha=.2)
     axes.flat[-1].axis('off');axes.flat[0].legend(fontsize=8)
-    fig.suptitle('Off / medium static / medium policy: median and min-max, n=3 (not confidence intervals)')
+    fig.suptitle(f'Off / medium static / medium policy: {memory_policy}; median and min-max (not confidence intervals)')
     for ext in ('png','pdf'):fig.savefig(out/f'phase-time.{ext}',dpi=180)
     plt.close(fig)
     print(json.dumps(audit,indent=2))

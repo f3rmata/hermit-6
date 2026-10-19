@@ -17,7 +17,7 @@ usage:
 
 YCSB page-size sweep under Hermit RDMA swap. For every requested THP page size
 the script starts a KV server (Redis or Memcached) in a cgroup, loads a YCSB
-dataset, lowers memory.max to force RDMA stores, restores memory.max, then runs
+dataset, lowers memory.max to force RDMA stores, keeps that fixed limit, then runs
 a read-only YCSB workload (default workloadc) and snapshots Hermit order_stats
 around the run to compute remote-load bytes, large-folio share, protocol
 bandwidth, throughput and latency percentiles.
@@ -535,9 +535,9 @@ for kb in $PAGE_SIZES_KB; do
     protocol_gib=$(awk -v b="$total_store_bytes" 'BEGIN { printf "%.6f", b/1073741824 }')
 
     # ----------------------------------------------------------------------
-    # Swap-in phase: restore memory.max, run YCSB read-only workload
+    # Swap-in phase: run YCSB read-only workload under the same hard budget.
     # ----------------------------------------------------------------------
-    sudo_write max "$CGROUP/memory.max"
+    snapshot_fixed_memory_budget "$CGROUP" "$run_dir" before-swapin "$((limit_mb * 1024 * 1024))"
     snapshot_order_stats > "$load_before"
     snapshot_benchmark_pebs "$load_before.pebs"
     pswpin_before=$(read_vmstat_key pswpin)
@@ -552,6 +552,7 @@ for kb in $PAGE_SIZES_KB; do
     bench_pswpout_after=$(read_vmstat_key pswpout)
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-after-swapin.txt"
     sudo_cat "$CGROUP/memory.events" > "$run_dir/memory-events-after-swapin.txt"
+    snapshot_fixed_memory_budget "$CGROUP" "$run_dir" after-swapin "$((limit_mb * 1024 * 1024))"
 
     run_time_ms=$(ycsb_parse_field "$run_log" OVERALL "RunTime(ms)")
     throughput_ops=$(ycsb_parse_field "$run_log" OVERALL "Throughput(ops/sec)")
@@ -609,8 +610,6 @@ for kb in $PAGE_SIZES_KB; do
     [ "$pswpin_delta" -gt 0 ] || rdma_die "YCSB run caused no swap-ins; see $run_dir"
     [[ "$total_load_bytes" =~ ^[0-9]+$ ]] && [ "$total_load_bytes" -gt 0 ] || \
       rdma_die "Hermit recorded no backend loads; see $run_dir"
-    [ "$bench_pswpout_delta" -eq 0 ] || \
-      rdma_die "YCSB run caused $bench_pswpout_delta new swap-outs; results are not isolated"
 
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$kb" "$order" "$repeat" "$BINDING" "$MODE" \

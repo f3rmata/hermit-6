@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Baseline-matched PEBS matrix. --dry-run never needs sudo or changes the host."""
+"""Fixed-memory-budget PEBS matrix. --dry-run needs no sudo or host changes."""
 import argparse
 import csv
 import fcntl
@@ -20,6 +20,7 @@ import time
 
 RDMA = Path(__file__).resolve().parents[1]
 DEBUG = Path('/sys/kernel/debug/hermit')
+MEMORY_POLICY = 'fixed-max-v1'
 SUITES = {
     'anon-1t-full': ('run_anon_swapout_sweep.sh', dict(BENCH_THREADS=1, BENCH_CPUS='0', ACCESS_RATIOS='100')),
     'anon-1t-chunk64k': ('run_anon_swapout_sweep.sh', dict(BENCH_THREADS=1, BENCH_CPUS='0', ACCESS_RATIOS='chunk64k')),
@@ -130,6 +131,23 @@ def validate_results(folder, row):
     record = records[0]
     if int(record['page_kb']) != row['page_kb']:
         issues.append('page size mismatch')
+    budgets = list(folder.rglob('memory-max-before-swapin.txt'))
+    if len(budgets) != 1:
+        issues.append('expected one fixed memory budget snapshot pair')
+    else:
+        budget_dir = budgets[0].parent
+        policy = budget_dir/'memory-policy.txt'
+        if not policy.exists() or policy.read_text().strip() != MEMORY_POLICY:
+            issues.append('missing or incorrect memory policy')
+        limit_mb = record.get('limit_mb', '')
+        if not limit_mb.isdigit() or int(limit_mb) <= 0:
+            issues.append('missing or invalid limit_mb')
+        else:
+            expected = str(int(limit_mb) * 1024 * 1024)
+            for phase in ('before-swapin', 'after-swapin'):
+                path = budget_dir/f'memory-max-{phase}.txt'
+                if not path.exists() or path.read_text().strip() != expected:
+                    issues.append(f'memory.max mismatch: {phase}, expected {expected}')
     for key, value in record.items():
         if ('errors' in key or key == 'checksum_errors') and float(value) != 0:
             issues.append(f'{key}={value}')
@@ -173,7 +191,8 @@ def main():
         if len(set(values)) != len(values): ap.error('duplicate selections are not allowed')
     rows, env = plan(args), environment(args)
     if args.dry_run:
-        print(json.dumps({'samples':len(rows), 'environment':env, 'plan':rows}, indent=2))
+        print(json.dumps({'samples':len(rows), 'memory_policy':MEMORY_POLICY,
+                          'environment':env, 'plan':rows}, indent=2))
         return
     if os.geteuid() == 0: ap.error('run as the benchmark user after sudo -v')
     if platform.machine() != 'x86_64' or 'hermit-pebs' not in platform.release():
@@ -222,7 +241,7 @@ def main():
         f.write('\nsudo() { command sudo -n "$@"; }\nhermit_stats_helper() { printf "%s\\n" "$PEBS_STATS_HELPER"; }\n')
     env['PEBS_STATS_HELPER'] = str(helper)
     save_json(args.output/'plan.json', {'samples':len(rows),'seed':args.seed,'environment':env,'plan':rows,
-        'baseline':'20260924-prepebs-full',
+        'workload_parameters_from':'20260924-prepebs-full', 'memory_policy':MEMORY_POLICY,
         'policy_tunables': {k:read(DEBUG/k) for k in ['pebs_fixed_cost_ns','pebs_bw_mibps','pebs_min_f','pebs_hysteresis','pebs_cooling_period','pebs_region_max']},
         'dataset': {'path':args.higgs,'size':Path(args.higgs).stat().st_size} if 'xgboost' in args.suites else None, 'source_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()}})
     save_json(args.output/'restore.json',saved)
@@ -262,7 +281,7 @@ def main():
             case_env = env | {k:str(v) for k,v in suite_env.items()} | dict(
                 PAGE_SIZES_KB=str(row['page_kb']), RESULT_DIR=str(folder.resolve()/'results'),
                 RUN_ID=name, PEBS_CGROUP=str(cg), PEBS_BENCH_MODE=row['case'])
-            save_json(folder/'case.json',row | {'environment':case_env})
+            save_json(folder/'case.json',row | {'environment':case_env, 'memory_policy':MEMORY_POLICY})
             start=time.monotonic()
             with (folder/'run.log').open('w') as log:
                 child=subprocess.Popen(['bash',str(source/script)],env=case_env,stdout=log,stderr=subprocess.STDOUT,preexec_fn=os.setpgrp)

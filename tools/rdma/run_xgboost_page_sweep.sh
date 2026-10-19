@@ -17,8 +17,8 @@ usage:
 
 XGBoost training page-size sweep under Hermit. For every requested page size
 the script starts a signal-driven XGBoost process in a cgroup, lowers
-memory.max to force RDMA stores, restores memory.max, and runs the training
-to measure and verify RDMA loads.
+memory.max to force RDMA stores, keeps that fixed limit, and runs the training
+while allowing concurrent reclamation.
 
 Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
@@ -370,9 +370,8 @@ for kb in $PAGE_SIZES_KB; do
     swapout_gib=$(awk -v p="$pswpout_delta" 'BEGIN { printf "%.6f", p*4096/1073741824 }')
     protocol_gib=$(awk -v b="$total_store_bytes" 'BEGIN { printf "%.6f", b/1073741824 }')
 
-    # Restore headroom before training; otherwise training reads force new
-    # swap-outs and measure cgroup thrashing instead of backend loads.
-    sudo_write max "$CGROUP/memory.max"
+    # Keep the same hard budget throughout training.
+    snapshot_fixed_memory_budget "$CGROUP" "$run_dir" before-swapin "$((limit_mb * 1024 * 1024))"
     load_before="$run_dir/order-before-swapin.txt"
     load_after="$run_dir/order-after-swapin.txt"
     snapshot_order_stats > "$load_before"
@@ -390,6 +389,7 @@ for kb in $PAGE_SIZES_KB; do
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-after-swapin.txt"
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-after-swapin.txt"
     sudo_cat "$CGROUP/memory.events" > "$run_dir/memory-events-after-swapin.txt"
+    snapshot_fixed_memory_budget "$CGROUP" "$run_dir" after-swapin "$((limit_mb * 1024 * 1024))"
 
     train_sec=$(awk -F'sec=' '/^TRAIN / { print $2; exit }' "$log" | awk '{ print $1 }')
     train_metric=$(awk -F'metric=' '/^TRAIN / { print $2; exit }' "$log" | awk '{ print $1 }')
@@ -444,8 +444,6 @@ for kb in $PAGE_SIZES_KB; do
     [ "$pswpin_delta" -gt 0 ] || rdma_die "training caused no swap-ins; see $run_dir"
     [[ "$total_load_bytes" =~ ^[0-9]+$ ]] && [ "$total_load_bytes" -gt 0 ] || \
       rdma_die "Hermit recorded no backend loads; see $run_dir"
-    [ "$train_pswpout_delta" -eq 0 ] || \
-      rdma_die "training caused $train_pswpout_delta new swap-outs; results are not isolated"
 
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$kb" "$order" "$repeat" "$MODE" "$resident_mb" "$limit_mb" "$populate_sec" \

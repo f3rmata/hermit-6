@@ -948,6 +948,22 @@ save_config() {
   } > "$RESULT_DIR/config.env"
 }
 
+# Verify and record the hard budget around the measured workload phase.
+# Loading may use more memory, but the swap-in phase must retain its limit.
+snapshot_fixed_memory_budget() {
+  local cgroup=$1 out=$2 phase=$3 expected=$4 actual key
+  actual=$(sudo_cat "$cgroup/memory.max")
+  [[ "$expected" =~ ^[0-9]+$ ]] && [ "$expected" -gt 0 ] || \
+    rdma_die "invalid fixed memory budget: $expected"
+  [ "$actual" = "$expected" ] || \
+    rdma_die "memory.max changed during $phase: expected $expected, got $actual"
+  printf 'fixed-max-v1\n' > "$out/memory-policy.txt"
+  printf '%s\n' "$actual" > "$out/memory-max-$phase.txt"
+  for key in memory.high memory.current memory.swap.current; do
+    sudo_cat "$cgroup/$key" > "$out/${key//./-}-$phase.txt"
+  done
+}
+
 # Optional instrumentation for the baseline-matched PEBS matrix. Ordinary
 # sweep invocations retain their original behaviour.
 configure_benchmark_pebs() {

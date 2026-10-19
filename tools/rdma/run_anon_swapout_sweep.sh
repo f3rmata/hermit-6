@@ -17,8 +17,8 @@ usage:
 
 Anonymous-memory sparse/random swap-out/swap-in protocol benchmark. For every
 requested page size it fully populates a fresh working set, lowers memory.max
-to measure RDMA stores, restores memory.max, and accesses a configurable subset
-of base pages in each folio to measure and verify RDMA loads.
+to measure RDMA stores, keeps that fixed limit, and accesses a configurable
+subset of base pages in each folio while allowing concurrent reclamation.
 
 Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
@@ -455,9 +455,8 @@ for kb in $PAGE_SIZES_KB; do
       -v swapped_pages="$pswpout_delta" \
       'BEGIN { printf "%.6f", (swapped_pages > 0 ? protocol_bytes / (swapped_pages * 4096) : 0) }')
 
-    # Restore headroom before the sparse scan. Otherwise each swap-in could
-    # force another swap-out and measure memcg thrashing instead of loads.
-    sudo_write max "$CGROUP/memory.max"
+    # Keep the same hard budget: swap-in may reclaim other resident pages.
+    snapshot_fixed_memory_budget "$CGROUP" "$run_dir" before-swapin "$((LIMIT_MB * 1024 * 1024))"
     load_before="$run_dir/order-before-swapin.txt"
     load_after="$run_dir/order-after-swapin.txt"
     snapshot_order_stats > "$load_before"
@@ -475,6 +474,7 @@ for kb in $PAGE_SIZES_KB; do
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-after-swapin.txt"
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-after-swapin.txt"
     sudo_cat "$CGROUP/memory.events" > "$run_dir/memory-events-after-swapin.txt"
+    snapshot_fixed_memory_budget "$CGROUP" "$run_dir" after-swapin "$((LIMIT_MB * 1024 * 1024))"
 
     swapin_scan_sec=$(log_field SCAN sec "$log")
     scan_accessed_pages=$(log_field SCAN accessed_pages "$log")
@@ -537,8 +537,6 @@ for kb in $PAGE_SIZES_KB; do
     [ "$swapin_pswpin_delta" -gt 0 ] || rdma_die "scan caused no swap-ins; see $run_dir"
     [[ "$total_load_bytes" =~ ^[0-9]+$ ]] && [ "$total_load_bytes" -gt 0 ] || \
       rdma_die "Hermit recorded no backend loads; see $run_dir"
-    [ "$swapin_pswpout_delta" -eq 0 ] || \
-      rdma_die "swap-in caused $swapin_pswpout_delta new swap-outs; results are not isolated"
 
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$kb" "$order" "$repeat" "$BENCH_THREADS" "$SWAPOUT_TRIGGER" \
