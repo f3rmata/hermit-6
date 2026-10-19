@@ -7,7 +7,7 @@
 ## 数据和实验条件
 
 - [原始结果目录](../../../tools/rdma/results/pebs/20261007-233523-workloads/)、[执行计划](../../../tools/rdma/results/pebs/20261007-233523-workloads/plan.json)、[完成及恢复记录](../../../tools/rdma/results/pebs/20261007-233523-workloads/completion.json)。前置 3 样本检查保存在独立目录，不混入本报告。
-- [运行方法及 baseline 参数映射](pebs-workload-matrix.md)：7 种负载配置 × 9 种页大小 × 7 种采样/策略配置 × 3 次重复。
+- [运行方法及 baseline 参数映射](../../pebs/runbook.md)：7 种负载配置 × 9 种页大小 × 7 种采样/策略配置 × 3 次重复。
 - dnet-61，`6.18.38-hermit-pebs #9`，2026-10-06 构建，RDMA rswap 后端。应用与模块记录见 [host.json](../../../tools/rdma/results/pebs/20261007-233523-workloads/host.json)。
 - load period 为 19997、1999、199，store period 固定 1500003；adaptive=0、force_order=0。period 是事件间隔，不是每秒采样次数，数值越小采样越密。
 - 每轮只允许 4 KiB 与当前所选页大小，使用独立进程和 cgroup；采样覆盖填充、换出及读取/训练。每个负载、页大小、重复内的配置顺序随机化。
@@ -88,7 +88,7 @@ Redis 与 YCSB 在请求 **2048 KiB** 的 off 组中，大页读取字节占比�
 
 本轮负载参数映射到 [2026-09-24 pre-PEBS baseline](../rdma/prepebs-baseline-20260924.md)，但本文的性能百分比全部采用**当前内核的 off 组**作为直接对照。尚未把旧内核与新内核的 off 数据按应用版本、数据规模、实际页大小、内存驻留量逐项验收并量化比较，不能将跨内核差异全部记为采样成本。
 
-[2026-10-06 Memcached 报告](pebs-performance-summary-20261006.md) 中约 +124% 的饱和吞吐收益属于那一套内存压力、THP 与候选 order 配置。本轮结果说明该收益没有自动推广到数组、Redis、YCSB 和 XGBoost；报告应同时保留两类证据。
+[2026-10-06 Memcached 报告](pebs-performance-20261006.md) 中约 +124% 的饱和吞吐收益属于那一套内存压力、THP 与候选 order 配置。本轮结果说明该收益没有自动推广到数组、Redis、YCSB 和 XGBoost；报告应同时保留两类证据。
 
 后续优先顺序：先排查 Redis/YCSB 2 MiB 大页未生效；再用阶段差分核对数组的采样、决策及 RDMA 字节变化；对有 lost 的高频组修复采样质量后复测；最后补充分阶段 CPU、填充/换出成本与旧 baseline 的严格匹配比较。在这些检查完成前，1999 可作为本轮未出现 lost 增量的复测起点，不应宣称为全场景最优采样间隔。
 

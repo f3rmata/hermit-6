@@ -26,8 +26,8 @@
 |---|---|
 | GCC 14 构建 bzImage、brd.ko、DRAM rswap-client.ko | 通过 |
 | RDMA `rswap_rdma_ops.o` 使用本仓库内核头文件编译 | 通过；不等价于 OFED 模块链接 |
-| `python3 tools/rdma/tests/test_rdma_submission.py` | 通过；ASan/UBSan，验证整体/分段/base-page、非法 order、越界、部分提交排空 |
-| `python3 tools/rdma/tests/test_remote_read.py` | 通过；ASan/UBSan，验证 backend 消失和读取错误不回退本地 |
+| `python3 tools/rdma/tests/test_rdma_submission.py`（现合并为 `test_kernel_paths.py`） | 通过；ASan/UBSan，验证整体/分段/base-page、非法 order、越界、部分提交排空 |
+| `python3 tools/rdma/tests/test_remote_read.py`（现合并为 `test_kernel_paths.py`） | 通过；ASan/UBSan，验证 backend 消失和读取错误不回退本地 |
 | QEMU direct swap-in 基线 | PASS |
 | QEMU 64 KiB + force_order=4 + lazy_poll | PASS；558 次 order-4 store 和 load |
 | QEMU 2 MiB + force_order=9 | PASS；99 次 order-9 store，DRAM 回退 4 KiB |

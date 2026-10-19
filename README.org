@@ -26,8 +26,7 @@ Linux 源码树内的 RDMA core。
   folio 粒度（syscall 473/474、debugfs =pebs_all= / =pebs_*=）。PEBS 历史
   归属 =mm=，不依赖 cgroup；详见 =docs/pebs/design.md=。
 
-详细迁移记录见 =docs/migration-6.18.md=。=docs/archive/plan/= 下的 6.6 文档作为历史
-记录保留。
+详细迁移记录见 =docs/migration-6.18.md=。更早的 6.6/6.15 适配文档已删除。
 
 * 目录
 

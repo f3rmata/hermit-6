@@ -7,8 +7,8 @@
 - Previous migration snapshot: Linux `v6.6.138`
 - RDMA provider: external Mellanox OFED built for the target kernel
 
-The historical 6.6 plans remain under `docs/archive/plan/`. This document records the
-6.18 result rather than rewriting those earlier stages.
+The earlier 6.6/6.15 adaptation documents have been removed. This document records
+the 6.18 result; the repository no longer keeps superseded migration plans.
 
 ## Kernel integration
 
