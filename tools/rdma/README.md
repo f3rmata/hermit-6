@@ -19,19 +19,14 @@
 - Memcached 采样开销：`pebs/run_memcached_sampling_cost.py`，固定并发，比较同页大小的采样开关。
 - 多负载矩阵：`pebs/run_workload_matrix.py`，1323 个样本，PEBS 按工作负载 pid 启用。
 - 页面选择微基准：`pebs/run_page_selection_microbench.py`。
-- 离线汇总：`pebs/summarize_workload_matrix.py`。
 
 旧版 Memcached 矩阵 `pebs_perf_matrix.py` 保留用于复现 2026-10-06 的条件；当前实验优先使用上面的入口。
 
 ```sh
 python3 tools/rdma/pebs/pebs_perf_matrix.py --help
-for phase in pressure resident saturation; do
-  python3 tools/rdma/pebs/plot_pebs_perf.py tools/rdma/results/pebs/20261006/pebs-campaign-20261006/$phase
-done
-python3 tools/rdma/pebs/summarize_pebs_campaign.py tools/rdma/results/pebs/20261006/pebs-campaign-20261006
 ```
 
-矩阵程序用于已准备好内核、RDMA 后端和 swap 的专用测试机，需要 root 执行，并以 `--user` 指定的普通用户运行负载；必须指定新的 `--output` 目录。离线汇总与绘图不需要 sudo。`plot_pebs_perf.py` 读取单次 campaign 的 manifest/summary；`plot_pebs_workloads.py` 读取多负载矩阵的 per-case CSV；`plot_page_selection_microbench.py` 读取 page-selection 运行目录。
+矩阵程序用于已准备好内核、RDMA 后端和 swap 的专用测试机，需要 root 执行，并以 `--user` 指定的普通用户运行负载；必须指定新的 `--output` 目录。离线汇总和绘图脚本已移除；历史图表与结论见 [PEBS 评估](../../docs/pebs/evaluation.md)，原始数据在 `results/pebs/`。
 
 ## 其他基准和基线
 

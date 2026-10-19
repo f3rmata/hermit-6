@@ -93,9 +93,4 @@ Redis 与 YCSB 在请求 **2048 KiB** 的 off 组中，大页读取字节占比�
 
 ## 复现统计与图表
 
-```sh
-python3 tools/rdma/pebs/summarize_workload_matrix.py \
-  tools/rdma/results/pebs/20261007-233523-workloads
-```
-
-脚本从原始 case/status JSON 与负载 CSV 重新生成 `analysis/samples.csv`、`aggregate.csv`、`audit.json`、`tables.md` 和三组 PNG/PDF，不修改原始测量文件。PDF 下载：[仅采样](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/static-time-change.pdf)、[策略净变化](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/policy-time-change.pdf)、[绝对耗时](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/phase-time.pdf)。
+分析与绘图脚本已随仓库清理移除；`analysis/` 中保留已生成的 `samples.csv`、`aggregate.csv`、`audit.json`、`tables.md` 和三组 PNG/PDF。PDF：[仅采样](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/static-time-change.pdf)、[策略净变化](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/policy-time-change.pdf)、[绝对耗时](../../../tools/rdma/results/pebs/20261007-233523-workloads/analysis/phase-time.pdf)。

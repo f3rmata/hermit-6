@@ -6,8 +6,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 requested_mode=${MODE-}
 requested_run_id=${RUN_ID-}
 requested_result_dir=${RESULT_DIR-}
-# shellcheck source=common.sh
-source "$SCRIPT_DIR/common.sh"
+# shellcheck source=sweep_common.sh
+source "$SCRIPT_DIR/sweep_common.sh"
 
 usage() {
   cat <<'USAGE'
@@ -72,104 +72,14 @@ XGB_TREE_METHOD=${XGB_TREE_METHOD:-hist}
 XGB_EVAL_METRIC=${XGB_EVAL_METRIC:-auc}
 XGB_EXPECTED_METRIC_MIN=${XGB_EXPECTED_METRIC_MIN:-}
 XGB_EXPECTED_METRIC_MAX=${XGB_EXPECTED_METRIC_MAX:-}
-QUIET_INTERVAL_SEC=${QUIET_INTERVAL_SEC:-1}
-QUIET_SAMPLES=${QUIET_SAMPLES:-3}
-QUIET_TIMEOUT_SEC=${QUIET_TIMEOUT_SEC:-120}
 READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-300}
 TRAIN_TIMEOUT_SEC=${TRAIN_TIMEOUT_SEC:-3600}
-RESTORE_THP=${RESTORE_THP:-1}
 RUN_ID=${requested_run_id:-"$(date +%Y%m%d-%H%M%S)-xgboost-swapio"}
 RESULT_DIR=${requested_result_dir:-"$RESULT_ROOT/$RUN_ID"}
 WORKER="$SCRIPT_DIR/xgboost_train.py"
 CGROUP=${PEBS_CGROUP:-/sys/fs/cgroup/hermit-xgboost}
-THP_ROOT=/sys/kernel/mm/transparent_hugepage
-REMOTE_MASK_FILE=/sys/kernel/debug/hermit/remote_order_mask
-EFFECTIVE_MASK_FILE=/sys/kernel/debug/hermit/effective_order_mask
 CSV="$RESULT_DIR/xgboost-swapio-summary.csv"
 current_pid=
-remote_mask_before=
-declare -a thp_files=()
-declare -A thp_policy=()
-
-page_order() {
-  case "$1" in
-    4) printf 0 ;; 16) printf 2 ;; 32) printf 3 ;; 64) printf 4 ;;
-    128) printf 5 ;; 256) printf 6 ;; 512) printf 7 ;;
-    1024) printf 8 ;; 2048) printf 9 ;; *) return 1 ;;
-  esac
-}
-
-selected_policy() {
-  awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\[.*\]$/) { gsub(/\[|\]/, "", $i); print $i; exit } }' "$1"
-}
-
-snapshot_order_stats() {
-  sudo_cat /sys/kernel/debug/hermit/order_stats
-}
-
-order_field() {
-  local file=$1 order=$2 column=$3
-  awk -v o="$order" -v c="$column" 'NR > 1 && $1 == o { print $c; found=1 } END { if (!found) print 0 }' "$file"
-}
-
-order_total_stores() {
-  snapshot_order_stats | awk 'NR > 1 { total += $3 } END { printf "%d", total }'
-}
-
-wait_for_stores_quiet() {
-  local previous current quiet=0 start
-  start=$(date +%s)
-  previous=$(order_total_stores)
-  while [ "$quiet" -lt "$QUIET_SAMPLES" ]; do
-    sleep "$QUIET_INTERVAL_SEC"
-    current=$(order_total_stores)
-    if [ "$current" -eq "$previous" ]; then
-      quiet=$((quiet + 1))
-    else
-      previous=$current
-      quiet=0
-    fi
-    if [ "$quiet" -lt "$QUIET_SAMPLES" ]; then
-      [ "$(( $(date +%s) - start ))" -lt "$QUIET_TIMEOUT_SEC" ] || \
-        rdma_die "Hermit store counters did not become quiet; stop other swap workloads"
-    fi
-  done
-}
-
-memory_event() {
-  local key=$1
-  awk -v key="$key" '$1 == key { print $2; found=1 } END { if (!found) print 0 }' \
-    "$CGROUP/memory.events"
-}
-
-save_thp_state() {
-  local file policy
-  for file in "$THP_ROOT/enabled" "$THP_ROOT"/hugepages-*kB/enabled; do
-    [ -e "$file" ] || continue
-    policy=$(selected_policy "$file")
-    [ -n "$policy" ] || rdma_die "cannot read THP policy: $file"
-    thp_files+=("$file")
-    thp_policy["$file"]=$policy
-  done
-  remote_mask_before=$(sudo_cat "$REMOTE_MASK_FILE")
-}
-
-configure_page_size() {
-  local kb=$1 order=$2 file selected
-  for file in "${thp_files[@]}"; do
-    sudo_write never "$file"
-  done
-  if [ "$kb" != 4 ]; then
-    selected="$THP_ROOT/hugepages-${kb}kB/enabled"
-    if [ "$kb" = 2048 ] && [ ! -e "$selected" ]; then
-      selected="$THP_ROOT/enabled"
-    fi
-    [ -e "$selected" ] || return 1
-    sudo_write always "$selected"
-    [ "$kb" != 2048 ] || sudo_write always "$THP_ROOT/enabled"
-  fi
-  sudo_write "$(printf '0x%x' $((1 | (1 << order))))" "$REMOTE_MASK_FILE"
-}
 
 cleanup_process() {
   if [ -n "$current_pid" ] && kill -0 "$current_pid" 2>/dev/null; then
@@ -181,14 +91,9 @@ cleanup_process() {
 }
 
 cleanup() {
-  local ret=$? file
+  local ret=$?
   cleanup_process
-  if [ "$RESTORE_THP" = 1 ]; then
-    for file in "${thp_files[@]}"; do
-      sudo_write "${thp_policy[$file]}" "$file" || true
-    done
-    [ -z "$remote_mask_before" ] || sudo_write "$remote_mask_before" "$REMOTE_MASK_FILE" || true
-  fi
+  restore_thp_state
   sudo rmdir "$CGROUP" 2>/dev/null || true
   exit "$ret"
 }
@@ -208,19 +113,7 @@ wait_for_log() {
 command -v python3 >/dev/null 2>&1 || rdma_die "python3 is required"
 python3 -c 'import xgboost' 2>/dev/null || \
   rdma_die "python3 xgboost module is required (pip install xgboost)"
-[ -r /sys/fs/cgroup/cgroup.controllers ] || rdma_die "cgroup v2 is required"
-mount_debugfs_if_needed
-sudo_test -r /sys/kernel/debug/hermit/order_stats || rdma_die "Hermit order_stats is unavailable"
-sudo_test -w "$REMOTE_MASK_FILE" || rdma_die "Hermit remote_order_mask is not writable"
-[ "$(detect_rswap_backend)" = rdma ] || rdma_die "Hermit RDMA backend is not active"
-swap_count=$(awk 'NR > 1 { count++ } END { print count + 0 }' /proc/swaps)
-[ "$swap_count" -eq 1 ] || \
-  rdma_die "exactly one active swap device is required; found $swap_count"
-awk 'NR == 2 && $2 == "partition" { ok=1 } END { exit !ok }' /proc/swaps || \
-  rdma_die "the active swap area must be a block device, not a swapfile"
-if [ -r /sys/module/zswap/parameters/enabled ] && grep -qi '^Y' /sys/module/zswap/parameters/enabled; then
-  rdma_die "zswap is enabled; disable it before measuring RDMA swap-out"
-fi
+validate_sweep_host
 if [ -n "$XGB_DATA_FILE" ] && [ ! -r "$XGB_DATA_FILE" ]; then
   rdma_die "XGB_DATA_FILE is not readable: $XGB_DATA_FILE"
 fi
@@ -231,15 +124,7 @@ trap 'exit 143' TERM
 save_thp_state
 configure_hermit_mode
 
-if sudo_test -d "$CGROUP"; then
-  existing=$(sudo_cat "$CGROUP/cgroup.procs")
-  [ -z "$existing" ] || rdma_die "$CGROUP is busy with PIDs: $existing"
-else
-  sudo mkdir "$CGROUP"
-fi
-sudo_write max "$CGROUP/memory.max"
-sudo_write max "$CGROUP/memory.swap.max"
-configure_benchmark_pebs
+prepare_sweep_cgroup
 
 mkdir -p "$RESULT_DIR"
 {
@@ -297,15 +182,12 @@ for kb in $PAGE_SIZES_KB; do
     [ "$limit_mb" -lt "$resident_mb" ] || \
       rdma_die "computed limit ${limit_mb} MiB is not below resident ${resident_mb} MiB; lower LOCAL_RATIO_PCT or enlarge the workset"
     required_swap_mb=$((resident_mb - limit_mb))
-    free_swap_mb=$(awk 'NR > 1 { free += $3 - $4 } END { printf "%d", free / 1024 }' /proc/swaps)
-    [ "$free_swap_mb" -ge "$required_swap_mb" ] || \
-      rdma_die "only ${free_swap_mb} MiB swap is free; at least ${required_swap_mb} MiB is required"
+    check_swap_capacity "$required_swap_mb"
 
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-before.txt"
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-before.txt"
     wait_for_stores_quiet
-    snapshot_order_stats > "$before"
-    snapshot_benchmark_pebs "$before.pebs"
+    snapshot_sweep_stats "$before"
     pswpout_before=$(read_vmstat_key pswpout)
     stores_before=$(order_total_stores)
     oom_before=$(memory_event oom_kill)
@@ -313,26 +195,8 @@ for kb in $PAGE_SIZES_KB; do
     sudo_write "$((limit_mb * 1024 * 1024))" "$CGROUP/memory.max"
     write_end_ns=$(date +%s%N)
     last_change_ns=$write_end_ns
-    previous=$(order_total_stores)
-    quiet=0
-    quiet_start=$(date +%s)
-    while [ "$quiet" -lt "$QUIET_SAMPLES" ]; do
-      sleep "$QUIET_INTERVAL_SEC"
-      current=$(order_total_stores)
-      if [ "$current" -ne "$previous" ]; then
-        previous=$current
-        quiet=0
-        last_change_ns=$(date +%s%N)
-      else
-        quiet=$((quiet + 1))
-      fi
-      if [ "$quiet" -lt "$QUIET_SAMPLES" ]; then
-        [ "$(( $(date +%s) - quiet_start ))" -lt "$QUIET_TIMEOUT_SEC" ] || \
-          rdma_die "swap-out did not become quiet within ${QUIET_TIMEOUT_SEC}s; see $run_dir"
-      fi
-    done
-    snapshot_order_stats > "$after"
-    snapshot_benchmark_pebs "$after.pebs"
+    wait_for_stores_quiet "$last_change_ns"
+    snapshot_sweep_stats "$after"
     pswpout_after=$(read_vmstat_key pswpout)
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-after.txt"
     sudo_cat "$CGROUP/memory.events" > "$run_dir/memory-events-after.txt"
@@ -340,7 +204,6 @@ for kb in $PAGE_SIZES_KB; do
     [ "$oom_after" -eq "$oom_before" ] || rdma_die "cgroup OOM killed the xgboost process; see $run_dir"
     kill -0 "$current_pid" 2>/dev/null || rdma_die "xgboost process exited during reclaim; see $run_dir"
 
-    memory_max_write_ms=$(( (write_end_ns - start_ns) / 1000000 ))
     completion_ms=$(( (last_change_ns - start_ns) / 1000000 ))
     [ "$completion_ms" -gt 0 ] || completion_ms=1
     target_stores=$(( $(order_field "$after" "$order" 3) - $(order_field "$before" "$order" 3) ))
@@ -351,22 +214,7 @@ for kb in $PAGE_SIZES_KB; do
     stores_after=$(order_total_stores)
     stores_delta=$((stores_after - stores_before))
 
-    metrics=$(awk -v before="$before" -v after="$after" -v ms="$completion_ms" '
-      FILENAME == before && NR > 1 { b[$1]=$3; fb[$1]=$5; size[$1]=$2; next }
-      FILENAME == after && FNR > 1 {
-        d=$3-b[$1]; f=$5-fb[$1];
-        if (f < 0) f=0; if (f > d) f=d;
-        total += d*$2; if ($1 > 0) large += (d-f)*$2
-      }
-      END {
-        pct=total ? 100*large/total : 0;
-        gib=total/1073741824;
-        printf "%.0f,%.0f,%.3f,%.6f", total, large, pct, gib/(ms/1000)
-      }' "$before" "$after")
-    total_store_bytes=${metrics%%,*}
-    rest=${metrics#*,}; large_store_bytes=${rest%%,*}
-    rest=${rest#*,}; large_store_pct=${rest%%,*}
-    protocol_gib_per_sec=${rest#*,}
+    summarize_stores "$before" "$after" "$completion_ms"
     swapout_gib=$(awk -v p="$pswpout_delta" 'BEGIN { printf "%.6f", p*4096/1073741824 }')
     protocol_gib=$(awk -v b="$total_store_bytes" 'BEGIN { printf "%.6f", b/1073741824 }')
 
@@ -374,16 +222,12 @@ for kb in $PAGE_SIZES_KB; do
     snapshot_fixed_memory_budget "$CGROUP" "$run_dir" before-swapin "$((limit_mb * 1024 * 1024))"
     load_before="$run_dir/order-before-swapin.txt"
     load_after="$run_dir/order-after-swapin.txt"
-    snapshot_order_stats > "$load_before"
-    snapshot_benchmark_pebs "$load_before.pebs"
+    snapshot_sweep_stats "$load_before"
     pswpin_before=$(read_vmstat_key pswpin)
     train_pswpout_before=$(read_vmstat_key pswpout)
-    train_start_ns=$(date +%s%N)
     kill -USR2 "$current_pid"
     wait_for_log '^TRAIN ' "$log" "$TRAIN_TIMEOUT_SEC" 1
-    train_end_ns=$(date +%s%N)
-    snapshot_order_stats > "$load_after"
-    snapshot_benchmark_pebs "$load_after.pebs"
+    snapshot_sweep_stats "$load_after"
     pswpin_after=$(read_vmstat_key pswpin)
     train_pswpout_after=$(read_vmstat_key pswpout)
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-after-swapin.txt"
@@ -410,33 +254,13 @@ for kb in $PAGE_SIZES_KB; do
         rdma_die "training metric $train_metric=$train_metric_value is outside the expected window; see $run_dir"
     fi
 
-    swapin_wall_ms=$(( (train_end_ns - train_start_ns) / 1000000 ))
     pswpin_delta=$((pswpin_after - pswpin_before))
     train_pswpout_delta=$((train_pswpout_after - train_pswpout_before))
     target_loads=$(( $(order_field "$load_after" "$order" 4) - $(order_field "$load_before" "$order" 4) ))
     target_fallback=$(( $(order_field "$load_after" "$order" 5) - $(order_field "$load_before" "$order" 5) ))
     target_errors=$(( $(order_field "$load_after" "$order" 6) - $(order_field "$load_before" "$order" 6) ))
 
-    if ! load_metrics=$(awk -v before="$load_before" -v after="$load_after" -v sec="$train_sec" '
-      FILENAME == before && NR > 1 { b[$1]=$4; fb[$1]=$5; size[$1]=$2; next }
-      FILENAME == after && FNR > 1 {
-        d=$4-b[$1]; f=$5-fb[$1];
-        if (f < 0) f=0; if (f > d) f=d;
-        total += d*$2; if ($1 > 0) large += (d-f)*$2
-      }
-      END {
-        pct=total ? 100*large/total : 0;
-        printf "%.0f,%.0f,%.3f,%.6f", total, large, pct,
-               (sec > 0 ? total / 1073741824 / sec : 0)
-      }' "$load_before" "$load_after"); then
-      rdma_die "failed to summarize Hermit swap-in counters; see $run_dir"
-    fi
-    [ -n "$load_metrics" ] || \
-      rdma_die "empty Hermit swap-in counter summary; see $run_dir"
-    total_load_bytes=${load_metrics%%,*}
-    rest=${load_metrics#*,}; large_load_bytes=${rest%%,*}
-    rest=${rest#*,}; large_load_pct=${rest%%,*}
-    load_protocol_gib_per_sec=${rest#*,}
+    summarize_loads "$load_before" "$load_after" "$train_sec"
     swapin_gib=$(awk -v p="$pswpin_delta" 'BEGIN { printf "%.6f", p*4096/1073741824 }')
     load_protocol_gib=$(awk -v b="$total_load_bytes" 'BEGIN { printf "%.6f", b/1073741824 }')
     oom_after_swapin=$(memory_event oom_kill)

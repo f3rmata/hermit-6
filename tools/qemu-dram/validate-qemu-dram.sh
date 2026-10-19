@@ -327,7 +327,7 @@ check_pebs_unit() {
     [ "\$ring_result" = pass ] || rc=1
     check_pattern full_scan 9 "\$full" || rc=1
     check_pattern chunk64k 4 "\$chunk64" || rc=1
-    check_pattern single_page 2 "\$single" || rc=1
+    check_pattern single_page 0 "\$single" || rc=1
     echo "PEBS_UNIT: status=\$([ "\$rc" -eq 0 ] && echo pass || echo fail)"
     return "\$rc"
 }

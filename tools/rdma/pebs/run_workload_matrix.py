@@ -68,6 +68,20 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False)+'\n')
 
 
+def snapshot_sources(destination):
+    """Keep relative imports usable when running the archived workload scripts."""
+    paths = [p for p in RDMA.iterdir() if p.suffix in ('.sh', '.py', '.c')]
+    paths += [Path(__file__).resolve(), RDMA/'pebs/enable_pebs_pid.py']
+    for path in paths:
+        target = destination/path.relative_to(RDMA)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    with (destination/'common.sh').open('a') as f:
+        f.write('\nsudo() { command sudo -n "$@"; }\n')
+    return {str(p.relative_to(destination)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(destination.rglob('*')) if p.is_file()}
+
+
 def snapshot(path):
     data = {'time_ns': time.time_ns(), 'uname': list(platform.uname()),
             'controls': {k: read(DEBUG/k) for k in CONTROLS if k.startswith('pebs_')} |
@@ -230,20 +244,12 @@ def main():
     for p in Path('/sys/kernel/mm/transparent_hugepage').glob('**/enabled'):
         saved[str(p)] = re.search(r'\[([^]]+)\]',p.read_text())[1]
     args.output.mkdir(parents=True)
-    source = args.output/'source'; source.mkdir()
-    for p in RDMA.iterdir():
-        if p.suffix in ('.sh','.py','.c'): shutil.copy2(p,source/p.name)
-    shutil.copy2(__file__,source/'run_workload_matrix.py')
-    shutil.copy2(RDMA.parent/'qemu-dram/src/hermit_swap_stats.c',source/'hermit_swap_stats.c')
-    helper = args.output.resolve()/'hermit_swap_stats'
-    command(['cc','-O2','-Wall','-Wextra','-Werror',RDMA.parent/'qemu-dram/src/hermit_swap_stats.c','-o',helper])
-    with (source/'common.sh').open('a') as f:
-        f.write('\nsudo() { command sudo -n "$@"; }\nhermit_stats_helper() { printf "%s\\n" "$PEBS_STATS_HELPER"; }\n')
-    env['PEBS_STATS_HELPER'] = str(helper)
+    source = args.output/'source'
+    source_hashes = snapshot_sources(source)
     save_json(args.output/'plan.json', {'samples':len(rows),'seed':args.seed,'environment':env,'plan':rows,
         'workload_parameters_from':'20260924-prepebs-full', 'memory_policy':MEMORY_POLICY,
         'policy_tunables': {k:read(DEBUG/k) for k in ['pebs_fixed_cost_ns','pebs_bw_mibps','pebs_min_f','pebs_hysteresis','pebs_cooling_period','pebs_region_max']},
-        'dataset': {'path':args.higgs,'size':Path(args.higgs).stat().st_size} if 'xgboost' in args.suites else None, 'source_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()}})
+        'dataset': {'path':args.higgs,'size':Path(args.higgs).stat().st_size} if 'xgboost' in args.suites else None, 'source_sha256':source_hashes})
     save_json(args.output/'restore.json',saved)
     save_json(args.output/'host.json', {
         'version':Path('/proc/version').read_text(), 'cmdline':Path('/proc/cmdline').read_text(),

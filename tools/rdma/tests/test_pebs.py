@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for PEBS benchmark drivers, page selection, and mm scope."""
 import csv
+import hashlib
 import io
 import importlib.util
 import json
@@ -43,7 +44,6 @@ PEBS = RDMA / 'pebs'
 sys.path.insert(0, str(PEBS))
 import page_selection_metrics as metrics
 import run_page_selection_microbench as runner
-import plot_page_selection_microbench as plot
 
 
 class FixedConcurrencyTests(unittest.TestCase):
@@ -181,6 +181,25 @@ class ThpCases(unittest.TestCase):
 
 
 class MatrixTests(unittest.TestCase):
+    def test_archived_drivers_include_pebs_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)/'source'
+            hashes = matrix.snapshot_sources(source)
+            self.assertIn('sweep_common.sh', hashes)
+            self.assertIn('pebs/enable_pebs_pid.py', hashes)
+            self.assertIn('pebs/run_workload_matrix.py', hashes)
+            for name, digest in hashes.items():
+                self.assertEqual(hashlib.sha256((source/name).read_bytes()).hexdigest(), digest)
+            for script in {entry[0] for entry in matrix.SUITES.values()}:
+                archived = subprocess.check_output(['bash', str(source/script), '--help'], text=True)
+                original = subprocess.check_output(['bash', str(RDMA/script), '--help'], text=True)
+                self.assertEqual(archived, original)
+            subprocess.run(['bash', '-c', 'source "$1"; PEBS_BENCH_MODE=policy configure_benchmark_pebs',
+                            'test', str(source/'sweep_common.sh')], check=True, capture_output=True)
+            archived_plan = subprocess.check_output(['python3', str(source/'pebs/run_workload_matrix.py'),
+                                                     '--dry-run'], text=True)
+            self.assertEqual(json.loads(archived_plan)['samples'], 1323)
+
     def test_default_plan_and_baseline_parameters(self):
         result = subprocess.check_output(['python3', str(RDMA/'pebs/run_workload_matrix.py'), '--dry-run'], text=True)
         data = json.loads(result)
@@ -283,7 +302,7 @@ class ScopeTests(unittest.TestCase):
         text = (KERNEL / 'mm/hermit_pebs.c').read_text()
         self.assertIn('hermit_pebs_mm_exit', text)
         self.assertIn('hermit_pebs_get_mm', text)
-        self.assertIn('hermit_order_policy(struct mm_struct *mm', text)
+        self.assertIn('hermit_swapin_order(struct mm_struct *mm', text)
         self.assertNotIn('#include <linux/memcontrol.h>', text)
         self.assertNotIn('get_mem_cgroup_from_mm', text)
         self.assertNotIn('hermit_pebs_memcg', text)
@@ -293,7 +312,7 @@ class ScopeTests(unittest.TestCase):
         self.assertNotIn('get_mem_cgroup_from_folio', page_io)
         memory = (KERNEL / 'mm/memory.c').read_text()
         block = memory.split('PEBS policy:', 1)[1].split('#endif', 1)[0]
-        self.assertIn('hermit_order_policy(', block)
+        self.assertIn('hermit_swapin_order(', block)
         self.assertIn('vma->vm_mm', block)
         self.assertNotIn('get_mem_cgroup_from_mm', block)
 
@@ -422,47 +441,6 @@ class MicrobenchTests(unittest.TestCase):
             (b/'pebs_order_stats').write_text('sampled: 20\n')
             with self.assertRaisesRegex(ValueError, 'Missing PEBS'):
                 metrics.deltas(a, b)
-
-    def test_plot_refuses_no_data(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root/'manifest.json').write_text(json.dumps({'schema': 'page-selection-v1'}))
-            with self.assertRaisesRegex(ValueError, 'No measured epochs'):
-                plot.load_rows(root)
-
-    @unittest.skipUnless(importlib.util.find_spec('matplotlib'), 'Matplotlib unavailable')
-    def test_plot_pipeline_with_explicit_temporary_fixture(self):
-        # Synthetic fixture validates file parsing/rendering only; not experimental evidence.
-        with tempfile.TemporaryDirectory(prefix='page-selection-test-fixture-') as tmp:
-            root = Path(tmp)
-            spec = {'scenario': 'switch', 'case': 'fixed-4k', 'repeat': 1, 'phases': [1, 512, 1]}
-            (root/'manifest.json').write_text(json.dumps({'schema': 'page-selection-v1', 'runs': [spec],
-                'args': {'epochs': 1, 'cases': 'fixed-4k', 'scenarios': 'switch', 'workset_mb': 4}}))
-            (root/'status').write_text('completed')
-            run = root/'0001-fixture'; run.mkdir()
-            for phase, density in enumerate(spec['phases'], 1):
-                cycle = run/f'p{phase}-e1'; cycle.mkdir()
-                a, b = cycle/'a', cycle/'b'
-                self.counters(a, 10); self.counters(b, 20)
-                delta = metrics.deltas(a, b)
-                row = spec | {'phase': phase, 'epoch': 1, 'density_pages': density, 'valid': True,
-                    'warnings': ['SYNTHETIC TEST FIXTURE'], 'access_delta': delta, 'pageout_delta': delta,
-                    'access': {'seconds': 1., 'page_coverage_bytes': density * 8192,
-                               'read_instructions': density * 128, 'checksum_errors': 0},
-                    'pageout': {'seconds': 2., 'settle_seconds': .3}}
-                (cycle/'result.json').write_text(json.dumps(row))
-                for stage in ['before', 'evicted', 'after']:
-                    d = cycle/f'pages-{stage}'; d.mkdir()
-                    (d/'page-sizes.json').write_text(json.dumps({
-                        'resident_mapped_bytes': 4 * 1024**2, 'swapped_mapped_bytes': 0,
-                        'unknown_resident_bytes': 0, 'not_present_mapped_bytes': 0,
-                        'folio_size_kib': {'4': {'mapped_bytes': 4 * 1024**2}}}))
-            result = subprocess.run([sys.executable, str(PEBS/'plot_page_selection_microbench.py'), str(root)],
-                                    text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            for name in ['switch-metrics.png', 'switch-folios.png', 'switch-timeline.png']:
-                self.assertTrue((root/'analysis'/name).read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
-            self.assertEqual(len(json.loads((root/'analysis'/'runs.json').read_text())), 1)
 
 if __name__ == '__main__':
     unittest.main()

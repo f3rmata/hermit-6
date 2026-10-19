@@ -153,13 +153,4 @@ pressure 日志新增 **9 次 `perf: interrupt took too long`**，全局 `kernel
 
 远端结果目录为 `/home/xwz/hermit-baselines/pebs-campaign-20261006`。本地每个 case 保留装载/预热/测量日志、before/after 内核与进程计数、memcached stats、配置快照；每阶段保留 manifest、内核日志、恢复记录、汇总 CSV/JSON、PNG/PDF。短时预检独立保留，不进入正式矩阵。
 
-重新生成分析与图表（不运行服务器负载）：
-
-```sh
-for phase in pressure resident saturation; do
-  python3 tools/rdma/pebs/plot_pebs_perf.py tools/rdma/results/pebs/20261006/pebs-campaign-20261006/$phase
-done
-python3 tools/rdma/pebs/summarize_pebs_campaign.py tools/rdma/results/pebs/20261006/pebs-campaign-20261006
-```
-
-复测需使用新输出目录，先检查独占测试条件，再参考已归档的 campaign.sh；不要覆盖本次原始数据。性能脚本不执行内核安装或重启。
+分析与绘图脚本已随仓库清理移除；上述目录中的原始 CSV/JSON、PNG/PDF 和运行快照保留。复测需使用新输出目录，先检查独占测试条件，再参考已归档的 `campaign.sh`；不要覆盖本次原始数据。性能脚本不执行内核安装或重启。
