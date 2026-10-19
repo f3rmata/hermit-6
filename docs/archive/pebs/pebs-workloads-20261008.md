@@ -7,7 +7,6 @@
 ## 数据和实验条件
 
 - [原始结果目录](../../../tools/rdma/results/pebs/20261007-233523-workloads/)、[执行计划](../../../tools/rdma/results/pebs/20261007-233523-workloads/plan.json)、[完成及恢复记录](../../../tools/rdma/results/pebs/20261007-233523-workloads/completion.json)。前置 3 样本检查保存在独立目录，不混入本报告。
-- [运行方法及 baseline 参数映射](../../pebs/runbook.md)：7 种负载配置 × 9 种页大小 × 7 种采样/策略配置 × 3 次重复。
 - dnet-61，`6.18.38-hermit-pebs #9`，2026-10-06 构建，RDMA rswap 后端。应用与模块记录见 [host.json](../../../tools/rdma/results/pebs/20261007-233523-workloads/host.json)。
 - load period 为 19997、1999、199，store period 固定 1500003；adaptive=0、force_order=0。period 是事件间隔，不是每秒采样次数，数值越小采样越密。
 - 每轮只允许 4 KiB 与当前所选页大小，使用独立进程和 cgroup；采样覆盖填充、换出及读取/训练。每个负载、页大小、重复内的配置顺序随机化。
