@@ -51,8 +51,7 @@ python3 -m pytest tools/rdma/tests -q
 ```
 
 - `test_kernel_paths.py`：提取生产源码并编译宿主机 C harness，覆盖 RDMA 提交边界、失败排空与远端读取错误路径。
-- `test_pebs_benchmarks.py`：PEBS 作用域、mm 生命周期、Memcached 开销、THP、矩阵驱动与采样质量检查。
-- `test_page_selection.py`：page-selection 微基准的 worker、folio 统计、WR 计数和绘图流程。
+- `test_pebs.py`：PEBS 作用域、mm 生命周期、Memcached 开销、THP、矩阵驱动、page-selection 微基准与绘图流程。
 
 QEMU 构建及回归仍位于 [tools/qemu-dram](../qemu-dram/)，其临时输出位于 `_work/`。
 
