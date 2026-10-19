@@ -9,15 +9,12 @@
 | `anon_seq_workset.c`、`redis_bench.py`、`xgboost_train.py` | 负载程序，供基准脚本调用 |
 | [pebs/](pebs/) | PEBS 开关、频率矩阵与正式结果汇总 |
 | [baseline/](baseline/) | native local/cgroup-linux sweep、PEBS 前基线、续跑与恢复检查 |
-| [plots/](plots/) | 其他基准的离线绘图与分析，通常从参数读取 CSV |
 | [tests/](tests/) | 无需 RDMA 服务器的源码回归测试 |
-| [notebooks/](notebooks/) | 历史 Memcached 交互分析 |
-| [data/](data/README.md) | HIGGS 等输入数据集与下载日志 |
 | [results/](results/README.md) | 历次测量、构建日志、图表和归档 |
 
 ## PEBS
 
-当前设计、实测结论和操作步骤见 [PEBS 设计](../../docs/pebs/design.md)、[PEBS 评估](../../docs/pebs/evaluation.md) 和 [PEBS 实验手册](../../docs/pebs/runbook.md)。
+当前设计、实测结论和操作步骤见 [PEBS 设计](../../docs/pebs/design.md)
 
 - Memcached 采样开销：`pebs/run_memcached_sampling_cost.py`，固定并发，比较同页大小的采样开关。
 - 多负载矩阵：`pebs/run_workload_matrix.py`，1323 个样本，PEBS 按工作负载 pid 启用。
@@ -34,7 +31,7 @@ done
 python3 tools/rdma/pebs/summarize_pebs_campaign.py tools/rdma/results/pebs/20261006/pebs-campaign-20261006
 ```
 
-矩阵程序用于已准备好内核、RDMA 后端和 swap 的专用测试机，需要 root 执行，并以 `--user` 指定的普通用户运行负载；必须指定新的 `--output` 目录。离线汇总与绘图不需要 sudo。`plot_pebs_clean.py` 是 2026-10-06 的固定数值展示脚本，可用 `--output-dir` 指定输出；新测量应使用读取原始数据的正式汇总工具。
+矩阵程序用于已准备好内核、RDMA 后端和 swap 的专用测试机，需要 root 执行，并以 `--user` 指定的普通用户运行负载；必须指定新的 `--output` 目录。离线汇总与绘图不需要 sudo。`plot_pebs_perf.py` 读取单次 campaign 的 manifest/summary；`plot_pebs_workloads.py` 读取多负载矩阵的 per-case CSV；`plot_page_selection_microbench.py` 读取 page-selection 运行目录。
 
 ## 其他基准和基线
 
@@ -50,7 +47,8 @@ python3 tools/rdma/pebs/summarize_pebs_campaign.py tools/rdma/results/pebs/20261
 python3 -m pytest tools/rdma/tests -q
 ```
 
-- `test_kernel_paths.py`：提取生产源码并编译宿主机 C harness，覆盖 RDMA 提交边界、失败排空与远端读取错误路径。
+- `test_kernel_paths.py`：提取生产源码并编译宿主机 C harness，覆盖 RDMA 提交边界、失败排空、远端读取错误、换入分配回退和最大粒度换出。
+- `test_pebs_policy.py`：执行生产窗口、fault-PC 足迹表和代价模型，验证时间边界、跨区域学习、隔离、淘汰和失效。
 - `test_pebs.py`：PEBS 作用域、mm 生命周期、Memcached 开销、THP、矩阵驱动、page-selection 微基准与绘图流程。
 
 QEMU 构建及回归仍位于 [tools/qemu-dram](../qemu-dram/)，其临时输出位于 `_work/`。
