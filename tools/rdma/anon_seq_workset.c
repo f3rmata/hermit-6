@@ -97,7 +97,7 @@ static unsigned char page_value(size_t page_index)
 static void usage(const char *name)
 {
 	fprintf(stderr,
-		"usage: %s <MiB> <huge|base> <folio-KiB> "
+		"usage: %s <MiB> <huge|base> <access-region-KiB> "
 		"<100|50|25|6.25|1p> <sequential|random> <high|low> "
 		"[seed] [threads]\n",
 		name);

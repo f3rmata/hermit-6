@@ -16,15 +16,17 @@ usage:
     ./run_anon_swapout_sweep.sh
 
 Anonymous-memory sparse/random swap-out/swap-in protocol benchmark. For every
-requested page size it fully populates a fresh working set, lowers memory.max
+maximum page size it fully populates a fresh working set, lowers memory.max
 to measure RDMA stores, keeps that fixed limit, and accesses a configurable
-subset of base pages in each folio while allowing concurrent reclamation.
+subset of base pages in each logical access region while allowing concurrent reclamation.
 
 Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
-  ACCESS_RATIOS="100 50 25 6.25 1p" (1p = one base page per folio;
-                  chunk64k = a contiguous 64 KiB chunk per folio)
-  ACCESS_ORDERS="sequential random" (folio traversal order)
+    Each value is a maximum allocation size; smaller orders remain eligible.
+  ACCESS_REGION_KB=2048  logical access region, independent of the allocation ceiling
+  ACCESS_RATIOS="100 50 25 6.25 1p" (1p = one base page per access region;
+                  chunk64k = a contiguous 64 KiB chunk per access region)
+  ACCESS_ORDERS="sequential random" (access region traversal order)
   ACCESS_LOCALITIES="high low"       (contiguous vs scattered base pages)
   ACCESS_SEED=1
   WORKSET_MB=16384
@@ -60,6 +62,7 @@ ACCESS_RATIOS=${ACCESS_RATIOS:-"100 50 25 6.25 1p"}
 ACCESS_ORDERS=${ACCESS_ORDERS:-"sequential random"}
 ACCESS_LOCALITIES=${ACCESS_LOCALITIES:-"high low"}
 ACCESS_SEED=${ACCESS_SEED:-1}
+ACCESS_REGION_KB=${ACCESS_REGION_KB:-2048}
 WORKSET_MB=${WORKSET_MB:-16384}
 LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-70}
 LIMIT_MB=${LIMIT_MB:-$((WORKSET_MB * LOCAL_RATIO_PCT / 100))}
@@ -166,6 +169,7 @@ mkdir -p "$RESULT_DIR"
     "$SWAPOUT_TRIGGER"
   printf 'access_ratios=%s\naccess_orders=%s\naccess_localities=%s\naccess_seed=%s\n' \
     "$ACCESS_RATIOS" "$ACCESS_ORDERS" "$ACCESS_LOCALITIES" "$ACCESS_SEED"
+  printf 'page_size_policy=max\naccess_region_kb=%s\n' "$ACCESS_REGION_KB"
   printf 'backend=%s\n' "$(detect_rswap_backend)"
   printf 'swap:\n'
   sed 's/^/  /' /proc/swaps
@@ -179,9 +183,7 @@ rdma_log "planned runs: $((page_count * ratio_count * order_count * locality_cou
 
 for kb in $PAGE_SIZES_KB; do
   order=$(page_order "$kb") || rdma_die "unsupported page size: ${kb} KiB"
-  configure_page_size "$kb" "$order" || rdma_die "THP size ${kb} KiB is unavailable"
-  effective=$(sudo_cat "$EFFECTIVE_MASK_FILE")
-  (( (effective & (1 << order)) != 0 )) || rdma_die "effective mask $effective lacks order $order"
+  configure_page_size "$kb" || rdma_die "THP size ${kb} KiB is unavailable"
 
   for access_ratio in $ACCESS_RATIOS; do
     ratio_label=${access_ratio//./p}
@@ -198,7 +200,7 @@ for kb in $PAGE_SIZES_KB; do
     advice=huge
     [ "$kb" != 4 ] || advice=base
 
-    taskset -c "$BENCH_CPUS" "$BIN" "$WORKSET_MB" "$advice" "$kb" \
+    taskset -c "$BENCH_CPUS" "$BIN" "$WORKSET_MB" "$advice" "$ACCESS_REGION_KB" \
       "$access_ratio" "$access_order" "$access_locality" "$access_seed" \
       "$BENCH_THREADS" > "$log" 2>&1 &
     current_pid=$!

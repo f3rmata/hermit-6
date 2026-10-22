@@ -26,6 +26,7 @@ Important environment:
   BINDING=redis                     (redis or memcached)
   YCSB_BIN=$HOME/ycsb-0.17.0/bin/ycsb
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
+    Each value is a maximum allocation size; smaller orders remain eligible.
   YCSB_WORKSET_MB=16384             (target total value bytes; used only for
                                      sanity checks, recordcount controls size)
   YCSB_RECORDCOUNT=8192             (keys to load; default fits 2 MiB * 16 GiB)
@@ -294,9 +295,7 @@ fi
 
 for kb in $PAGE_SIZES_KB; do
   order=$(page_order "$kb") || rdma_die "unsupported page size: ${kb} KiB"
-  configure_page_size "$kb" "$order" || rdma_die "THP size ${kb} KiB is unavailable"
-  effective=$(sudo_cat "$EFFECTIVE_MASK_FILE")
-  (( (effective & (1 << order)) != 0 )) || rdma_die "effective mask $effective lacks order $order"
+  configure_page_size "$kb" || rdma_die "THP size ${kb} KiB is unavailable"
 
   for repeat in $(seq 1 "$BENCH_REPEATS"); do
     run_dir="$RESULT_DIR/${kb}k/r${repeat}"

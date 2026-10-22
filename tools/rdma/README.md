@@ -17,7 +17,7 @@
 当前设计、实测结论和操作步骤见 [PEBS 设计](../../docs/pebs/design.md)
 
 - Memcached 采样开销：`pebs/run_memcached_sampling_cost.py`，固定并发，比较同页大小的采样开关。
-- 多负载矩阵：`pebs/run_workload_matrix.py`，1323 个样本，PEBS 按工作负载 pid 启用。
+- 多负载矩阵：`pebs/run_workload_matrix.py`，默认 1323 个样本（去掉 XGBoost 为 1134），PEBS 按工作负载 pid 启用。`--pages` 表示每轮**最大分配页大小**，保留全部较小 THP 档位。
 - 页面选择微基准：`pebs/run_page_selection_microbench.py`。
 
 旧版 Memcached 矩阵 `pebs_perf_matrix.py` 保留用于复现 2026-10-06 的条件；当前实验优先使用上面的入口。
@@ -26,7 +26,28 @@
 python3 tools/rdma/pebs/pebs_perf_matrix.py --help
 ```
 
-矩阵程序用于已准备好内核、RDMA 后端和 swap 的专用测试机，需要 root 执行，并以 `--user` 指定的普通用户运行负载；必须指定新的 `--output` 目录。离线汇总和绘图脚本已移除；历史图表与结论见 [PEBS 评估](../../docs/pebs/evaluation.md)，原始数据在 `results/pebs/`。
+旧版 `pebs_perf_matrix.py` 用 root 执行并通过 `--user` 指定负载用户。当前多负载矩阵用普通用户执行，预先运行 `sudo -v`，并使用新的输出目录：
+
+```sh
+python3 tools/rdma/pebs/run_workload_matrix.py \
+  --suites anon-1t-full anon-1t-chunk64k anon-8t-full anon-8t-chunk64k redis ycsb \
+  --pages 4 16 32 64 128 256 512 1024 2048 \
+  --output tools/rdma/results/pebs/matrix-max-pages --dry-run
+```
+
+移除 `--dry-run` 才执行负载。每轮只设置 THP 分配上限，例如 64KiB 轮允许 4/16/32/64KiB，2MiB 轮允许所有较小档位；实际分配及预取粒度由内核和 Hermit 决定。off/static/policy 和采样周期仍按原来的配对、随机顺序、重复次数运行。
+
+运行前应准备好 Hermit、RDMA 和 swap。脚本保留 `remote_order_mask`、`pebs_force_order`、学习阈值、自适应开关以及回收/批处理参数，只记录其值；启用强制 order 或后端缺少上限以内的档位会在启动检查中报错。例如完整 4KiB–2MiB 矩阵要求 `effective_order_mask` 包含 `0x3fd`，旧实验恢复的 `0x1` 不满足条件。脚本不会替换这个掩码。退出时恢复本次修改的 THP 设置及采样模式/周期。
+
+匿名负载的逻辑访问区域固定为 2MiB（单独运行时可设 `ACCESS_REGION_KB`），`chunk64k` 始终访问每个区域的 64KiB；访问量不再随页上限变化。16GiB 工作集的覆盖量固定为 512MiB。历史字段 `pages_per_folio` 表示逻辑区域的页数，不代表实际分配 folio。
+
+新结果标记 `page_policy=max-allocation-v1`，包含：
+
+- `summary.csv`：每轮 `max_page_kb`、应用吞吐、计时及有效性。匿名吞吐按访问页面覆盖量计算，每页实际读取一个字节；Redis 为 GET/s、YCSB 为 ops/s、XGBoost 为 rounds/s。
+- `granularity.csv`：按准备阶段/应用阶段、order 记录 folio 请求数、实际 RDMA WR 数/字节数/读字节占比、PEBS 决策数和内核提供的实际换入计数。旧内核缺少 `actual_order_N` 时留空；off 的 PEBS 计数不表示全部换入流量。
+- 每轮 `measurement.json` 和原始 `order-*.txt`、`.wr`、`.pebs`、`.thp`：保留性能、粒度分布及实际 THP 设置。原负载 CSV 的 `page_kb` 是上限，`target_*` 只统计该上限 order；分析所有粒度应使用 `granularity.csv`。
+
+后端计数是整机计数，需要独占测试机；folio 请求大小、PEBS 决策和实际 WR 粒度不可互相替代。旧结果的单档限制及匿名访问量与新版本不同，不应直接混合汇总。历史图表与结论见 [PEBS 评估](../../docs/pebs/evaluation.md)，原始数据在 `results/pebs/`。
 
 ## 其他基准和基线
 

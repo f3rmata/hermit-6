@@ -583,6 +583,10 @@ detect_rswap_backend() {
 
 configure_hermit_mode() {
   local flag backend
+  if [ "${PAGE_SIZE_POLICY:-}" = max ]; then
+    rdma_log "Preserving Hermit controls; sweep changes only the THP allocation ceiling"
+    return 0
+  fi
   mount_debugfs_if_needed
 
   if ! sudo_test -d /sys/kernel/debug/hermit 2>/dev/null; then

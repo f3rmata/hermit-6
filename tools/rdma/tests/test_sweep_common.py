@@ -1,5 +1,7 @@
 """Shared sweep mechanics, using fixture counters and files instead of a live host."""
 from pathlib import Path
+import select
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -41,10 +43,11 @@ class SweepTests(unittest.TestCase):
             before.unlink()
             self.assertNotEqual(shell('summarize_loads "$1" "$2" 1', before, after, check=False).returncode, 0)
 
-    def test_page_size_changes_restore_original_policy(self):
+    def test_allocation_ceiling_keeps_smaller_orders_and_never_writes_mask(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            policies = {'enabled': 'madvise', 'hugepages-64kB/enabled': 'always',
+            policies = {'enabled': 'madvise', 'hugepages-16kB/enabled': 'never',
+                        'hugepages-32kB/enabled': 'never', 'hugepages-64kB/enabled': 'always',
                         'hugepages-2048kB/enabled': 'inherit'}
             for path, policy in policies.items():
                 file = root/path
@@ -55,20 +58,31 @@ class SweepTests(unittest.TestCase):
             result = shell('''
                 THP_ROOT=$1; REMOTE_MASK_FILE=$1/remote_order_mask; RESTORE_THP=1
                 sudo_cat() { cat "$1"; }
-                sudo_write() { printf '%s\n' "$1" > "$2"; }
+                sudo_write() {
+                    [ "$2" != "$REMOTE_MASK_FILE" ] || exit 31
+                    printf '[%s]\n' "$1" > "$2"
+                }
                 save_thp_state
-                configure_page_size 64 "$(page_order 64)"
-                cat "$THP_ROOT/enabled" "$THP_ROOT/hugepages-64kB/enabled" \
-                    "$THP_ROOT/hugepages-2048kB/enabled" "$REMOTE_MASK_FILE"
-                configure_page_size 4 "$(page_order 4)"
-                cat "$THP_ROOT/enabled" "$THP_ROOT/hugepages-64kB/enabled" \
-                    "$THP_ROOT/hugepages-2048kB/enabled" "$REMOTE_MASK_FILE"
+                for cap in 4 16 32 64 2048; do
+                    configure_page_size "$cap"
+                    for file in enabled hugepages-16kB/enabled hugepages-32kB/enabled \
+                                hugepages-64kB/enabled hugepages-2048kB/enabled; do
+                        selected_policy "$THP_ROOT/$file"
+                    done
+                done
+                # Hermit configuration must also be read-only in ceiling sweeps.
+                mount_debugfs_if_needed() { exit 32; }
+                set_hermit_flag() { exit 33; }
+                set_debugfs_file() { exit 34; }
+                configure_hermit_mode
                 restore_thp_state
             ''', root)
             self.assertEqual(result.stdout.splitlines(),
-                             ['never', 'always', 'never', '0x11', 'never', 'never', 'never', '0x1'])
+                             ['never']*5 + ['never', 'always', 'never', 'never', 'never'] +
+                             ['never', 'always', 'always', 'never', 'never'] +
+                             ['never', 'always', 'always', 'always', 'never'] + ['always']*5)
             for path, policy in policies.items():
-                self.assertEqual((root/path).read_text().strip(), policy)
+                self.assertEqual((root/path).read_text().strip(), f'[{policy}]')
             self.assertEqual(mask.read_text().strip(), '0x3fd')
 
     def test_quiet_wait_tracks_last_change_and_times_out(self):
@@ -94,6 +108,46 @@ class SweepTests(unittest.TestCase):
                     else:
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result.stdout, expected)
+
+    def test_ceiling_write_failure_is_not_reported_as_success(self):
+        result = shell('''
+            THP_ROOT=/fixture; thp_files=(/fixture/enabled)
+            sudo_write() { return 1; }
+            if configure_page_size 4; then exit 9; fi
+        ''')
+        self.assertEqual(result.returncode, 0)
+
+    def test_chunk_access_geometry_is_independent_of_page_advice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory)/'anon-workset'
+            subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-std=c11', '-pthread',
+                            '-o', str(binary), str(COMMON.parent/'anon_seq_workset.c')], check=True)
+            for advice in ('base', 'huge'):
+                with self.subTest(advice=advice):
+                    p = subprocess.Popen([str(binary), '4', advice, '2048', 'chunk64k',
+                                          'sequential', 'high', '1', '1'], stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True)
+                    def response(prefix):
+                        self.assertTrue(select.select([p.stdout], [], [], 10)[0], 'worker timed out')
+                        line = p.stdout.readline()
+                        self.assertTrue(line.startswith(prefix), line)
+                        return dict(word.split('=', 1) for word in line.split()[1:])
+                    try:
+                        response('WAITING')
+                        p.send_signal(signal.SIGUSR1)
+                        ready = response('READY')
+                        self.assertEqual(int(ready['accessed_pages']), 32)
+                        self.assertEqual(int(ready['accessed_bytes']), 128*1024)
+                        p.send_signal(signal.SIGUSR2)
+                        scan = response('SCAN')
+                        self.assertEqual(scan['accessed_bytes'], ready['accessed_bytes'])
+                        self.assertEqual(scan['checksum_errors'], '0')
+                        p.terminate()
+                        self.assertEqual(p.wait(timeout=10), 0)
+                    finally:
+                        if p.poll() is None:
+                            p.kill(); p.wait()
+                        p.stdout.close(); p.stderr.close()
 
 
 if __name__ == '__main__':

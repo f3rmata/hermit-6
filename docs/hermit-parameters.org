@@ -1,0 +1,286 @@
+#+title: Hermit 参数配置汇总
+#+date: 2026-10-22
+#+language: zh-CN
+#+options: toc:2 num:nil
+
+* 范围与当前状态
+
+本文根据当前工作区源码整理，区分 *内核初始化默认值*、*实验脚本覆盖值* 和 *只读统计接口*。
+
+- Hermit 控制目录：=/sys/kernel/debug/hermit/=。普通开关和数值参数一般为 root 可读写，统计项只读。
+- PEBS 历史按进程地址空间 =mm= 保存，可按 PID 启用或使用 =pebs_all=，*不要求 memcg*。
+- =apt_reclaim= 是独立的 memcg 主动回收功能，只有编译 =CONFIG_MEMCG=y= 时才提供相关控制项。
+- 当前 PEBS 策略只选择 *swap-in folio 大小*；swap-out 完整写出原 folio，采用允许的最大传输粒度，不合并冷页。
+
+当前本地 =linux-stable/.config= 中，=CONFIG_HERMIT=、=CONFIG_MEMCG=、=CONFIG_SWAP=、
+=CONFIG_TRANSPARENT_HUGEPAGE=、=CONFIG_PERF_EVENTS=、=CONFIG_DEBUG_FS= 和 =CONFIG_X86_64= 均为 =y=。
+THP 编译默认策略为 =MADVISE=；实际运行时 THP/mTHP 配置仍需读取 sysfs。
+=CONFIG_HERMIT= 的 Kconfig 依赖为 =X86_64 && SWAP && DEBUG_FS=，没有 MEMCG 依赖。
+
+* 基础换入与回收开关
+
+以下文件均位于 =/sys/kernel/debug/hermit/=。布尔项初始值全部为 =N=，可写入 =Y/N=。
+
+| 参数 | 内核默认值 | 当前作用 |
+|------+------------+----------|
+| =bypass_swapcache= | N | 对满足条件的远端 entry 使用 direct swap-in 路径；PEBS folio 选择接入该路径中的分配逻辑 |
+| =speculative_io= | N | 在 direct fault 路径提前提交异步 load，与缺页元数据处理重叠；不是独立邻页预取 |
+| =lazy_poll= | N | Y 时先非阻塞 poll 并忙等，超过固定 100 ms 上限后调用等待式 poll；N 时直接等待完成 |
+| =apt_reclaim= | N | 为接近 memory.max 的非根 memcg 调度主动回收；需 CONFIG_MEMCG=y |
+| =batch_swapout= | N | 兼容占位：有节点，当前源码未读取此开关 |
+| =batch_tlb= | N | 兼容占位：有节点，当前源码未读取此开关 |
+| =batch_io= | N | 兼容占位：有节点，当前源码未读取此开关 |
+| =batch_account= | N | 兼容占位：有节点，当前源码未读取此开关 |
+| =vaddr_swapout= | N | 兼容占位：有节点，当前源码未读取此开关 |
+| =speculative_lock= | N | 兼容占位：有节点，当前源码未读取此开关 |
+
+部分旧脚本还处理 =exclusive_swapout=、=swap_thread=、=prefetch_thread=，但当前内核没有创建这些节点。
+不能据此认为当前版本实现了对应功能，也不能把上述占位开关设为 Y 当作性能优化已经生效。
+
+** memcg 主动回收参数
+
+仅在 =CONFIG_MEMCG=y= 时暴露；PEBS 页大小策略本身不需要这些参数。
+
+| 参数 | 内核默认值 | 单位/语义 |
+|------+------------+-----------|
+| =reclaim_mode= | 0 | 1 使用多个回收 worker；其他值均使用 1 个 worker |
+| =sthd_cnt= | min(在线 CPU 数, 4) | reclaim_mode=1 时生效，执行时裁剪到 1..16 |
+| =reclaim_headroom_pages= | 2048 | 基础页数；4 KiB 页下等于 8 MiB，剩余配额不足该值时触发主动回收；0 不触发 |
+
+主动回收还要求 =apt_reclaim=Y=、非根 memcg、有限的 =memory.max=。
+只设置 =sthd_cnt=16= 而保留 =reclaim_mode=0=，实际仍使用一个 worker。
+回收任务使用 =system_unbound_wq=；=sthd_cnt= 不是整个 RDMA 客户端的线程数。
+
+* 远端传输粒度
+
+| 参数 | 内核默认值 | 说明 |
+|------+------------+------|
+| =remote_order_mask= | 0x1 | 可写；允许的远端传输 order 位图，必须包含 bit 0，只允许 order 0、2..9 |
+| =effective_order_mask= | 由后端决定 | 只读；remote_order_mask 与后端能力的交集，并始终包含 bit 0；未注册后端时为 0x1 |
+
+4 KiB 基础页下，大小为 =4096 << order=：
+
+| order | 大小 | 单独允许该粒度并保留 4 KiB 的掩码 |
+|-------+------+-----------------------------------|
+| 0 | 4 KiB | 0x1 |
+| 2 | 16 KiB | 0x5 |
+| 3 | 32 KiB | 0x9 |
+| 4 | 64 KiB | 0x11 |
+| 5 | 128 KiB | 0x21 |
+| 6 | 256 KiB | 0x41 |
+| 7 | 512 KiB | 0x81 |
+| 8 | 1 MiB | 0x101 |
+| 9 | 2 MiB | 0x201 |
+
+=0x3fd= 允许全部上述粒度；order 1（8 KiB）不在支持范围。
+
+- *swap-out*：选取不超过原 folio 且在有效掩码中的最大分片，完整写出原 folio。
+- *swap-in 的 WR*：若有效掩码包含当前 folio order，整 folio 一个 WR；否则沿用按 4 KiB 分片的规则。
+  读侧不会自动选择掩码中的次大 order。
+- *swap-in 的 folio*：还受远端 extent、连续 swap PTE、地址对齐、VMA/THP 策略及分配结果约束。
+  当前 2 MiB 候选额外要求远端 extent 为 order 9，且有效掩码包含 bit 9。
+- =remote_order_mask=0x1= 只限制传输粒度，不保证实际分配和换入 folio 都是 4 KiB。
+- 允许大粒度不等于创建大页；已成为 4 KiB 远端 extent 的页面不会仅靠调整掩码重新合并。
+
+* PEBS 参数
+
+** 启用范围与模式
+
+| 参数 | 内核默认值 | 说明 |
+|------+------------+------|
+| =pebs_enabled= | 0 | 缺页跟踪/策略开关；直接写 1 不会创建 perf 事件，写 0 也不销毁已有采样会话，完整启停应使用 syscall |
+| =pebs_all= | 0 | 1 跟踪所有 mm；0 只跟踪显式按 PID 启用的 mm |
+| =pebs_mode= | 0 | 0 为 static：采样开启时可收集历史，但不使用模型选择 folio；1 为 policy |
+| =pebs_force_order= | 0 | 0 关闭覆盖；通常用 2..9 指定换入 folio 上限，再选最大合法候选；只影响 swap-in |
+
+=pebs_force_order= 非零且 =pebs_enabled= 非零时，覆盖逻辑先于模式和 mm 范围检查，具有全局实验作用域。
+它仍受合法候选约束；大于 9 的值按 9 裁剪，值 1 只剩 order 0 候选。
+因此写入 =0= 表示“关闭强制覆盖”，不是“强制 4 KiB”。
+
+自定义 syscall 仅适用于本项目内核，均要求 =CAP_SYS_ADMIN=：
+
+| 接口 | x86-64 编号 | 参数与行为 |
+|------+-------------+------------|
+| =hermit_pebs_start(pid, mode)= | 473 | pid>0 同时启用目标 mm；pid=-1 只启动/更新全局采样。mode=-1 保留模式，0/1 切换模式 |
+| =hermit_pebs_end(pid)= | 474 | 当前忽略 pid，停止全局采样会话，并非仅停止某一个进程 |
+
+已有按 PID 启用工具：[[file:../tools/rdma/pebs/enable_pebs_pid.py][enable_pebs_pid.py]]。
+模式是全局的，不是每个 PID 各自独立的模式。=pebs_all= 不会自动启动采样器。
+启动/停止会话以及再次按 PID 启用会使对应旧历史逻辑失效；仅写 debugfs 开关不等价于完整会话重启。
+
+** 采样频率
+
+采样周期的单位是 *事件次数/样本*，不是毫秒；周期越小，采样越密。
+
+| 参数 | 内核默认值 | 说明 |
+|------+------------+------|
+| =pebs_load_period= | 0 | 0 使用周期表，启动值 199；非零使用指定 load 周期 |
+| =pebs_store_period= | 0 | 0 使用周期表，启动值 100003；非零使用指定 store 周期 |
+| =pebs_adaptive= | 1 | 1 按约 2 秒的样本计数窗口调整周期表索引；0 停止自适应 |
+
+load 周期表从 =199= 到 =19997=，store 周期表为
+=100003, 300007, 600011, 1000003, 1500003=。
+每个自适应窗口采样数大于 50000 时增大周期，低于 1000 时减小周期。
+显式设置非零周期时，该事件优先使用指定周期；固定频率实验通常同时设置 =pebs_adaptive=0=。
+周期参数应在采样停止时设置，避免只修改变量却尚未更新已打开的 perf 事件。
+
+事件配置保留为：load =0x1d3=（Cascade Lake 的 LOCAL_DRAM load-miss 事件）、store =0x82d0=。
+事件为所有在线 CPU 上的用户态 per-CPU 事件；按 PID 过滤的是历史归属，不是 PMU 采样范围。
+调整 =hermit_pebsd= CPU 亲和性只改变 ring 消费位置。每个事件/CPU 的 ring 为 32 个数据页。
+
+** 观测窗口与跨区域足迹
+
+| 参数 | 内核默认值 | 单位与作用 |
+|------+------------+------------|
+| =pebs_window_ms= | 10 | ms；固定观测时长，另有同样长的样本收集宽限期；0 不建立新窗口，模型选择回退基础页 |
+| =pebs_history_ms= | 1000 | ms；已完成窗口的历史 TTL，从窗口结束时间计算 |
+| =pebs_min_regions= | 4 | 至少需要的不同虚拟区域数；有效范围 1..8 |
+| =pebs_min_samples= | 32 | 历史中累计 PEBS load 样本下限；必须大于 0；不是不同页面数 |
+| =pebs_region_max= | 32768 | 每 mm 区域表容量上限；按 LRU 淘汰，新建/复用判断至少按 1 项处理 |
+| =pebs_pc_max= | 4096 | 每 mm fault-PC 表容量上限；按 LRU 淘汰，新建/复用判断至少按 1 项处理 |
+
+区域固定为 2 MiB，含 512 个基础页；每区域两个窗口槽，load/store 位图分离。
+跨区域键为同一 mm 中的 =(fault-PC, 触发页偏移)=，每个键保留最近 8 个完成窗口。
+首次成功处理的区域远程缺页启动窗口，以缺页入口时间计时；后续访问不延长窗口。
+样本按 =CLOCK_MONOTONIC= 事件时间归属，允许 ring 消费乱序；超过宽限期不再修改已发布历史。
+
+模型使用 demand fault 与 load 足迹，store 数据留作后续换出策略接口。
+缺少真实用户 fault-PC、历史不足、历史过期或相关参数非法时，policy 选择 4 KiB。
+未被采到不等于页面一定未访问；容量和时间窗口参数宜在停止采样后修改。
+缩小容量参数不主动遍历收缩已分配表项，主要约束后续新建/复用。
+
+** 代价模型
+
+#+begin_example
+C(order) = [L_read + N_WR(order) * L_WR + B(order) / BW] / U(order)
+#+end_example
+
+=B= 是实际读回字节数，=U= 是历史窗口中的平均观测有效页数；本次 demand 页始终计入，因此 =U>=1=。
+固定开销和传输开销统一按有效页摊销，成本相等选择较小 folio。
+
+| 参数 | 内核默认值 | 单位与作用 |
+|------+------------+------------|
+| =pebs_fixed_cost_ns= | 7000 | ns/逻辑读取；L_read，不再解释为每 WR 固定成本 |
+| =pebs_wr_cost_ns= | 0 | ns/WR；额外的 L_WR，默认不重复摊入整次读取延迟 |
+| =pebs_bw_mibps= | 12288 | MiB/s；传输带宽模型参数，0 使模型回退基础页 |
+| =pebs_hysteresis= | 900 | 千分比；相对同一 PC 上次合法预测，通常需至少 10% 成本改善才切换；有效范围 0..1000 |
+| =pebs_min_f= | 50 | 已弃用的密度下限兼容节点；不参与新模型 |
+| =pebs_cooling_period= | 100000 | 已弃用的样本冷却周期兼容节点；不参与新窗口 |
+
+代价参数是配置值，不是自动测量结果。滞回不会阻止证据失效时退回 4 KiB，也不会覆盖“成本相等选较小页”的规则。
+
+* 后端模块参数
+
+模块参数目录通常为 =/sys/module/rswap_client/parameters/=。RDMA 与 DRAM 测试后端提供的项目不同。
+
+| 参数 | 源码初始值 | 权限/生效时机 | 说明 |
+|------+------------+---------------+------|
+| =sip= | 空字符串 | 0644；初始化时使用 | RDMA 服务端 IPv4 地址，加载模块时提供 |
+| =sport= | 0 | 0644；初始化时使用 | RDMA 服务端端口，加载模块时提供 |
+| =rmsize= | 0 | 0644；初始化时使用 | 远端内存容量，模块接口标注单位 GB；加载模块时提供 |
+| =max_order= | 9 | 0444；可作为加载参数 | RDMA 单 WR 最大 order，初始化时最多裁剪到 9，决定后端支持掩码 |
+| =wr_stats= | 计数器初始为 0 | 0444，只读 | 按实际 WR order 统计读写请求数和字节数，包含重试 |
+| =force_local= | N | 0644，仅 DRAM 后端 | 诊断用；拒绝 backend store，使写出回到原生 swap |
+
+=sip/sport/rmsize= 虽然节点可写，当前实现没有重连或扩容回调；写 sysfs 不代表已运行后端会重新配置。
+DRAM 后端忽略网络地址参数，只公布 order 0 能力，因此不能用它证明 RDMA 大 WR 的性能收益。
+
+* 实验脚本配置与内核默认值的区别
+
+以下是脚本行为，不是已应用到某台机器的实时值。
+
+** 多负载矩阵：run_workload_matrix.py
+
+当前工作区版本采用 =max-allocation-v1=，设置 =PAGE_SIZE_POLICY=max=。
+通过 =--pages= 扫描最大分配粒度，默认包含 =4/16/32/64/128/256/512/1024/2048 KiB=，
+同时保留所有不超过该上限的可用 THP order；它不是强制每个 folio 必须达到指定大小。
+远端掩码、回收开关和 PEBS 模型参数保留运行前的值；同一分配上限下各 case 改变采样会话、模式和周期。
+
+- case：=off=、=static-周期=、=policy-周期=。
+- load 周期默认依次包含 =19997 / 1999 / 199=；store 周期默认 =1500003=。
+- =pebs_adaptive=、窗口参数、阈值和成本参数保留现场值；检查 =pebs_force_order= 未启用。
+- 工作集默认 16384 MiB，本地内存比例 70%；这是负载/内存预算参数，不是 PEBS 窗口参数。
+- =common.sh= 的 max 路径跳过 Hermit 模式重配置；THP 分配上限由 sweep 设置和恢复。
+  不要把旧版本中设置回收线程数和掩码的行为套到该路径。
+
+** Memcached 矩阵与页面选择微基准
+
+[[file:../tools/rdma/pebs/pebs_perf_matrix.py][pebs_perf_matrix.py]] 和
+[[file:../tools/rdma/pebs/run_page_selection_microbench.py][run_page_selection_microbench.py]] 仍明确设置如下控制项：
+
+| 参数 | 脚本覆盖值 | 与内核默认的区别 |
+|------+------------+------------------|
+| =bypass_swapcache= | Y | 默认 N |
+| =speculative_io= | Y | 默认 N |
+| =lazy_poll= | N | 保持等待式 poll |
+| =apt_reclaim= | Y | 默认 N；这些脚本仍使用 memcg 限额 |
+| =reclaim_mode= | 1 | 默认 0，启用多 worker |
+| =reclaim_headroom_pages= | 16384 | 64 MiB，而默认是 2048 页/8 MiB |
+| =sthd_cnt= | 4 | 配合 reclaim_mode=1 使用 |
+| =pebs_force_order= | 0 | 禁用强制 order 实验覆盖 |
+
+页面选择微基准还固定 =pebs_adaptive=0=，默认 load/store 周期为 =1999/1500003=。
+其 =all-off/sample-only/dynamic= 使用 =0x3fd=，分别不开采样、static、policy；
+=fixed-4k/64k/512k/2048k= 会同时配置 THP 和对应的基础页加目标 order 掩码。
+Memcached 矩阵保留系统 THP 设置；其 =off= 使用 =0x1=，一般 static/policy case 使用 =0x3fd=，
+=off-original-mask= 保留原掩码。不能把 Memcached 的 =off= 直接视为纯 4 KiB folio 基线。
+
+* 只读统计与测试接口
+
+| 接口 | 作用 | 解读要点 |
+|------+-------+----------|
+| =order_stats= | 按 folio order 统计 stores、loads、fallback_4k、errors | folio 数不是 WR 数；fallback_4k 不表示 folio 已拆为基础页 |
+| =pebs_order_stats= | 预测 order、实际 order、窗口/表/采样计数 | 数字 order 行是预测；actual_order_N 是成功映射的远程 folio 大小计数 |
+| =effective_order_mask= | 当前有效传输能力 | 需与配置掩码和模块 max_order 一起看 |
+| 模块 =wr_stats= | 实际 WR 数及传输字节 | 用它计算读写流量；包含异常重试流量 |
+| =pebs_test_eval= | 写入 8 个十六进制 u64 位图，读取模型评估 | 构造 8 个完成历史窗口的测试输入，不是工作负载测量 |
+| =pebs_test_offset= | 默认 0 | 仅测试用，fault 页偏移 0..511 |
+| =pebs_test_candidates= | 默认 0x3fd | 仅测试用，候选 folio order 掩码 |
+| =pebs_ring_test= | ring 跨页/回绕及 perf 事件生命周期测试 | 读取会执行测试，不属于纯配置查询 |
+
+=pebs_order_stats= 中常用诊断字段为 =unknown=、=pc_hit=、=insufficient_evidence=、
+=windows_completed=、=history_expired=、=samples_late_or_untracked=、=metadata_alloc_failed=、
+=table_evictions=、=allocation_fallback= 和 =forced=。
+=sampled= 是全局样本计数，并不等于目标 mm 中已用于训练的样本数；
+=lost= 混合 ring 异常与丢失记录事件计数，不能直接当作精确丢样数。
+
+* 核对实际生效配置
+
+在目标实验机上读取以下项目，才能确认当前生效值。该片段仅输出信息，不调用测试节点或修改参数。
+需要有 debugfs 读取权限；未挂载或无权限时应先由实验机操作者处理。
+
+#+begin_src sh
+hermit_debug=/sys/kernel/debug/hermit
+uname -r
+for key in bypass_swapcache speculative_io lazy_poll apt_reclaim \
+    sthd_cnt reclaim_mode reclaim_headroom_pages remote_order_mask effective_order_mask \
+    pebs_enabled pebs_all pebs_mode pebs_force_order pebs_adaptive \
+    pebs_load_period pebs_store_period pebs_window_ms pebs_history_ms \
+    pebs_min_regions pebs_min_samples pebs_region_max pebs_pc_max \
+    pebs_fixed_cost_ns pebs_wr_cost_ns pebs_bw_mibps pebs_hysteresis; do
+    if [ -r "$hermit_debug/$key" ]; then
+        printf '%s=' "$key"
+        cat "$hermit_debug/$key"
+    else
+        printf '%s=unavailable\n' "$key"
+    fi
+done
+for path in /sys/kernel/mm/transparent_hugepage/enabled \
+    /sys/kernel/mm/transparent_hugepage/hugepages-*kB/enabled \
+    /sys/module/rswap_client/parameters/max_order; do
+    if [ -r "$path" ]; then
+        printf '%s=' "$path"
+        cat "$path"
+    fi
+done
+#+end_src
+
+* 源码依据
+
+- [[file:../linux-stable/mm/hermit.c][mm/hermit.c]]、[[file:../linux-stable/include/linux/hermit.h][include/linux/hermit.h]]：基础开关、回收变量及初始化默认值。
+- [[file:../linux-stable/mm/memcontrol.c][mm/memcontrol.c]]：主动回收触发条件及 worker 数语义。
+- [[file:../linux-stable/mm/hermit_backend.c][mm/hermit_backend.c]]、[[file:../linux-stable/mm/page_io.c][mm/page_io.c]]：有效掩码、读写分片与 poll。
+- [[file:../linux-stable/mm/hermit_pebs.c][mm/hermit_pebs.c]]、[[file:../linux-stable/mm/hermit_pebs_policy.h][mm/hermit_pebs_policy.h]]：PEBS 参数、syscall、窗口、足迹表及成本计算。
+- [[file:../remoteswap/client/rswap_client.c][rswap_client.c]]、[[file:../remoteswap/client/rswap_rdma_ops.c][rswap_rdma_ops.c]]、[[file:../remoteswap/client/rswap_dram_ops.c][rswap_dram_ops.c]]：模块参数。
+- [[file:../tools/rdma/pebs/run_workload_matrix.py][run_workload_matrix.py]]、[[file:../tools/rdma/common.sh][common.sh]]：当前多负载矩阵的保留配置路径。
+- [[file:pebs/design.md][PEBS 设计文档]]：策略数据路径和实现限制。

@@ -22,6 +22,7 @@ keeps that fixed limit, and GET-scans the keys while allowing concurrent reclama
 
 Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
+    Each value is a maximum allocation size; smaller orders remain eligible.
   REDIS_WORKSET_MB=16384            (total value bytes to load)
   REDIS_VALUE_SIZE=2097152          (bytes per value; default 2 MiB)
   REDIS_SCAN_CHUNK=65536            (read first 64 KiB of each value during
@@ -251,9 +252,7 @@ export REDIS_CHECKSUM
 
 for kb in $PAGE_SIZES_KB; do
   order=$(page_order "$kb") || rdma_die "unsupported page size: ${kb} KiB"
-  configure_page_size "$kb" "$order" || rdma_die "THP size ${kb} KiB is unavailable"
-  effective=$(sudo_cat "$EFFECTIVE_MASK_FILE")
-  (( (effective & (1 << order)) != 0 )) || rdma_die "effective mask $effective lacks order $order"
+  configure_page_size "$kb" || rdma_die "THP size ${kb} KiB is unavailable"
 
   for active_ratio in $REDIS_ACTIVE_RATIOS; do
     REDIS_ACTIVE_RATIO=$active_ratio

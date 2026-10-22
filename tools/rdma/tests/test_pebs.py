@@ -32,6 +32,8 @@ thp = importlib.util.module_from_spec(thp_spec)
 thp_spec.loader.exec_module(thp)
 THP_ROOT = '/sys/kernel/mm/transparent_hugepage/'
 
+PEBS = RDMA / 'pebs'
+sys.path.insert(0, str(PEBS))
 MATRIX_PATH = RDMA / 'pebs/run_workload_matrix.py'
 matrix_spec = importlib.util.spec_from_file_location('matrix', MATRIX_PATH)
 assert matrix_spec is not None and matrix_spec.loader is not None
@@ -40,8 +42,6 @@ matrix_spec.loader.exec_module(matrix)
 
 
 
-PEBS = RDMA / 'pebs'
-sys.path.insert(0, str(PEBS))
 import page_selection_metrics as metrics
 import run_page_selection_microbench as runner
 
@@ -188,6 +188,7 @@ class MatrixTests(unittest.TestCase):
             self.assertIn('sweep_common.sh', hashes)
             self.assertIn('pebs/enable_pebs_pid.py', hashes)
             self.assertIn('pebs/run_workload_matrix.py', hashes)
+            self.assertIn('pebs/page_selection_metrics.py', hashes)
             for name, digest in hashes.items():
                 self.assertEqual(hashlib.sha256((source/name).read_bytes()).hexdigest(), digest)
             for script in {entry[0] for entry in matrix.SUITES.values()}:
@@ -205,8 +206,10 @@ class MatrixTests(unittest.TestCase):
         data = json.loads(result)
         self.assertEqual(data['samples'], 1323)
         self.assertEqual(data['memory_policy'], 'fixed-max-v1')
+        self.assertEqual(data['page_policy'], 'max-allocation-v1')
         blocks = {}
         for row in data['plan']:
+            self.assertEqual(row['max_page_kb'], row['page_kb'])
             blocks.setdefault((row['suite'],row['page_kb'],row['repeat']), []).append(row)
         self.assertEqual(len(blocks),189)
         for rows in blocks.values():
@@ -215,9 +218,11 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual({r['store_period'] for r in rows},{1500003})
             self.assertEqual({r['load_period'] for r in rows},{0,199,1999,19997})
         env=data['environment']
-        for key,value in dict(WORKSET_MB='16384',LOCAL_RATIO_PCT='70',STHD_CNT='16',
+        for key,value in dict(WORKSET_MB='16384',LOCAL_RATIO_PCT='70',PAGE_SIZE_POLICY='max',ACCESS_REGION_KB='2048',
                               YCSB_RECORDCOUNT='8192',XGB_ROUNDS='30',REDIS_SCAN_CHUNK='65536').items():
             self.assertEqual(env[key],value)
+        for key in ('STHD_CNT', 'RECLAIM_MODE', 'RECLAIM_HEADROOM_PAGES', 'BYPASS_SWAPCACHE', 'LAZY_POLL'):
+            self.assertNotIn(key, env)
         again=json.loads(subprocess.check_output(['python3',str(RDMA/'pebs/run_workload_matrix.py'),'--dry-run'],text=True))
         self.assertEqual(data['plan'],again['plan'])
 
@@ -286,6 +291,71 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(len(rows),6)
         for repeat in (1,2):
             self.assertEqual({r['case'] for r in rows if r['repeat']==repeat},{'off','static-1999','policy-1999'})
+
+    def test_reject_hidden_backend_candidate_restrictions(self):
+        for ceiling, mask in [(4, 1), (64, 0x1d), (2048, 0x3fd), (64, 0x3fd)]:
+            matrix.validate_backend_orders(ceiling, mask)
+        for ceiling, mask in [(64, 1), (64, 0x11), (2048, 0x201)]:
+            with self.assertRaisesRegex(ValueError, 'excludes sizes'):
+                matrix.validate_backend_orders(ceiling, mask)
+
+    def test_policy_changes_ignore_only_sampling_controls(self):
+        baseline = {'controls': {'remote_order_mask':'0x3fd', 'pebs_force_order':'0',
+                                'pebs_mode':'0', 'pebs_load_period':'1999', 'pebs_min_samples':'32'},
+                    'thp': {'enabled':'[madvise]'}}
+        current = json.loads(json.dumps(baseline))
+        current['controls'].update(pebs_mode='1', pebs_load_period='199', pebs_order_stats='sampled: 5')
+        self.assertEqual(matrix.policy_changes(baseline, current), [])
+        for key in ('remote_order_mask', 'pebs_force_order', 'pebs_min_samples'):
+            changed = json.loads(json.dumps(current))
+            changed['controls'][key] = '7'
+            self.assertEqual(len(matrix.policy_changes(baseline, changed)), 1)
+        current['thp']['enabled'] = '[never]'
+        self.assertTrue(matrix.policy_changes(baseline, current))
+
+    def test_measurement_pairs_performance_with_all_orders_and_actual_wrs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'redis-swapio-summary.csv').write_text('page_kb,get_qps,bench_sec\n64,1234,2\n')
+            for suffix in ('', '-swapin'):
+                for phase, extra in [('before', 0), ('after', 1)]:
+                    p = root/f'order-{phase}{suffix}.txt'
+                    p.write_text('order size_bytes stores loads fallback_4k errors\n'
+                                 f'0 4096 10 10 0 0\n4 65536 {10+extra} {10+2*extra} {extra} 0\n')
+                    Path(str(p)+'.wr').write_text('order write_wrs read_wrs write_bytes read_bytes\n'
+                        f'0 0 {10+16*extra} 0 {40960+65536*extra}\n'
+                        f'4 {10+extra} {10+extra} {655360+65536*extra} {655360+65536*extra}\n')
+                    Path(str(p)+'.pebs').write_text('order: decisions\n 0: 10\n'
+                        f' 4: {10+3*extra}\nactual_order_0: 10\nactual_order_4: {10+2*extra}\n')
+                    Path(str(p)+'.thp').write_text('/thp/enabled=never\n/thp/hugepages-64kB/enabled=always\n'
+                                                  '/thp/hugepages-2048kB/enabled=never\n')
+            row = {'suite':'redis', 'page_kb':64}
+            result = matrix.collect_measurement(root, row)
+            self.assertEqual(result['max_page_kb'], 64)
+            self.assertEqual(result['performance'], dict(metric='get_qps', unit='GET/s', throughput=1234, duration_sec=2))
+            small, large = [r for r in result['granularity'] if r['phase'] == 'application']
+            self.assertEqual((small['folio_loads'], small['read_wrs'], small['read_bytes']), (0, 16, 65536))
+            self.assertEqual((large['folio_loads'], large['read_wrs'], large['read_bytes']), (2, 1, 65536))
+            self.assertEqual((large['folio_fallback_4k'], large['pebs_decisions'], large['pebs_actual_swapins']), (1, 3, 2))
+            self.assertEqual(large['read_byte_share'], 0.5)
+            # Older kernels lack actual_order_N: missing data must not become zero.
+            for p in root.glob('*.pebs'):
+                p.write_text('\n'.join(s for s in p.read_text().splitlines() if not s.startswith('actual_'))+'\n')
+            result = matrix.collect_measurement(root, row)
+            self.assertTrue(all(r['pebs_actual_swapins'] is None for r in result['granularity']))
+            wr = root/'order-after-swapin.txt.wr'
+            original = wr.read_text()
+            wr.write_text(original.replace('0 0 26', '0 0 9'))
+            with self.assertRaisesRegex(ValueError, 'counter reset'):
+                matrix.collect_measurement(root, row)
+            wr.write_text(original)
+            thp = root/'order-after-swapin.txt.thp'
+            thp.write_text(thp.read_text().replace('2048kB/enabled=never', '2048kB/enabled=always'))
+            with self.assertRaisesRegex(ValueError, 'THP settings'):
+                matrix.collect_measurement(root, row)
+            wr.unlink()
+            with self.assertRaises(FileNotFoundError):
+                matrix.collect_measurement(root, row)
 
 
 class ScopeTests(unittest.TestCase):

@@ -7,12 +7,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 THP_ROOT=/sys/kernel/mm/transparent_hugepage
 REMOTE_MASK_FILE=/sys/kernel/debug/hermit/remote_order_mask
-EFFECTIVE_MASK_FILE=/sys/kernel/debug/hermit/effective_order_mask
+WR_STATS_FILE=/sys/module/rswap_client/parameters/wr_stats
+# The sweep varies an allocation ceiling, not an exact transfer order.
+PAGE_SIZE_POLICY=max
 QUIET_INTERVAL_SEC=${QUIET_INTERVAL_SEC:-1}
 QUIET_SAMPLES=${QUIET_SAMPLES:-3}
 QUIET_TIMEOUT_SEC=${QUIET_TIMEOUT_SEC:-120}
 RESTORE_THP=${RESTORE_THP:-1}
-remote_mask_before=
 declare -a thp_files=()
 declare -A thp_policy=()
 
@@ -56,24 +57,31 @@ save_thp_state() {
     thp_files+=("$file")
     thp_policy["$file"]=$policy
   done
-  remote_mask_before=$(sudo_cat "$REMOTE_MASK_FILE")
 }
 
 configure_page_size() {
-  local kb=$1 order=$2 file selected
-  for file in "${thp_files[@]}"; do
-    sudo_write never "$file"
-  done
+  local kb=$1 file selected size policy
   if [ "$kb" != 4 ]; then
     selected="$THP_ROOT/hugepages-${kb}kB/enabled"
     if [ "$kb" = 2048 ] && [ ! -e "$selected" ]; then
       selected="$THP_ROOT/enabled"
     fi
     [ -e "$selected" ] || return 1
-    sudo_write always "$selected"
-    [ "$kb" != 2048 ] || sudo_write always "$THP_ROOT/enabled"
   fi
-  sudo_write "$(printf '0x%x' $((1 | (1 << order))))" "$REMOTE_MASK_FILE"
+  # Keep every supported anonymous THP size <= the ceiling eligible. The
+  # backend mask and PEBS policy remain owned by Hermit, including at cleanup.
+  sudo_write never "$THP_ROOT/enabled" || return 1
+  for file in "${thp_files[@]}"; do
+    [ "$file" != "$THP_ROOT/enabled" ] || continue
+    size=${file%kB/enabled}; size=${size##*hugepages-}
+    policy=never
+    if (( size >= 16 && size <= kb )); then policy=always; fi
+    sudo_write "$policy" "$file" || return 1
+  done
+  if [ "$kb" = 2048 ]; then
+    sudo_write always "$THP_ROOT/enabled" || return 1
+  fi
+  return 0
 }
 
 log_field() {
@@ -133,7 +141,8 @@ validate_sweep_host() {
   [ -r /sys/fs/cgroup/cgroup.controllers ] || rdma_die "cgroup v2 is required"
   mount_debugfs_if_needed
   sudo_test -r /sys/kernel/debug/hermit/order_stats || rdma_die "Hermit order_stats is unavailable"
-  sudo_test -w "$REMOTE_MASK_FILE" || rdma_die "Hermit remote_order_mask is not writable"
+  sudo_test -r "$REMOTE_MASK_FILE" || rdma_die "Hermit remote_order_mask is unavailable"
+  sudo_test -r "$WR_STATS_FILE" || rdma_die "RDMA wr_stats is unavailable"
   [ "$(detect_rswap_backend)" = rdma ] || rdma_die "Hermit RDMA backend is not active"
   swap_count=$(awk 'NR > 1 { count++ } END { print count + 0 }' /proc/swaps)
   [ "$swap_count" -eq 1 ] || \
@@ -164,7 +173,6 @@ restore_thp_state() {
     for file in "${thp_files[@]}"; do
       sudo_write "${thp_policy[$file]}" "$file" || true
     done
-    [ -z "$remote_mask_before" ] || sudo_write "$remote_mask_before" "$REMOTE_MASK_FILE" || true
   fi
 }
 
@@ -178,6 +186,11 @@ check_swap_capacity() {
 snapshot_sweep_stats() {
   snapshot_order_stats > "$1"
   snapshot_benchmark_pebs "$1.pebs"
+  sudo_cat "$WR_STATS_FILE" > "$1.wr"
+  local file
+  for file in "${thp_files[@]}"; do
+    printf '%s=%s\n' "$file" "$(selected_policy "$file")"
+  done > "$1.thp"
 }
 
 # order_stats measures folio requests, not actual WRs. Keep the historical

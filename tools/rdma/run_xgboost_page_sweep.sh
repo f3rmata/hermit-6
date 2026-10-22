@@ -22,6 +22,7 @@ while allowing concurrent reclamation.
 
 Important environment:
   PAGE_SIZES_KB="4 16 32 64 128 256 512 1024 2048"
+    Each value is a maximum allocation size; smaller orders remain eligible.
   WORKSET_MB=16384                  (synthetic matrix size)
   XGB_DATA_FILE=/path/to/train.libsvm (optional real dataset)
   XGB_DATA_FORMAT=csv|libsvm        (inferred from extension when unset)
@@ -151,9 +152,7 @@ export XGB_EVAL_METRIC
 
 for kb in $PAGE_SIZES_KB; do
   order=$(page_order "$kb") || rdma_die "unsupported page size: ${kb} KiB"
-  configure_page_size "$kb" "$order" || rdma_die "THP size ${kb} KiB is unavailable"
-  effective=$(sudo_cat "$EFFECTIVE_MASK_FILE")
-  (( (effective & (1 << order)) != 0 )) || rdma_die "effective mask $effective lacks order $order"
+  configure_page_size "$kb" || rdma_die "THP size ${kb} KiB is unavailable"
 
   for repeat in $(seq 1 "$BENCH_REPEATS"); do
     run_dir="$RESULT_DIR/${kb}k/r${repeat}"
