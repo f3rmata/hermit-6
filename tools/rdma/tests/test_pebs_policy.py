@@ -25,6 +25,8 @@ def test_policy():
     source = (KERNEL / 'mm/hermit_pebs.c').read_text()
     public = without_includes((KERNEL / 'include/linux/hermit_pebs.h').read_text())
     core = without_includes((KERNEL / 'mm/hermit_pebs_policy.h').read_text())
+    swap = (KERNEL / 'mm/swap_state.c').read_text()
+    memory = (KERNEL / 'mm/memory.c').read_text()
     setup = r'''
 #include <assert.h>
 #include <stdlib.h>
@@ -37,6 +39,8 @@ def test_policy():
 #include <linux/bitops.h>
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096UL
+#define PTRS_PER_PTE 512
+#define PMD_MASK (~((1UL << 21) - 1))
 #define NSEC_PER_MSEC 1000000ULL
 #define U32_MAX UINT32_MAX
 #define U64_MAX UINT64_MAX
@@ -51,6 +55,7 @@ typedef int spinlock_t;
 #define spin_lock(p) assert(!(*(p))++)
 #define spin_unlock(p) assert((*(p))-- == 1)
 #define atomic_long_inc(p) (++(p)->counter)
+#define atomic_long_add(n, p) ((p)->counter += (n))
 static bool fail_alloc;
 static unsigned int allocations;
 static void *kzalloc(size_t n, int flags)
@@ -62,12 +67,64 @@ static u64 clock_ns;
 static u64 ktime_get_ns(void) { return clock_ns; }
 struct hermit_pebs_state;
 struct mm_struct { struct hermit_pebs_state *hermit_pebs; bool hermit_pebs_enabled; };
-struct vm_area_struct { struct mm_struct *vm_mm; };
+struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end; };
 struct vm_fault {
     struct vm_area_struct *vma;
+    unsigned long address, hermit_fault_pc;
+    u64 hermit_policy_time;
     unsigned int hermit_policy_order;
     bool hermit_policy_used;
 };
+typedef unsigned long pgd_t;
+typedef unsigned long p4d_t;
+typedef unsigned long pud_t;
+typedef unsigned long pmd_t;
+typedef struct { unsigned long pfn; bool present, young; } pte_t;
+static pgd_t fake_pgd = 1;
+static p4d_t fake_p4d = 1;
+static pud_t fake_pud = 1;
+static pmd_t fake_pmd = 1;
+static pte_t fake_ptes[512];
+static unsigned long mapped_pmd;
+static unsigned int pte_writes[512];
+static spinlock_t pte_lock;
+#define pte_index(addr) (((addr) >> PAGE_SHIFT) & 511)
+static pgd_t *pgd_offset(struct mm_struct *mm, unsigned long addr) { return &fake_pgd; }
+static bool pgd_none(pgd_t p) { return !p; }
+static bool pgd_bad(pgd_t p) { return p == 2; }
+static p4d_t *p4d_offset(pgd_t *p, unsigned long addr) { return &fake_p4d; }
+static bool p4d_none(p4d_t p) { return !p; }
+static bool p4d_bad(p4d_t p) { return p == 2; }
+static pud_t *pud_offset(p4d_t *p, unsigned long addr) { return &fake_pud; }
+static bool pud_none(pud_t p) { return !p; }
+static bool pud_bad(pud_t p) { return p == 2; }
+static bool pud_leaf(pud_t p) { return p == 3; }
+static pmd_t *pmd_offset(pud_t *p, unsigned long addr) { return &fake_pmd; }
+static pte_t *pte_offset_map_lock(struct mm_struct *mm, pmd_t *pmd,
+    unsigned long addr, spinlock_t **ptl)
+{
+    assert(!mm->hermit_pebs || !*(spinlock_t *)mm->hermit_pebs);
+    if (!*pmd || (addr & PMD_MASK) != mapped_pmd) return NULL;
+    *ptl = &pte_lock; spin_lock(*ptl); return fake_ptes + pte_index(addr);
+}
+static void pte_unmap_unlock(pte_t *p, spinlock_t *ptl) { spin_unlock(ptl); }
+static pte_t ptep_get(pte_t *p) { return *p; }
+static bool pte_present(pte_t p) { return p.present; }
+static bool pte_young(pte_t p) { return p.young; }
+static unsigned long pte_pfn(pte_t p) { return p.pfn; }
+static pte_t pte_mkold(pte_t p) { p.young = false; return p; }
+static pte_t pte_mkyoung(pte_t p) { p.young = true; return p; }
+static pte_t pte_advance_pfn(pte_t p, unsigned int n) { p.pfn += n; return p; }
+static void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
+                     pte_t pte, unsigned int nr)
+{
+    assert(ptep == fake_ptes + pte_index(addr));
+    assert(ptep + nr <= fake_ptes + 512);
+    for (unsigned int i = 0; i < nr; i++) {
+        ptep[i] = pte_advance_pfn(pte, i);
+        pte_writes[ptep - fake_ptes + i]++;
+    }
+}
 struct perf_event_header { u32 type; u16 misc, size; };
 struct perf_buffer { unsigned int nr_pages; void *data_pages[2]; };
 #define page_order(rb) 0
@@ -79,6 +136,14 @@ static const unsigned long pc_a = 0x1000, pc_b = 0x2000;
 static const u64 ms = NSEC_PER_MSEC;
 static unsigned long address(unsigned int region, unsigned int page)
 { return ((unsigned long)region << HERMIT_REGION_SHIFT) + page * PAGE_SIZE; }
+
+static int choose(struct mm_struct *mm, unsigned long addr, unsigned long pc,
+                  unsigned long candidates)
+{
+    struct vm_area_struct vma = { .vm_mm = mm, .vm_end = ULONG_MAX };
+    struct vm_fault vmf = { .vma = &vma, .address = addr, .hermit_fault_pc = pc };
+    return hermit_swapin_order(&vmf, candidates);
+}
 
 static void ring_tests(void)
 {
@@ -183,7 +248,7 @@ static void train(struct mm_struct *mm, unsigned int region, unsigned int pages,
     for (unsigned int i = 0; i < 8; i++)
         hermit_region_sample(mm, address(region, 0), clock_ns + 1, false);
     clock_ns += 20 * ms;
-    (void)hermit_swapin_order(mm, address(99, 0), pc, 0x3fd);
+    (void)choose(mm, address(99, 0), pc, 0x3fd);
 }
 
 static void table_tests(void)
@@ -195,28 +260,30 @@ static void table_tests(void)
     hermit_pebs_epoch = clock_ns;
     hermit_pebs_enabled = 1;
     hermit_pebs_mode = HERMIT_PEBS_MODE_POLICY;
-    assert(hermit_swapin_order(&a, address(1, 0), pc_a, 0x3fd) == -1);
+    assert(choose(&a, address(1, 0), pc_a, 0x3fd) == -1);
     hermit_pebs_mm_enable(&a, true);
-    assert(hermit_swapin_order(&a, address(1, 0), pc_a, 0x3fd) == 0);
-    assert(hermit_swapin_order(&a, address(1, 0), 0, 0x3fd) == 0);
+    assert(choose(&a, address(1, 0), pc_a, 0x3fd) == 3);
+    assert(choose(&a, address(1, 0), 0, 0x3fd) == 0);
+    hermit_pebs_mm_exit(&a);
     fail_alloc = true;
+    assert(choose(&a, address(1, 0), pc_a, 0x3fd) == 0);
     hermit_pebs_fault(&a, address(1, 0), pc_a, clock_ns);
     assert(!a.hermit_pebs);
     fail_alloc = false;
     for (unsigned int i = 1; i <= 4; i++) train(&a, i, 16, pc_a);
-    assert(hermit_swapin_order(&a, address(99, 0), pc_a, 0x3fd) == 4);
-    assert(hermit_swapin_order(&a, address(99, 1), pc_a, 0x3fd) == 0);
-    assert(hermit_swapin_order(&a, address(99, 0), pc_b, 0x3fd) == 0);
+    assert(choose(&a, address(99, 0), pc_a, 0x3fd) == 4);
+    assert(choose(&a, address(99, 1), pc_a, 0x3fd) == 3);
+    assert(choose(&a, address(99, 0), pc_b, 0x3fd) == 3);
     hermit_pebs_all = 1;
-    assert(hermit_swapin_order(&b, address(99, 0), pc_a, 0x3fd) == 0);
+    assert(choose(&b, address(99, 0), pc_a, 0x3fd) == 3);
     for (unsigned int i = 1; i <= 4; i++) train(&b, i, 512, pc_a);
-    assert(hermit_swapin_order(&b, address(99, 0), pc_a, 0x3fd) == 9);
-    assert(hermit_swapin_order(&a, address(99, 0), pc_a, 0x3fd) == 4);
+    assert(choose(&b, address(99, 0), pc_a, 0x3fd) == 9);
+    assert(choose(&a, address(99, 0), pc_a, 0x3fd) == 4);
     /* Force applies only to legal candidates, even without mm tracking. */
     hermit_pebs_all = 0; hermit_pebs_force_order = U32_MAX;
-    assert(hermit_swapin_order(&other, 0, 0, BIT(4)) == 4);
+    assert(choose(&other, 0, 0, BIT(4)) == 4);
     hermit_pebs_force_order = 0;
-    assert(hermit_swapin_order(&other, 0, 0, BIT(4)) == -1);
+    assert(choose(&other, 0, 0, BIT(4)) == -1);
     /* Active region: old bits cannot live forever. Adjacent windows accept
      * out-of-order samples only within their respective event-time range. */
     clock_ns += 30 * ms;
@@ -238,15 +305,15 @@ static void table_tests(void)
     assert(p->history.slot[last].loads == 2);
     /* Session reset, disabling/re-enabling and TTL all invalidate history. */
     hermit_pebs_epoch = ++clock_ns;
-    assert(hermit_swapin_order(&a, address(99, 0), pc_a, 0x3fd) == 0);
+    assert(choose(&a, address(99, 0), pc_a, 0x3fd) == 3);
     for (unsigned int i = 1; i <= 4; i++) train(&a, i, 16, pc_a);
     hermit_pebs_mm_enable(&a, false);
-    assert(hermit_swapin_order(&a, 0, pc_a, 0x3fd) == -1);
+    assert(choose(&a, 0, pc_a, 0x3fd) == -1);
     hermit_pebs_mm_enable(&a, true);
-    assert(hermit_swapin_order(&a, 0, pc_a, 0x3fd) == 0);
+    assert(choose(&a, 0, pc_a, 0x3fd) == 3);
     for (unsigned int i = 1; i <= 4; i++) train(&a, i, 16, pc_a);
     clock_ns += 1000 * ms;
-    assert(hermit_swapin_order(&a, 0, pc_a, 0x3fd) == 0);
+    assert(choose(&a, 0, pc_a, 0x3fd) == 3);
     hermit_pebs_mm_exit(&a); hermit_pebs_mm_exit(&b);
     /* Tiny capacities exercise rb removal and LRU reuse of pending windows. */
     hermit_pebs_region_max = 2; hermit_pebs_pc_max = 1;
@@ -263,13 +330,203 @@ static void table_tests(void)
     assert(allocations == 0);
 }
 
+static void readahead_tests(void)
+{
+    struct mm_struct mm = { .hermit_pebs_enabled = true };
+    struct vm_area_struct vma = { .vm_mm = &mm, .vm_end = ULONG_MAX };
+    struct vm_fault vmf = { .vma = &vma, .hermit_fault_pc = pc_a };
+    struct hermit_readahead ra = {};
+    unsigned int hits;
+    hermit_pebs_pc_max = 4096;
+    hermit_pebs_region_max = HERMIT_PEBS_MAX_REGIONS;
+    hermit_pebs_mode = HERMIT_PEBS_MODE_POLICY;
+    hermit_pebs_all = 0;
+    clock_ns += ms;
+    hermit_pebs_epoch = clock_ns;
+    /* No PEBS samples: native cold start is eight pages, not order 9. */
+    assert(hermit_readahead_choose(&ra, address(1, 0), 0, 0x3fd, 0x3fd) == 3);
+    assert(hermit_readahead_choose(&ra, address(1, 0), 0, BIT(0) | BIT(4), 0x3fd) == 0);
+    assert(hermit_readahead_choose(&ra, address(1, 0), 0, 0x3fd, BIT(0)) == 0);
+    /* Fully consumed windows grow; unused windows decay, including the
+     * unsupported 8 KiB hole. Adjacent base faults can bootstrap 16 KiB. */
+    ra = (struct hermit_readahead) { .nr_pages = 8, .fault_addr = address(1, 0) };
+    assert(hermit_readahead_choose(&ra, address(2, 0), 7, 0x3fd, 0x3fd) == 4);
+    assert(hermit_readahead_choose(&ra, address(2, 0), 0, 0x3fd, 0x3fd) == 2);
+    ra.nr_pages = 4;
+    assert(hermit_readahead_choose(&ra, address(2, 0), 0, 0x3fd, 0x3fd) == 0);
+    ra.nr_pages = 1;
+    assert(hermit_readahead_choose(&ra, address(1, 1), 0, 0x3fd, 0x3fd) == 2);
+    assert(hermit_readahead_choose(&ra, address(1, 1), 0, BIT(0), 0x3fd) == 0);
+    ra.nr_pages = 512;
+    assert(hermit_readahead_choose(&ra, address(2, 0), 511, 0x1d, 0x3fd) == 4);
+
+    /* Exercise the real selector, installation helper and feedback walk.
+     * Every PTE is installed once; only the demand PTE starts young. */
+    vmf.address = address(1, 7);
+    int order = hermit_swapin_order(&vmf, 0x3fd);
+    assert(order == 3 && vmf.hermit_policy_time);
+    vmf.hermit_policy_used = true; vmf.hermit_policy_order = order;
+    mapped_pmd = address(1, 0);
+    memset(fake_ptes, 0, sizeof(fake_ptes));
+    memset(pte_writes, 0, sizeof(pte_writes));
+    pte_t first = { .pfn = 1024, .present = true, .young = true };
+    hermit_set_swapin_ptes(&vmf, mapped_pmd, fake_ptes, first, 8);
+    for (unsigned int i = 0; i < 8; i++) {
+        assert(fake_ptes[i].pfn == 1024 + i && pte_writes[i] == 1);
+        assert(fake_ptes[i].young == (i == 7));
+    }
+    hermit_pebs_swapin_result(&vmf, 3, mapped_pmd, 1024, 8);
+    struct hermit_pc_entry *p = hermit_pc_get(mm.hermit_pebs, pc_a, HERMIT_PC_RA_OFFSET, false);
+    assert(p && p->readahead.nr_pages == 8);
+    ra = p->readahead;
+    assert(hermit_readahead_hits(&vma, &ra, &hits) && hits == 0);
+    for (unsigned int i = 0; i < 8; i++) fake_ptes[i].young = true;
+    assert(hermit_readahead_hits(&vma, &ra, &hits) && hits == 7);
+    clock_ns++;
+    vmf.address = address(2, 0);
+    assert(hermit_swapin_order(&vmf, 0x3fd) == 4); /* 64 KiB, zero PEBS */
+    /* No fabricated hits from holes, changed PFNs, VMA changes or huge PMDs. */
+    fake_ptes[3].present = false;
+    assert(!hermit_readahead_hits(&vma, &ra, &hits));
+    fake_ptes[3].present = true; fake_ptes[3].pfn++;
+    assert(!hermit_readahead_hits(&vma, &ra, &hits));
+    fake_ptes[3].pfn--;
+    vma.vm_start = PAGE_SIZE;
+    assert(!hermit_readahead_hits(&vma, &ra, &hits));
+    vma.vm_start = 0;
+    fake_pud = 3;
+    assert(!hermit_readahead_hits(&vma, &ra, &hits));
+    fake_pud = 1;
+    ra.nr_pages = 513;
+    assert(!hermit_readahead_hits(&vma, &ra, &hits));
+    ra = p->readahead;
+    ra.start = address(1, 511);
+    assert(!hermit_readahead_hits(&vma, &ra, &hits));
+    /* Account actual allocation fallback, not the requested 64 KiB. */
+    vmf.hermit_policy_order = 4;
+    hermit_pebs_swapin_result(&vmf, 0, vmf.address, 2048, 1);
+    assert(p->readahead.nr_pages == 1 && p->readahead.pfn == 2048);
+    u64 saved_time = p->readahead.time_ns;
+    vmf.hermit_policy_time--;
+    hermit_pebs_swapin_result(&vmf, 9, vmf.address, 4096, 512);
+    assert(p->readahead.nr_pages == 1 && p->readahead.time_ns == saved_time);
+    /* Expiry and a new session discard stale feedback. */
+    clock_ns += 1000 * ms;
+    assert(hermit_swapin_order(&vmf, 0x3fd) == 3);
+    hermit_pebs_epoch = ++clock_ns;
+    hermit_pebs_swapin_result(&vmf, 9, vmf.address, 4096, 512);
+    p = hermit_pc_get(mm.hermit_pebs, pc_a, HERMIT_PC_RA_OFFSET, false);
+    assert(p && !p->readahead.nr_pages);
+    /* Off/static/force retain their existing behavior and PTE ages. */
+    vmf.hermit_policy_time = 0;
+    hermit_pebs_enabled = 0;
+    assert(hermit_swapin_order(&vmf, 0x3fd) == -1 && !vmf.hermit_policy_time);
+    hermit_pebs_enabled = 1; hermit_pebs_mode = HERMIT_PEBS_MODE_STATIC;
+    assert(hermit_swapin_order(&vmf, 0x3fd) == -1 && !vmf.hermit_policy_time);
+    hermit_pebs_force_order = 4;
+    assert(hermit_swapin_order(&vmf, 0x3fd) == 4 && !vmf.hermit_policy_time);
+    hermit_pebs_force_order = 0; hermit_pebs_mode = HERMIT_PEBS_MODE_POLICY;
+    hermit_set_swapin_ptes(&vmf, mapped_pmd, fake_ptes, first, 8);
+    for (unsigned int i = 0; i < 8; i++) assert(fake_ptes[i].young);
+    /* Confident PEBS evidence wins even when readahead suggests 2 MiB. */
+    for (unsigned int i = 1; i <= 4; i++) train(&mm, i, 16, pc_a);
+    mapped_pmd = address(8, 0);
+    vmf.address = mapped_pmd;
+    vmf.hermit_policy_time = ++clock_ns;
+    vmf.hermit_policy_order = 9;
+    hermit_set_swapin_ptes(&vmf, mapped_pmd, fake_ptes, first, 512);
+    hermit_pebs_swapin_result(&vmf, 9, mapped_pmd, 1024, 512);
+    for (unsigned int i = 0; i < 512; i++) fake_ptes[i].young = true;
+    long ra_decisions = hermit_policy_counters[HPC_READAHEAD].counter;
+    vmf.address = address(9, 0);
+    assert(hermit_swapin_order(&vmf, 0x3fd) == 4);
+    assert(hermit_policy_counters[HPC_READAHEAD].counter == ra_decisions);
+    /* Prefix, demand, suffix and last PTE of a full PMD-sized folio. */
+    for (unsigned int demand = 0; demand < 512; demand++) {
+        memset(pte_writes, 0, sizeof(pte_writes));
+        vmf.address = mapped_pmd + demand * PAGE_SIZE;
+        hermit_set_swapin_ptes(&vmf, mapped_pmd, fake_ptes, first, 512);
+        for (unsigned int i = 0; i < 512; i++) {
+            assert(pte_writes[i] == 1 && fake_ptes[i].pfn == 1024 + i);
+            assert(fake_ptes[i].young == (i == demand));
+        }
+    }
+    hermit_pebs_mm_exit(&mm);
+    assert(allocations == 0);
+}
+
+/* Replay demand accesses, including accesses hidden by mapped mTHPs. No PEBS
+ * events are injected. Candidate pruning models already-present PTEs. */
+static void sparse_sampling_trace(unsigned int touched, unsigned int cap)
+{
+    struct mm_struct mm = { .hermit_pebs_enabled = true };
+    struct vm_area_struct vma = { .vm_mm = &mm, .vm_end = ULONG_MAX };
+    struct vm_fault vmf = { .vma = &vma, .hermit_fault_pc = pc_b };
+    unsigned int largest = 0, last = 0, reads = 0, read_pages = 0;
+    mapped_pmd = ULONG_MAX;
+    for (unsigned int region = 20; region < 28; region++) {
+        unsigned long base = address(region, 0);
+        for (unsigned int page = 0; page < touched; page++) {
+            vmf.address = base + page * PAGE_SIZE;
+            if (mapped_pmd == base && fake_ptes[page].present) {
+                fake_ptes[page].young = true;
+                continue;
+            }
+            unsigned long candidates = BIT(0);
+            for (unsigned int order = 2; order <= cap; order++) {
+                unsigned int nr = 1U << order, start = page & ~(nr - 1);
+                bool valid = true;
+                if (mapped_pmd == base)
+                    for (unsigned int i = start; i < start + nr; i++)
+                        if (fake_ptes[i].present) valid = false;
+                if (valid) candidates |= BIT(order);
+            }
+            clock_ns += 1000;
+            int order = hermit_swapin_order(&vmf, candidates);
+            assert(order >= 0 && (candidates & BIT(order)));
+            unsigned int nr = 1U << order, start = page & ~(nr - 1);
+            if (mapped_pmd != base) {
+                memset(fake_ptes, 0, sizeof(fake_ptes));
+                mapped_pmd = base;
+            }
+            pte_t pte = { .pfn = region * 512 + start, .present = true, .young = true };
+            vmf.hermit_policy_used = true; vmf.hermit_policy_order = order;
+            hermit_set_swapin_ptes(&vmf, base + start * PAGE_SIZE,
+                                   fake_ptes + start, pte, nr);
+            hermit_pebs_swapin_result(&vmf, order, base + start * PAGE_SIZE, pte.pfn, nr);
+            hermit_pebs_fault(&mm, vmf.address, pc_b, vmf.hermit_policy_time);
+            if ((unsigned int)order > largest) largest = order;
+            last = order; reads++; read_pages += nr;
+        }
+    }
+    if (touched == 1) assert(last == 0); /* sparse jumps shrink to 4 KiB */
+    if (touched == 16) assert(largest >= 4 && largest <= 5);
+    if (touched == 512) assert(largest == cap);
+    printf("Zero-PEBS trace: touched=%u pages/region cap=%u KiB max=%u KiB "
+           "last=%u KiB reads=%u read_pages=%u\n",
+           touched, 4U << cap, 4U << largest, 4U << last, reads, read_pages);
+    hermit_pebs_mm_exit(&mm);
+    assert(allocations == 0);
+}
+
 int main(void)
 {
-    ring_tests(); window_tests(); model_tests(); table_tests();
+    ring_tests(); window_tests(); model_tests(); table_tests(); readahead_tests();
+    sparse_sampling_trace(1, 9);
+    sparse_sampling_trace(16, 9);
+    sparse_sampling_trace(16, 4);
+    sparse_sampling_trace(512, 9);
     puts("PEBS production window/table/model tests: PASS");
 }
 '''
-    code = (setup + public + core +
+    # Keep the upstream heuristic's signedness warning localized; the kernel
+    # builds it with -Wno-sign-compare. New policy code retains -Werror.
+    code = (setup + public +
+            '#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored "-Wsign-compare"\n' +
+            section(swap, 'unsigned int swapin_readahead_pages(', 'static unsigned long swapin_nr_pages(') +
+            '#pragma GCC diagnostic pop\n' +
+            core +
+            section(memory, 'static void hermit_set_swapin_ptes(', 'static int hermit_direct_swapin(') +
             section(source, 'struct hermit_pebs_sample {', 'static struct task_struct *hermit_pebsd;') +
             section(source, 'static void hermit_ring_copy(', 'static int hermit_pebs_read_events(') +
             section(source, 'u32 hermit_pebs_enabled;', '/* ---------- sampling period') +

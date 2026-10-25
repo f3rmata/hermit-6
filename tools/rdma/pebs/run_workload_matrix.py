@@ -150,6 +150,34 @@ def validate_backend_orders(max_kb, mask):
                          'the matrix does not rewrite remote_order_mask')
 
 
+def validate_swapin_path(bypass_swapcache):
+    # With ordinary block-device swap, alloc_swap_folio() reaches the PEBS
+    # selector only on Hermit's direct path. Sampling alone is not sufficient.
+    if bypass_swapcache not in ('Y', '1'):
+        raise ValueError(f'bypass_swapcache={bypass_swapcache}: the PEBS matrix requires direct swap-in; '
+                         'set /sys/kernel/debug/hermit/bypass_swapcache to Y before running; '
+                         'the matrix preserves this setting for off/static/policy')
+
+
+def check_policy_activity(row, measurement):
+    application = [r for r in measurement['granularity'] if r['phase'] == 'application']
+    counts = [r['pebs_decisions'] for r in application]
+    decisions = sum(counts) if counts and all(v is not None for v in counts) else None
+    # A 4 KiB ceiling has no large candidates and may bypass the selector.
+    # For larger ceilings, selecting order 0 is still a real, valid decision.
+    required = row['mode'] == 1 and row['page_kb'] > 4
+    activity = dict(required=required, application_decisions=decisions,
+                    path_exercised=decisions > 0 if decisions is not None else None)
+    issues = []
+    if required and decisions is None:
+        issues.append('missing application-phase PEBS decision counters')
+    elif required and decisions == 0:
+        issues.append('policy selection was not exercised: zero application-phase decisions with '
+                      f'a {row["page_kb"]} KiB ceiling; check direct swap-in and legal swap-in candidates; '
+                      'PEBS samples or actual_order counters alone do not validate the policy path')
+    return activity, issues
+
+
 def environment(args):
     # Do not inherit accidental benchmark overrides from a previous shell run.
     env = {k: v for k, v in os.environ.items() if k in
@@ -357,6 +385,7 @@ def main():
         ap.error('pebs_force_order is active; disable the forced-order experiment before observing policy')
     try:
         validate_backend_orders(max(args.pages), int(read(DEBUG/'effective_order_mask'), 0))
+        validate_swapin_path(read(DEBUG/'bypass_swapcache'))
     except ValueError as exc:
         ap.error(str(exc))
     read(WR_STATS)
@@ -456,21 +485,30 @@ def main():
             issues = validate_results(folder/'results', row) if rc == 0 else ['workload failed']
             issues += policy_changes(baseline, after)
             measurement = None
+            policy_activity = None
             if rc == 0:
                 try:
                     measurement = collect_measurement(folder/'results', row)
                     save_json(folder/'measurement.json', measurement)
+                    policy_activity, policy_issues = check_policy_activity(row, measurement)
+                    issues += policy_issues
                 except (ValueError, KeyError, OSError, StopIteration) as exc:
                     issues.append(f'incomplete measurement: {exc}')
-            valid = rc == 0 and not issues and (row['mode'] is None or delta['sampled'] > 0)
+            if row['mode'] is not None and delta['sampled'] <= 0:
+                issues.append('no PEBS samples collected during the run')
+            valid = rc == 0 and not issues
             save_json(folder/'status.json',dict(exit_code=rc,elapsed_sec=time.monotonic()-start,
-                usable=valid,validation_issues=issues,pebs_delta=delta,perf_rate_changed=before['perf']!=after['perf']))
+                usable=valid,validation_issues=issues,pebs_delta=delta,policy_activity=policy_activity,
+                perf_rate_changed=before['perf']!=after['perf']))
             if measurement is not None:
                 identity = dict(run_id=name, suite=row['suite'], max_page_kb=row['page_kb'],
                                 repeat=row['repeat'], case=row['case'], usable=valid)
-                append_csv(args.output/'summary.csv', [identity | measurement['performance'] | delta])
+                activity_columns = {'application_policy_decisions': policy_activity['application_decisions'],
+                                    'policy_path_exercised': policy_activity['path_exercised']} if policy_activity else {
+                                    'application_policy_decisions': None, 'policy_path_exercised': None}
+                append_csv(args.output/'summary.csv', [identity | measurement['performance'] | delta | activity_columns])
                 append_csv(args.output/'granularity.csv', [identity | r for r in measurement['granularity']])
-            if not valid: raise RuntimeError(f'{name}: failed workload or zero PEBS samples; see run.log')
+            if not valid: raise RuntimeError(f'{name}: {"; ".join(issues)}; see status.json and run.log')
         failed=False
     finally:
         # Cleanup must not be interrupted by a second terminal signal.

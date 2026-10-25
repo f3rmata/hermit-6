@@ -39,11 +39,33 @@ python3 tools/rdma/pebs/run_workload_matrix.py \
 
 运行前应准备好 Hermit、RDMA 和 swap。脚本保留 `remote_order_mask`、`pebs_force_order`、学习阈值、自适应开关以及回收/批处理参数，只记录其值；启用强制 order 或后端缺少上限以内的档位会在启动检查中报错。例如完整 4KiB–2MiB 矩阵要求 `effective_order_mask` 包含 `0x3fd`，旧实验恢复的 `0x1` 不满足条件。脚本不会替换这个掩码。退出时恢复本次修改的 THP 设置及采样模式/周期。
 
+当前内核的 PEBS 选页调用位于直接换入路径，矩阵启动前必须配置 `bypass_swapcache=Y`，否则预检立即失败。采样量非零不能证明策略参与选页：2026-10-22 的 1134 次矩阵在 `bypass_swapcache=N` 下完成，但全部 policy 决策为零。先在空闲测试机上完成以下一次性准备，off/static/policy 全程使用相同设置：
+
+```sh
+sudo -v
+printf '0x3fd\n' | sudo tee /sys/kernel/debug/hermit/remote_order_mask
+printf 'Y\n' | sudo tee /sys/kernel/debug/hermit/bypass_swapcache
+sudo cat /sys/kernel/debug/hermit/effective_order_mask \
+  /sys/kernel/debug/hermit/bypass_swapcache \
+  /sys/kernel/debug/hermit/pebs_force_order /sys/kernel/debug/hermit/pebs_enabled
+```
+
+预期依次为 `0x3fd`、`Y`、`0`、`0`。脚本不会自动改写 `bypass_swapcache`，也不会在结束时撤销上述手工准备。正式矩阵前可先执行 6 次小矩阵（输出目录必须不存在）：
+
+```sh
+python3 -u tools/rdma/pebs/run_workload_matrix.py \
+  --suites anon-1t-chunk64k --pages 64 2048 --periods 1999 --repeats 1 \
+  --output "tools/rdma/results/pebs/policy-smoke-$(date +%Y%m%d-%H%M%S)"
+```
+
+每次 policy 运行后，最大页大于 4KiB 时必须观察到**应用阶段**决策计数增长；仅准备阶段有决策、只有采样或 `actual_order_N` 增长，都不能通过。无决策会记录 `usable=false` 并立即中止矩阵，保留诊断和原始数据。4KiB 上限没有大页候选，允许零决策；策略选择 4KiB 本身也有效，不要求必须选大页或达到特定命中率。
+
 匿名负载的逻辑访问区域固定为 2MiB（单独运行时可设 `ACCESS_REGION_KB`），`chunk64k` 始终访问每个区域的 64KiB；访问量不再随页上限变化。16GiB 工作集的覆盖量固定为 512MiB。历史字段 `pages_per_folio` 表示逻辑区域的页数，不代表实际分配 folio。
 
 新结果标记 `page_policy=max-allocation-v1`，包含：
 
-- `summary.csv`：每轮 `max_page_kb`、应用吞吐、计时及有效性。匿名吞吐按访问页面覆盖量计算，每页实际读取一个字节；Redis 为 GET/s、YCSB 为 ops/s、XGBoost 为 rounds/s。
+- `summary.csv`：每轮 `max_page_kb`、应用吞吐、计时及有效性，以及 `application_policy_decisions`、`policy_path_exercised`。匿名吞吐按访问页面覆盖量计算，每页实际读取一个字节；Redis 为 GET/s、YCSB 为 ops/s、XGBoost 为 rounds/s。
+- 每轮 `status.json` 的 `policy_activity`：是否要求选页路径生效、应用阶段决策数及路径是否生效；具体失败原因在 `validation_issues`。
 - `granularity.csv`：按准备阶段/应用阶段、order 记录 folio 请求数、实际 RDMA WR 数/字节数/读字节占比、PEBS 决策数和内核提供的实际换入计数。旧内核缺少 `actual_order_N` 时留空；off 的 PEBS 计数不表示全部换入流量。
 - 每轮 `measurement.json` 和原始 `order-*.txt`、`.wr`、`.pebs`、`.thp`：保留性能、粒度分布及实际 THP 设置。原负载 CSV 的 `page_kb` 是上限，`target_*` 只统计该上限 order；分析所有粒度应使用 `granularity.csv`。
 

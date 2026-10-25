@@ -1,13 +1,14 @@
 # Hermit PEBS 设计与实现
 
-> 状态：2026-10-19。PEBS 历史按 mm 保存，不依赖 cgroup；`CONFIG_HERMIT` 不要求
+> 状态：2026-10-25。PEBS 历史按 mm 保存，不依赖 cgroup；`CONFIG_HERMIT` 不要求
 > `CONFIG_MEMCG`。历史设计与验证记录见 [PEBS 历史报告](../archive/pebs/)。
 
 ## 1. 目标
 
 用 Intel PEBS 与成功的远程 demand fault 记录每个 mm 内的短期足迹，按
 `(fault-PC, 首次缺页的区域内页偏移)` 在不同 2 MiB 区域之间学习。预测只决定
-swap-in folio 大小，证据不足时读回 4 KiB，不增加异步预取。
+swap-in folio 大小。PEBS 证据不足时使用 Linux swap 预读启发式预测页数，
+再换算成合法 mTHP 大小；额外页面随本次 folio 一起换入，不增加独立异步预取。
 
 | 量 | 当前实现 |
 |---|---|
@@ -77,11 +78,13 @@ swap-in folio 大小，证据不足时读回 4 KiB，不增加异步预取。
 ### 3.3 跨区域 fault-PC 足迹表
 
 每个 mm 内用 `(fault-PC, 触发页偏移)` 查找最近 8 个完成窗口，保留 1 秒。
-至少来自 4 个不同虚拟区域，合计 32 条 load 样本，才允许扩大读取。
+至少来自 4 个不同虚拟区域，合计 32 条 load 样本，才使用 PEBS 代价模型选页。
+这两个门槛保持不变，不再阻止独立的预读反馈路径选择较大页面。
 同一区域窗口由第一个成功缺页的 PC 归属，其他线程/PC 的窗口内访问会补充该区域足迹。
 
 区域表默认上限 32768，PC 表 4096，均按 LRU 淘汰；新 PC、新 mm、不同触发偏移、
-历史过期或证据不足均选择 4 KiB。位图未置位仅代表未观测到，不能解释为确定冷页。
+历史过期或证据不足时使用下述预读后备预测。位图未置位仅代表未观测到，
+不能解释为确定冷页。
 
 ### 3.4 生命周期与并发
 
@@ -107,9 +110,37 @@ C(o) = [L_read + N_WR(o) * L_WR + B(o) / BW] / U(o)
 - 固定与传输成本统一按有效页摊销；无密度下限。使用整数定点
   `ns/useful-page * 1024`，传输时间向上取整，成本相等选较小 order。
 - 滞回参照同一 PC 表项上次预测的合法 order，默认要求改善至少 10%。
-  历史失效或模型参数非法立即选择 4 KiB，不被旧 order 锁住。
+  历史失效或模型参数非法时退出 PEBS 模型，清除上次模型 order，转入后备预测。
 - `pebs_force_order=2..9` 是全局实验覆盖，只约束 swap-in，仍需通过合法性检查；
   `0` 关闭覆盖。策略关闭或 mm 未启用时保留原换入路径。
+
+### 4.1 PEBS 不足时的预读后备预测
+
+`swapin_readahead_pages()` 是从 `swap_state.c` 开放给 Hermit 的原生算法，
+Linux 原有两处调用沿用原来的参数和算法行为。Hermit 使用相同的 `hits + 2`、
+向上取二次幂、无命中时的相邻缺页探测和半窗口衰减规则。
+
+- PEBS 有足够证据时优先采用代价模型；只有不满足置信条件时才使用后备预测。
+- 冷启动沿用原生的 4 个初始命中提示，得到 8 页（32 KiB）探测窗口。
+  缺少 PC、关闭观测窗口/历史 TTL 或 mm 状态分配失败时仍回退 4 KiB。
+- 后备窗口上限来自当前合法候选与 `effective_order_mask` 的交集，最多 512 页；
+  不使用原生路径的 `page-cluster` 上限，否则默认 8 页会阻止尝试 64 KiB。
+- 预测页数向下映射到受支持的 order，始终遵守 VMA、连续 swap PTE、extent 和
+  THP 上限。缺少 order 1 时，相邻 4 KiB 缺页允许试探合法的 16 KiB 页面；
+  窗口衰减仍向下映射，避免稀疏访问卡在 16 KiB。
+- 状态按 mm/fault-PC 保存，不按区域内偏移拆开，复用受 LRU 限制的 PC 表，
+  使用保留的偏移键 512。记录上次成功换入的实际地址范围、PFN、页数和 VMA 边界。
+  分配失败、charge 降级、过期及 session epoch 都不会沿用错误的预测大小。
+
+mTHP 会一次映射多个 PTE，因此原生 `PG_readahead` 的后续缺页命中不能直接使用。
+policy 安装 PTE 时，仅 demand 页初始置 young，其余预取页初始置 old；每个 PTE
+只安装一次，保留原有权限与 dirty 等属性。下一次同 PC 换入时，读取上次范围的
+硬件 accessed 位，排除 demand 页后作为命中数。检查最多 512 个 PTE，不清除
+存活页面的 accessed 位；PFN 改变、缺失 PTE 或 VMA 边界改变时放弃该反馈。
+获取 PTE 锁前已释放 PEBS 状态锁，成功映射后才记录新历史。
+
+预读启发式并不保证最优大小：零 PEBS 的 `chunk64k` 回放在 2 MiB 上限下可停在
+128 KiB；64 KiB 上限下达到 64 KiB。充分 PEBS 证据仍能通过代价模型选择 64 KiB。
 
 ## 5. 控制面与 ABI
 
@@ -162,6 +193,12 @@ C(o) = [L_read + N_WR(o) * L_WR + B(o) / BW] / U(o)
 PC 命中、证据不足、元数据分配失败、淘汰及分配降级计数。`actual_order_N`
 统计成功映射的远程 folio 大小；旧的逐 order 决策计数表示预测值。
 
+新增 `pebs_selected`、`readahead_selected` 区分决策来源；
+`readahead_feedback` 统计通过 PTE/PFN 检查的历史范围，`readahead_hits`
+累计其中已访问的非 demand 页数。`unknown`/`insufficient_evidence` 仍表示
+PEBS 证据不足，此时可能由后备预测选择大页，不能再等同于 order 0。
+矩阵原始 `order-*.txt.pebs` 快照保留这些字段，可按准备/应用阶段计算增量。
+
 ## 6. 远端 extent 与传输
 
 - 每个远端 folio 由 XArray extent 表示：先 reserve 全部 slot，store 成功后
@@ -179,6 +216,9 @@ PC 命中、证据不足、元数据分配失败、淘汰及分配降级计数�
 LRU、红黑树和模型代码；`test_kernel_paths.py` 覆盖真实分配循环的候选裁剪、
 分配/charge 失败与最大粒度换出。测试中的时间、PC、区域、掩码均可确定性控制。
 `pebs_test_eval` 的单页预期改为 order 0，全扫描仍为 9，chunk64k 仍为 4。
+该接口仅测试 PEBS 代价模型。新增的生产路径回放同时执行原生预读函数、PTE
+安装/反馈和策略选择，覆盖零 PEBS 样本、所有 demand 偏移、随机退避、顺序增长、
+候选掩码空洞、实际分配降级、PFN 变化、历史过期及 PEBS 优先级。
 
 ```sh
 python3 tools/rdma/tests/test_pebs_policy.py
@@ -188,15 +228,18 @@ python3 tools/rdma/tests/test_pebs.py
 
 测试启用 ASan/UBSan；在不支持 LeakSanitizer 的沙箱中可加
 `ASAN_OPTIONS=detect_leaks=0`，PC/区域元数据仍有分配余额检查。
-本次验证包括相关内核对象在 Hermit、MEMCG、THP 开关组合下编译；未启动 QEMU、
-未运行真实 PEBS/RDMA 实验。旧版实验结果见 archive，不能当作新策略的性能证据。
+本次编译验证使用现有 Hermit/MEMCG/THP 配置，检查 `hermit_pebs.o`、`memory.o`
+和 `swap_state.o`；未启动 QEMU、未运行真实 PEBS/RDMA 实验。旧版实验结果见
+archive，不能当作新策略的性能证据。
 
 ## 8. 已知限制与后续工作
 
 - 只在现有 `alloc_swap_folio()` direct 路径控制分配；swapcache 命中和常规
   readahead 不重新分配 folio。真实效果需要结合 `bypass_swapcache` 配置判断。
-- 预测基于稀疏观测，偏保守；冷启动和一次性快速扫描未必有足够训练时间。
-  不完整窗口、ring 丢样和多线程区域共享都会影响预测质量。
+- PEBS 预测仍受稀疏观测限制；后备预测支持零 PEBS 样本下的自适应，但也会试探
+  多读。回收清除 accessed 位可能低估命中；同 PC 的并发访问流共享最近一次范围，
+  可能相互干扰。PTE 扫描和锁开销需实机测量。不完整窗口、ring 丢样和多线程
+  区域共享仍会影响 PEBS 模型质量。
 - 不能跨远端 extent 合并读取。已换出为 4 KiB extent 的页面不会仅靠预测自动
   恢复为大 extent；冷页合并另行设计。
 - mm 内 unmap/remap 不单独建立代际，历史以窗口/TTL 衰减；PC 表只提供大小提示，

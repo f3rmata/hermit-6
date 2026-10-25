@@ -299,6 +299,62 @@ class MatrixTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'excludes sizes'):
                 matrix.validate_backend_orders(ceiling, mask)
 
+    def test_swapcache_path_is_rejected_before_any_host_changes(self):
+        for value in ('Y', '1'):
+            matrix.validate_swapin_path(value)
+        for value in ('N', '0', ''):
+            with self.assertRaisesRegex(ValueError, 'requires direct swap-in'):
+                matrix.validate_swapin_path(value)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root/'results'
+            values = {'effective_order_mask':'0x3fd', 'bypass_swapcache':'N'}
+            argv = [str(MATRIX_PATH), '--suites', 'anon-1t-full', '--pages', '64', '--output', str(output)]
+            with patch.object(matrix.sys, 'argv', argv), \
+                 patch.object(matrix.os, 'geteuid', return_value=1000), \
+                 patch.object(matrix.platform, 'machine', return_value='x86_64'), \
+                 patch.object(matrix.platform, 'release', return_value='6.18.38-hermit-pebs'), \
+                 patch.object(matrix, 'open', create=True, side_effect=lambda *_a: (root/'lock').open('w')), \
+                 patch.object(matrix, 'command'), \
+                 patch.object(matrix, 'read', side_effect=lambda p: values.get(p.name, '0')), \
+                 patch.object(matrix, 'write') as write, \
+                 patch.object(matrix, 'sampler') as sampler, \
+                 patch.object(matrix.subprocess, 'Popen') as workload, \
+                 patch('sys.stderr', new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as exc:
+                    matrix.main()
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn('bypass_swapcache=N', stderr.getvalue())
+                self.assertIn('requires direct swap-in', stderr.getvalue())
+                write.assert_not_called()
+                sampler.assert_not_called()
+                workload.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_policy_requires_application_decisions_but_not_large_page_selection(self):
+        row = dict(mode=1, page_kb=64)
+        measurement = {'granularity': [
+            dict(phase='populate', order=4, pebs_decisions=100, pebs_actual_swapins=100),
+            dict(phase='application', order=0, pebs_decisions=0, pebs_actual_swapins=1000),
+            dict(phase='application', order=4, pebs_decisions=0, pebs_actual_swapins=0)]}
+        activity, issues = matrix.check_policy_activity(row, measurement)
+        self.assertEqual(activity, dict(required=True, application_decisions=0, path_exercised=False))
+        self.assertTrue(any('zero application-phase decisions' in issue for issue in issues))
+        for mode, ceiling in [(None,64), (0,64), (1,4)]:
+            activity, issues = matrix.check_policy_activity(dict(mode=mode,page_kb=ceiling), measurement)
+            self.assertFalse(activity['required'])
+            self.assertEqual(issues, [])
+        # Unknown/cold histories may correctly choose only order 0.
+        measurement['granularity'][1]['pebs_decisions'] = 1
+        activity, issues = matrix.check_policy_activity(row, measurement)
+        self.assertEqual(issues, [])
+        self.assertTrue(activity['path_exercised'])
+        self.assertEqual(activity['application_decisions'], 1)
+        measurement['granularity'][1]['pebs_decisions'] = None
+        activity, issues = matrix.check_policy_activity(row, measurement)
+        self.assertIsNone(activity['application_decisions'])
+        self.assertTrue(any('missing' in issue for issue in issues))
+
     def test_policy_changes_ignore_only_sampling_controls(self):
         baseline = {'controls': {'remote_order_mask':'0x3fd', 'pebs_force_order':'0',
                                 'pebs_mode':'0', 'pebs_load_period':'1999', 'pebs_min_samples':'32'},
@@ -372,7 +428,7 @@ class ScopeTests(unittest.TestCase):
         text = (KERNEL / 'mm/hermit_pebs.c').read_text()
         self.assertIn('hermit_pebs_mm_exit', text)
         self.assertIn('hermit_pebs_get_mm', text)
-        self.assertIn('hermit_swapin_order(struct mm_struct *mm', text)
+        self.assertIn('hermit_swapin_order(struct vm_fault *vmf', text)
         self.assertNotIn('#include <linux/memcontrol.h>', text)
         self.assertNotIn('get_mem_cgroup_from_mm', text)
         self.assertNotIn('hermit_pebs_memcg', text)
@@ -383,7 +439,7 @@ class ScopeTests(unittest.TestCase):
         memory = (KERNEL / 'mm/memory.c').read_text()
         block = memory.split('PEBS policy:', 1)[1].split('#endif', 1)[0]
         self.assertIn('hermit_swapin_order(', block)
-        self.assertIn('vma->vm_mm', block)
+        self.assertIn('hermit_swapin_order(vmf, orders)', block)
         self.assertNotIn('get_mem_cgroup_from_mm', block)
 
     def test_pid_enable_helper_uses_syscall(self):

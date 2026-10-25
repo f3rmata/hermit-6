@@ -263,10 +263,9 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *pte, unsigned int nr)
     (void)vmf; return nr <= (1U << valid_order);
 }
 static void pte_unmap_unlock(pte_t *pte, spinlock_t *ptl) { (void)pte; (void)ptl; }
-static int hermit_swapin_order(struct mm_struct *mm, unsigned long addr,
-    unsigned long pc, unsigned long candidates)
+static int hermit_swapin_order(struct vm_fault *vmf, unsigned long candidates)
 {
-    (void)mm; (void)addr; assert(pc == 0x1000); selects++;
+    assert(vmf->hermit_fault_pc == 0x1000); selects++;
     assert(!(candidates & ~((BIT(valid_order + 1) - 1))));
     if (requested < 0) return -1;
     return highest_order((candidates & (BIT(requested + 1) - 1)) | BIT(0));
