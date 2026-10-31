@@ -84,6 +84,15 @@ configure_page_size() {
   return 0
 }
 
+require_process_thp_enabled() {
+  local pid=$1 output=$2 enabled
+  sudo_cat "/proc/$pid/status" > "$output" || \
+    rdma_die "cannot read THP status for pid $pid; see $output"
+  enabled=$(awk '$1 == "THP_enabled:" { print $2 }' "$output")
+  [ "$enabled" = 1 ] || \
+    rdma_die "pid $pid has THP_enabled=${enabled:-missing}; process-level THP disable overrides the sweep ceiling; see $output"
+}
+
 log_field() {
   local record=$1 key=$2 log=$3
   awk -v record="$record" -v key="$key" '

@@ -1,5 +1,6 @@
 """Shared sweep mechanics, using fixture counters and files instead of a live host."""
 from pathlib import Path
+import json
 import select
 import signal
 import subprocess
@@ -16,6 +17,61 @@ def shell(script, *args, check=True):
 
 
 class SweepTests(unittest.TestCase):
+    def test_process_thp_disable_is_rejected_and_status_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status, output = root/'status', root/'captured-status'
+            for value in ('1', '0', '3', None):
+                with self.subTest(value=value):
+                    text = 'Name:\tredis-server\n'
+                    if value is not None:
+                        text += f'THP_enabled:\t{value}\n'
+                    status.write_text(text)
+                    result = shell('''
+                        fixture=$1
+                        sudo_cat() { [ "$1" = /proc/123/status ] || exit 9; cat "$fixture"; }
+                        require_process_thp_enabled 123 "$2"
+                    ''', status, output, check=False)
+                    self.assertEqual(output.read_text(), text)
+                    if value == '1':
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('process-level THP disable', result.stderr)
+
+    def test_redis_and_ycsb_launchers_disable_redis_thp_optout(self):
+        for script_name, function, instances in [
+                ('run_redis_page_sweep.sh', 'start_redis_servers', 2),
+                ('run_ycsb_page_sweep.sh', 'start_server', 1)]:
+            with self.subTest(script=script_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root/'redis-server'
+                binary.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+port = sys.argv[sys.argv.index('--port') + 1]
+(Path(os.environ['REDIS_ARG_DIR']) / ('argv-' + port + '.json')).write_text(json.dumps(sys.argv[1:]))
+''')
+                binary.chmod(0o755)
+                source = (COMMON.parent/script_name).read_text()
+                start = source.index(function+'() {')
+                definition = source[start:source.index('\n}\n', start)+3]
+                shell(definition + '''
+                    REDIS_SERVER_BIN=$1
+                    export REDIS_ARG_DIR=$2
+                    REDIS_INSTANCES=2; REDIS_PORT=6391; BINDING=redis
+                    REDIS_SERVER_CPUS=0; SERVER_CPUS=0; CGROUP=/unused
+                    taskset() { shift 2; "$@"; }
+                    sudo_write() { :; }
+                    enable_benchmark_pebs_pid() { :; }
+                    ''' + function + ' "$2"\nwait\n', binary, root)
+                files = sorted(root.glob('argv-*.json'))
+                self.assertEqual(len(files), instances)
+                for file in files:
+                    args = json.loads(file.read_text())
+                    self.assertEqual(args.count('--disable-thp'), 1)
+                    self.assertEqual(args[args.index('--disable-thp')+1], 'no')
+
     def test_metrics_keep_units_and_fallback_accounting(self):
         with tempfile.TemporaryDirectory() as directory:
             before, after = (Path(directory)/name for name in ('before', 'after'))

@@ -1,7 +1,9 @@
 # Hermit PEBS 设计与实现
 
-> 状态：2026-10-25。PEBS 历史按 mm 保存，不依赖 cgroup；`CONFIG_HERMIT` 不要求
-> `CONFIG_MEMCG`。历史设计与验证记录见 [PEBS 历史报告](../archive/pebs/)。
+> 状态：2026-10-26。PEBS 历史按 mm 保存，不依赖 cgroup；`CONFIG_HERMIT` 不要求
+> `CONFIG_MEMCG`。新内核矩阵暴露的置信门槛、并发预读反馈和开销问题见
+> [PEBS 策略设计问题与改进方案](policy-design-review.md)。
+> 历史设计与验证记录见 [PEBS 历史报告](../archive/pebs/)。
 
 ## 1. 目标
 
@@ -228,9 +230,13 @@ python3 tools/rdma/tests/test_pebs.py
 
 测试启用 ASan/UBSan；在不支持 LeakSanitizer 的沙箱中可加
 `ASAN_OPTIONS=detect_leaks=0`，PC/区域元数据仍有分配余额检查。
-本次编译验证使用现有 Hermit/MEMCG/THP 配置，检查 `hermit_pebs.o`、`memory.o`
-和 `swap_state.o`；未启动 QEMU、未运行真实 PEBS/RDMA 实验。旧版实验结果见
-archive，不能当作新策略的性能证据。
+2026-10-25 的编译验证使用现有 Hermit/MEMCG/THP 配置，检查 `hermit_pebs.o`、
+`memory.o` 和 `swap_state.o`。随后在内核 #12 上完成的 1134 次 PEBS/RDMA
+矩阵于 2026-10-26 复核通过；432 次上限大于 4 KiB 的 policy 测试全部执行选页。
+但应用阶段 `pebs_selected=0`，实际选择几乎全部来自预读回退；单线程 chunk64k
+在 2 MiB 上限下主要选择 128 KiB，8 线程完整扫描则大量退回 4 KiB。
+运行通过不能视为 PEBS 学习有效，证据及改进优先级见
+[策略设计审查](policy-design-review.md)。旧版结果见 archive，应与新内核结果分开统计。
 
 ## 8. 已知限制与后续工作
 

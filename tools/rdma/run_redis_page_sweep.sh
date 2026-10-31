@@ -107,7 +107,7 @@ start_redis_servers() {
     if [ "$index" -eq 0 ]; then log="$run_dir/redis.log"; else log="$run_dir/redis-${index}.log"; fi
     taskset -c "$REDIS_SERVER_CPUS" "$bin" \
       --port "$port" --bind 127.0.0.1 --protected-mode no \
-      --save "" --appendonly no --daemonize no \
+      --save "" --appendonly no --daemonize no --disable-thp no \
       --stop-writes-on-bgsave-error no --rdbcompression no --maxmemory 0 \
       > "$log" 2>&1 &
     pid=$!
@@ -267,6 +267,10 @@ for kb in $PAGE_SIZES_KB; do
 
     start_redis_servers "$run_dir"
     wait_for_redis_ready
+    for index in "${!current_redis_pids[@]}"; do
+      require_process_thp_enabled "${current_redis_pids[$index]}" \
+        "$run_dir/redis-${index}-status-before.txt"
+    done
 
     taskset -c "$BENCH_CPUS" python3 "$WORKER" > "$worker_log" 2>&1 &
     current_worker_pid=$!

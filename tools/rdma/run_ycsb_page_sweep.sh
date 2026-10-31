@@ -118,7 +118,7 @@ start_server() {
     bin=$(find_redis_server_bin)
     taskset -c "$SERVER_CPUS" "$bin" \
       --port "$REDIS_PORT" --bind 127.0.0.1 --protected-mode no \
-      --save "" --appendonly no --daemonize no \
+      --save "" --appendonly no --daemonize no --disable-thp no \
       --stop-writes-on-bgsave-error no --rdbcompression no --maxmemory 0 \
       > "$current_server_log" 2>&1 &
     current_server_pid=$!
@@ -304,6 +304,9 @@ for kb in $PAGE_SIZES_KB; do
 
     start_server "$run_dir"
     wait_for_server_ready
+    if [ "$BINDING" = redis ]; then
+      require_process_thp_enabled "$current_server_pid" "$run_dir/server-status-before.txt"
+    fi
 
     workload_file="$run_dir/workload.properties"
     generate_workload_file "$workload_file" "$SERVER_PORT"

@@ -37,6 +37,13 @@ python3 tools/rdma/pebs/run_workload_matrix.py \
 
 移除 `--dry-run` 才执行负载。每轮只设置 THP 分配上限，例如 64KiB 轮允许 4/16/32/64KiB，2MiB 轮允许所有较小档位；实际分配及预取粒度由内核和 Hermit 决定。off/static/policy 和采样周期仍按原来的配对、随机顺序、重复次数运行。
 
+Redis 及 YCSB 的 Redis 服务统一使用 `--disable-thp no`，启动完成后、装载数据前保存
+`redis-*-status-before.txt` / `server-status-before.txt`，要求 `/proc/PID/status` 的
+`THP_enabled: 1`。Redis 7.4.1 默认 `disable-thp yes`：发现顶层 THP 为 `always`
+就会通过 `PR_SET_THP_DISABLE` 禁止整个进程使用大页，使 2MiB 轮次退化为 4KiB，
+绕过 PEBS 选页；仅记录 sysfs 不能发现这种进程级限制。4KiB 轮次仍由 THP 上限
+禁止分配大页。已有的零决策校验继续保留。
+
 运行前应准备好 Hermit、RDMA 和 swap。脚本保留 `remote_order_mask`、`pebs_force_order`、学习阈值、自适应开关以及回收/批处理参数，只记录其值；启用强制 order 或后端缺少上限以内的档位会在启动检查中报错。例如完整 4KiB–2MiB 矩阵要求 `effective_order_mask` 包含 `0x3fd`，旧实验恢复的 `0x1` 不满足条件。脚本不会替换这个掩码。退出时恢复本次修改的 THP 设置及采样模式/周期。
 
 当前内核的 PEBS 选页调用位于直接换入路径，矩阵启动前必须配置 `bypass_swapcache=Y`，否则预检立即失败。采样量非零不能证明策略参与选页：2026-10-22 的 1134 次矩阵在 `bypass_swapcache=N` 下完成，但全部 policy 决策为零。先在空闲测试机上完成以下一次性准备，off/static/policy 全程使用相同设置：
