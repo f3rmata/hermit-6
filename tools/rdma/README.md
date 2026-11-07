@@ -20,7 +20,10 @@
 - 多负载矩阵：`pebs/run_workload_matrix.py`，默认 1323 个样本（去掉 XGBoost 为 1134），PEBS 按工作负载 pid 启用。`--pages` 表示每轮**最大分配页大小**，保留全部较小 THP 档位。
 - 页面选择微基准：`pebs/run_page_selection_microbench.py`。
 
-旧版 Memcached 矩阵 `pebs_perf_matrix.py` 保留用于复现 2026-10-06 的条件；当前实验优先使用上面的入口。
+Memcached 使用 `pebs/pebs_perf_matrix.py`；加 `--pages` 后按相同的最大分配页口径扫描。
+默认每档为 `off` 加三个周期的 static/policy，`off` 仅关闭 PEBS，所有 case 保持同一后端掩码。
+旧 case 名 `off-same-pages` / `off-original-mask` 仍可指定，但现在与 `off` 使用相同掩码，
+不再复现旧脚本中 `off` 强制 `0x1` 的条件。
 
 ```sh
 python3 tools/rdma/pebs/pebs_perf_matrix.py --help
@@ -44,9 +47,9 @@ Redis 及 YCSB 的 Redis 服务统一使用 `--disable-thp no`，启动完成后
 绕过 PEBS 选页；仅记录 sysfs 不能发现这种进程级限制。4KiB 轮次仍由 THP 上限
 禁止分配大页。已有的零决策校验继续保留。
 
-运行前应准备好 Hermit、RDMA 和 swap。脚本保留 `remote_order_mask`、`pebs_force_order`、学习阈值、自适应开关以及回收/批处理参数，只记录其值；启用强制 order 或后端缺少上限以内的档位会在启动检查中报错。例如完整 4KiB–2MiB 矩阵要求 `effective_order_mask` 包含 `0x3fd`，旧实验恢复的 `0x1` 不满足条件。脚本不会替换这个掩码。退出时恢复本次修改的 THP 设置及采样模式/周期。
+运行前应准备好 Hermit、RDMA 和 swap。多负载脚本保留 `remote_order_mask`、`pebs_force_order`、学习阈值以及回收/批处理参数，只记录其值；固定周期 case 设置 `pebs_adaptive=0`。启用强制 order 或后端缺少上限以内的档位会在启动检查中报错。例如完整 4KiB–2MiB 矩阵要求 `effective_order_mask` 包含 `0x3fd`，旧实验恢复的 `0x1` 不满足条件。脚本不会替换这个掩码。退出时恢复本次修改的 THP 设置及采样模式/周期/自适应开关。
 
-当前内核的 PEBS 选页调用位于直接换入路径，矩阵启动前必须配置 `bypass_swapcache=Y`，否则预检立即失败。采样量非零不能证明策略参与选页：2026-10-22 的 1134 次矩阵在 `bypass_swapcache=N` 下完成，但全部 policy 决策为零。先在空闲测试机上完成以下一次性准备，off/static/policy 全程使用相同设置：
+矩阵为保持 off/static 的直接换入条件，启动前要求 `bypass_swapcache=Y`。新内核的 policy 组使用独立的 4 KiB 预测及批次换入路径。采样量非零不能证明策略参与换页。先在空闲测试机上完成以下一次性准备，off/static/policy 全程使用相同设置：
 
 ```sh
 sudo -v
@@ -57,7 +60,7 @@ sudo cat /sys/kernel/debug/hermit/effective_order_mask \
   /sys/kernel/debug/hermit/pebs_force_order /sys/kernel/debug/hermit/pebs_enabled
 ```
 
-预期依次为 `0x3fd`、`Y`、`0`、`0`。脚本不会自动改写 `bypass_swapcache`，也不会在结束时撤销上述手工准备。正式矩阵前可先执行 6 次小矩阵（输出目录必须不存在）：
+预期依次为 `0x3fd`、`Y`、`0`、`0`。多负载脚本不会自动改写 `bypass_swapcache`，也不会在结束时撤销上述手工准备。以下为可选的 7 次小矩阵（包含一个 4KiB-only 对照，输出目录必须不存在）：
 
 ```sh
 python3 -u tools/rdma/pebs/run_workload_matrix.py \
@@ -65,7 +68,48 @@ python3 -u tools/rdma/pebs/run_workload_matrix.py \
   --output "tools/rdma/results/pebs/policy-smoke-$(date +%Y%m%d-%H%M%S)"
 ```
 
-每次 policy 运行后，最大页大于 4KiB 时必须观察到**应用阶段**决策计数增长；仅准备阶段有决策、只有采样或 `actual_order_N` 增长，都不能通过。无决策会记录 `usable=false` 并立即中止矩阵，保留诊断和原始数据。4KiB 上限没有大页候选，允许零决策；策略选择 4KiB 本身也有效，不要求必须选大页或达到特定命中率。
+新内核按**应用阶段** `policy_stats` 和 batch read WR 的增量判定策略活动。
+存在远端 I/O 的 policy case 需要看到冷页观察、预测、回收排序或批次读请求的证据；
+单页 batch read 也表示策略路径已执行，不要求一定预取或形成大请求。无远端 I/O 的
+常驻测试会标记路径未执行，但不会因此拒绝采样开销结果。旧内核无 `policy_stats` 时，
+仍检查大于 4KiB 档位的旧选页计数。准备阶段活动、单纯采样量不能替代应用阶段证据。
+
+在 dnet-61 上，下面两个命令应依次运行，不能与其他矩阵并行。Memcached 为 189 个
+样本，Redis/YCSB 为 378 个样本；均为九档页面、三个周期、三次重复。Memcached
+保留原有 800000 条 1KiB value、640MiB `memory.high`、2GiB `memory.max` 压力条件；
+Redis/YCSB 保留原有 16GiB 数据、70% 驻留内存预算，YCSB 默认 Redis binding。
+它们的内存预算口径与新应用 `run_policy_app_matrix.py` 不同，结果应在同一负载内配对。
+
+```sh
+# Memcached：root 驱动将应用降权为 xwz；off 只关闭策略
+sudo python3 tools/rdma/pebs/pebs_perf_matrix.py \
+  --user xwz --server-cpus 0-7 --client-cpus 16-31 --sampler-cpus 0-7 \
+  --pages 4 16 32 64 128 256 512 1024 2048 \
+  --records 800000 --memory-mb 640 --connections 32 --qps 0 \
+  --warmup 30 --duration 120 --repeats 3 --require-fixed \
+  --output "$HOME/memcached-policy-$(date +%Y%m%d-%H%M%S)"
+
+# Redis + YCSB：以 xwz 运行，不要在 python3 前加 sudo
+sudo -v
+python3 -u tools/rdma/pebs/run_workload_matrix.py \
+  --suites redis ycsb \
+  --redis /home/xwz/redis/src/redis-server \
+  --ycsb /home/xwz/ycsb-0.17.0/bin/ycsb \
+  --pages 4 16 32 64 128 256 512 1024 2048 \
+  --periods 19997 1999 199 --store-period 1500003 --repeats 3 \
+  --output "$HOME/redis-ycsb-policy-$(date +%Y%m%d-%H%M%S)"
+```
+
+两个入口都支持 `--dry-run`，不要求 sudo，也不创建输出目录。Memcached 的
+`run_memcached_sampling_cost.py` 继续用于常驻/压力对照，其默认 baseline 同样为 `off`。
+
+额外明确标记 **`4KiB-only` 对照**：关闭全部 THP/mTHP 和 PEBS，复用每次重复中的
+`max_page_kb=4, case=off` 单元，不重复运行相同负载。指定的 `--pages` 不含 4 时，
+驱动自动为每个负载、每次重复补一个 4KiB/off 单元。该标记指分配页面大小，
+后端能力掩码保持一致，实际 RDMA 请求大小仍独立记录。`paired.csv` 同时输出
+相对 `off_same_page` 和相对 `4KiB-only` 的吞吐提升、p99/WR/换页计数下降比例，
+严格匹配负载与重复编号；缺失或失败的 baseline 保留标记，不借用其他重复。
+不带 `--pages` 的 Memcached 常驻/采样开销测试仍保留系统 THP 设置，不加入该对照。
 
 匿名负载的逻辑访问区域固定为 2MiB（单独运行时可设 `ACCESS_REGION_KB`），`chunk64k` 始终访问每个区域的 64KiB；访问量不再随页上限变化。16GiB 工作集的覆盖量固定为 512MiB。历史字段 `pages_per_folio` 表示逻辑区域的页数，不代表实际分配 folio。
 
@@ -73,7 +117,8 @@ python3 -u tools/rdma/pebs/run_workload_matrix.py \
 
 - `summary.csv`：每轮 `max_page_kb`、应用吞吐、计时及有效性，以及 `application_policy_decisions`、`policy_path_exercised`。匿名吞吐按访问页面覆盖量计算，每页实际读取一个字节；Redis 为 GET/s、YCSB 为 ops/s、XGBoost 为 rounds/s。
 - 每轮 `status.json` 的 `policy_activity`：是否要求选页路径生效、应用阶段决策数及路径是否生效；具体失败原因在 `validation_issues`。
-- `granularity.csv`：按准备阶段/应用阶段、order 记录 folio 请求数、实际 RDMA WR 数/字节数/读字节占比、PEBS 决策数和内核提供的实际换入计数。旧内核缺少 `actual_order_N` 时留空；off 的 PEBS 计数不表示全部换入流量。
+- `granularity.csv`：以 `size_kib` 记录实际请求大小，普通 order WR 与同大小的 SG WR 相加；12KiB 等非二次幂请求的 `order` 留空。`batch_*` 是总量的子集，不能再次相加。多负载入口还按准备/应用阶段记录 folio 请求及旧 PEBS 计数；Memcached 记录测量阶段 WR。folio 请求大小与 WR 大小分别计量。
+- `summary.csv` 增加应用阶段 `read_wrs/write_wrs/read_bytes/write_bytes`、`pswpin/pswpout` 和 `policy_*` 计数。Memcached、YCSB 保存延迟，Redis 扫描负载没有逐请求延迟分位数；缺失值留空。
 - 每轮 `measurement.json` 和原始 `order-*.txt`、`.wr`、`.pebs`、`.thp`：保留性能、粒度分布及实际 THP 设置。原负载 CSV 的 `page_kb` 是上限，`target_*` 只统计该上限 order；分析所有粒度应使用 `granularity.csv`。
 
 后端计数是整机计数，需要独占测试机；folio 请求大小、PEBS 决策和实际 WR 粒度不可互相替代。旧结果的单档限制及匿名访问量与新版本不同，不应直接混合汇总。历史图表与结论见 [PEBS 评估](../../docs/pebs/evaluation.md)，原始数据在 `results/pebs/`。

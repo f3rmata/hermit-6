@@ -27,6 +27,8 @@ static bool rswap_stopping = true;
 /* Posted traffic includes retries, grouped by the actual WR size. */
 static atomic64_t rswap_posted_writes[PMD_ORDER + 1];
 static atomic64_t rswap_posted_reads[PMD_ORDER + 1];
+static atomic64_t rswap_batch_writes[HERMIT_BATCH_MAX + 1];
+static atomic64_t rswap_batch_reads[HERMIT_BATCH_MAX + 1];
 
 static int rswap_wr_stats_get(char *buffer, const struct kernel_param *kp)
 {
@@ -44,6 +46,16 @@ static int rswap_wr_stats_get(char *buffer, const struct kernel_param *kp)
 		len += scnprintf(buffer + len, PAGE_SIZE - len,
 			"%u %llu %llu %llu %llu\n", order, writes, reads,
 			writes * (PAGE_SIZE << order), reads * (PAGE_SIZE << order));
+	}
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
+		"pages batch_write_wrs batch_read_wrs batch_write_bytes batch_read_bytes\n");
+	for (order = 1; order <= HERMIT_BATCH_MAX; order++) {
+		u64 w = atomic64_read(&rswap_batch_writes[order]);
+		u64 r = atomic64_read(&rswap_batch_reads[order]);
+
+		len += scnprintf(buffer + len, PAGE_SIZE - len,
+			"%u %llu %llu %llu %llu\n", order, w, r,
+			w * order * PAGE_SIZE, r * order * PAGE_SIZE);
 	}
 	return len;
 }
@@ -77,6 +89,9 @@ void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
 		if (!rswap_process_cq(rdma_queue, 16))
 			cpu_relax();
 	}
+	/* A CQ callback may have published the last completion on another CPU. */
+	mutex_lock(&rdma_queue->cq_lock);
+	mutex_unlock(&rdma_queue->cq_lock);
 }
 
 /**
@@ -109,11 +124,19 @@ static void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 		atomic_cmpxchg(&io->status, 0, -EIO);
 	}
 
-	ib_dma_unmap_page(ibdev, rdma_req->dma_addr, rdma_req->dma_len,
-			  rdma_req->dma_dir);
+	if (rdma_req->batch_nr) {
+		unsigned int i;
+
+		for (i = 0; i < rdma_req->batch_nr; i++)
+			ib_dma_unmap_page(ibdev, rdma_req->batch_sge[i].addr,
+					  PAGE_SIZE, rdma_req->dma_dir);
+	} else {
+		ib_dma_unmap_page(ibdev, rdma_req->dma_addr, rdma_req->dma_len,
+				  rdma_req->dma_dir);
+	}
+	kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
 	atomic_dec_return_release(&rdma_queue->rdma_post_counter);
 	atomic_dec_return_release(&io->pending);
-	kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
 }
 
 static bool rswap_reserve_send_slot(struct rswap_rdma_queue *rdma_queue)
@@ -172,6 +195,7 @@ static int fs_build_rdma_wr(struct rdma_session_context *rdma_session,
 	enum dma_data_direction dir;
 	struct ib_device *dev = rdma_session->rdma_dev->dev;
 
+	rdma_req->batch_nr = 0;
 	rdma_req->page = page;
 	rdma_req->io_context = io;
 	rdma_req->dma_len = len;
@@ -373,7 +397,7 @@ static int rswap_submit_folio(struct hermit_io *io,
 	unsigned int i, nr_pages = folio_nr_pages(io->folio);
 	int ret;
 
-	if (!rswap_extent_in_pool(swp_offset(io->entry), nr_pages))
+	if (!rswap_extent_in_pool(io->remote_offset, nr_pages))
 		return -ERANGE;
 
 	if (io->transfer_order > io->folio_order ||
@@ -383,7 +407,7 @@ static int rswap_submit_folio(struct hermit_io *io,
 	for (i = 0; i < nr_pages; i += 1U << (base_pages ? 0 : io->transfer_order)) {
 		size_t len = PAGE_SIZE << (base_pages ? 0 : io->transfer_order);
 
-		ret = rswap_rdma_send(ctx, io->cpu, swp_offset(io->entry) + i,
+		ret = rswap_rdma_send(ctx, io->cpu, io->remote_offset + i,
 				      folio_page(io->folio, i), len, type);
 		if (ret) {
 			/* Drain partial submission before retrying the entire folio. */
@@ -492,10 +516,143 @@ done:
 	return ret;
 }
 
+/* One WR describes adjacent remote pages and independent local DMA pages.
+ * Never bridge an MR boundary; QP and device READ SGE limits are independent.
+ */
+static int rswap_send_batch(struct hermit_batch *batch,
+		struct rswap_io_context *ctx, unsigned int first, unsigned int nr)
+{
+	struct rswap_rdma_queue *q = ctx->queue;
+	struct ib_device *dev = rdma_session_global.rdma_dev->dev;
+	struct fs_rdma_req *req;
+	struct remote_chunk *chunk;
+	size_t addr = pgoff2addr(batch->offsets[first]);
+	unsigned int i;
+	int ret;
+
+	if (!rswap_extent_in_pool(batch->offsets[first], nr) ||
+	    (addr & CHUNK_MASK) + nr * PAGE_SIZE > (1ULL << CHUNK_SHIFT))
+		return -ERANGE;
+	req = kmem_cache_zalloc(q->fs_rdma_req_cache, GFP_ATOMIC);
+	if (!req)
+		return -ENOMEM;
+	req->dma_dir = batch->write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	req->io_context = ctx;
+	for (i = 0; i < nr; i++) {
+		struct ib_sge *sge = &req->batch_sge[i];
+
+		sge->addr = ib_dma_map_page(dev, folio_page(batch->folios[first + i], 0),
+					  0, PAGE_SIZE, req->dma_dir);
+		if (ib_dma_mapping_error(dev, sge->addr)) {
+			ret = -ENOMEM;
+			goto unmap;
+		}
+		req->batch_nr++;
+		sge->length = PAGE_SIZE;
+		sge->lkey = rdma_session_global.rdma_dev->pd->local_dma_lkey;
+	}
+	chunk = &rdma_session_global.remote_mem_pool.chunks[addr >> CHUNK_SHIFT];
+	req->cqe.done = fs_rdma_callback;
+	req->rdma_wr.wr.wr_cqe = &req->cqe;
+	req->rdma_wr.wr.sg_list = req->batch_sge;
+	req->rdma_wr.wr.num_sge = nr;
+	req->rdma_wr.wr.opcode = batch->write ? IB_WR_RDMA_WRITE : IB_WR_RDMA_READ;
+	req->rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
+	req->rdma_wr.remote_addr = chunk->remote_addr + (addr & CHUNK_MASK);
+	req->rdma_wr.rkey = chunk->remote_rkey;
+	atomic_inc(&ctx->pending);
+	ret = fs_enqueue_send_wr(q, req);
+	if (ret) {
+		atomic_dec_return_release(&ctx->pending);
+		goto unmap;
+	}
+	if (batch->write)
+		atomic64_inc(&rswap_batch_writes[nr]);
+	else
+		atomic64_inc(&rswap_batch_reads[nr]);
+	return 0;
+unmap:
+	for (i = 0; i < req->batch_nr; i++)
+		ib_dma_unmap_page(dev, req->batch_sge[i].addr, PAGE_SIZE, req->dma_dir);
+	kmem_cache_free(q->fs_rdma_req_cache, req);
+	return ret;
+}
+
+static int rswap_backend_submit_batch(struct hermit_batch *batch)
+{
+	struct rswap_io_context *ctx;
+	unsigned int i, nr, limit;
+	int ret;
+
+	ctx = rswap_io_alloc(batch->cpu, batch->write ? QP_STORE : QP_LOAD_ASYNC,
+			     GFP_NOIO);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+	limit = min_t(unsigned int, HERMIT_BATCH_MAX, ctx->queue->max_send_sge);
+	if (!batch->write)
+		limit = min_t(unsigned int, limit,
+			rdma_session_global.rdma_dev->dev->attrs.max_sge_rd);
+	limit = clamp_t(unsigned int, limit, 1, 1U << max_order);
+	for (i = 0; i < batch->nr; i += nr) {
+		unsigned long boundary = 1UL << (CHUNK_SHIFT - PAGE_SHIFT);
+
+		nr = 1;
+		while (nr < limit && i + nr < batch->nr &&
+		       (batch->write || batch->addresses[i + nr] ==
+			batch->addresses[i] + nr * PAGE_SIZE) &&
+		       batch->offsets[i + nr] == batch->offsets[i] + nr &&
+		       batch->offsets[i] / boundary == batch->offsets[i + nr] / boundary)
+			nr++;
+		ret = rswap_send_batch(batch, ctx, i, nr);
+		/* Unsupported SG/layout falls back to exactly the selected pages. */
+		if (ret && nr > 1) {
+			nr = 1;
+			ret = rswap_send_batch(batch, ctx, i, 1);
+		}
+		if (ret) {
+			rswap_io_poll(ctx, true);
+			rswap_io_free(ctx);
+			return ret;
+		}
+	}
+	batch->private = ctx;
+	return 0;
+}
+
+static int rswap_backend_poll_batch(struct hermit_batch *batch, bool wait)
+{
+	struct rswap_io_context *ctx = batch->private;
+	unsigned int i;
+	int ret = rswap_io_poll(ctx, wait);
+
+	if (ret == -EAGAIN)
+		return ret;
+	batch->private = NULL;
+	rswap_io_free(ctx);
+	for (i = 0; i < batch->nr; i++)
+		batch->status[i] = ret;
+	/* Read errors are isolated at 4 KiB so a failed neighbor cannot hide
+	 * a successfully retried demand page. Writes are retried by reclaim.
+	 */
+	if (ret && !batch->write) {
+		for (i = 0; i < batch->nr; i++) {
+			struct hermit_io io = {
+				.entry = batch->entries[i], .folio = batch->folios[i],
+				.remote_offset = batch->offsets[i], .cpu = batch->cpu,
+			};
+
+			batch->status[i] = rswap_backend_load(&io, false);
+		}
+	}
+	return 0;
+}
+
 static struct hermit_backend_ops rswap_backend_ops = {
 	.load = rswap_backend_load,
 	.store = rswap_backend_store,
 	.poll = rswap_backend_poll,
+	.submit_batch = rswap_backend_submit_batch,
+	.poll_batch = rswap_backend_poll_batch,
 };
 
 int rswap_register_backend(void)
@@ -525,6 +682,16 @@ int rswap_register_backend(void)
 	rswap_backend_ops.supported_order_mask = BIT(0);
 	if (max_order >= 2)
 		rswap_backend_ops.supported_order_mask |= GENMASK(max_order, 2);
+	/* Only advertise the contiguous mapped prefix; holes are not capacity. */
+	rswap_backend_ops.capacity_pages = 0;
+	for (ret = 0; ret < rdma_session_global.remote_mem_pool.chunk_num; ret++) {
+		unsigned long pages = rdma_session_global.remote_mem_pool.chunks[ret].mapped_size >> PAGE_SHIFT;
+
+		rswap_backend_ops.capacity_pages += pages;
+		if (pages != (1UL << (CHUNK_SHIFT - PAGE_SHIFT)))
+			break;
+	}
+	rswap_backend_ops.boundary_pages = 1UL << (CHUNK_SHIFT - PAGE_SHIFT);
 	ret = hermit_register_backend(&rswap_backend_ops);
 	if (ret) {
 		spin_lock_irqsave(&rswap_io_lifecycle_lock, flags);

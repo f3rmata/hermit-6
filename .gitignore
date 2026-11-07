@@ -9,3 +9,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+artifacts
+docs/pebs/assets
+tools/rdma/pebs/lab

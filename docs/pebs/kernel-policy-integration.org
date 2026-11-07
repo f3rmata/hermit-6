@@ -1,0 +1,256 @@
+#+TITLE: Hermit 4 KiB 策略内核集成与 off/static/policy 应用矩阵
+#+DATE: 2026-11-01
+
+* 内核路径
+
+本次将策略接入真实的 reclaim、swap fault、swapcache 和 RDMA/DRAM 后端。
+策略使用现有 pebs_mode=1；矩阵在同一内核内切换既有采样与策略控制，以未开启策略的 off 作为 baseline。
+
+- 换入预测以 4 KiB 为单位。证据来自同一 mm、线程生命周期、fault PC、VMA 代次内的连续需求，以及达到置信门槛的逐页 PEBS load footprint。冷启动没有填充预取。
+- 每个新读页单独通过 swapcache 去重、预留 swap entry 并向 memcg 收费。预取分配不进入直接回收；分配失败、已有缓存或 PTE/VMA 边界使预测缩短，需求页仍走正常缺页处理。
+- 当前一次最多选择 16 页、限定同一 VMA/PMD。每页的 swap PTE 都单独检查。完成后再次检查预取 PTE，过期页撤销缓存；需求页由 do_swap_page 的现有 PTE 重验完成安装。没有对过期 VMA 异步装 PTE 的工作线程。
+- RDMA 合并检查实际远端 offset 连续、虚拟页连续、MR/chunk 边界、QP send SGE、设备 READ SGE 和 max_order。没有根据写出批次大小补读。不能合并时发送单页，READ 失败逐页重试。
+- 原有大 folio 路径保留；大 folio 分配额外检查实际远端连续性。策略新分配的 swapin 页为 order 0。
+
+冷页状态按页保存于有界的 per-mm 表（最多 8192 个条目），不持有 resident folio 引用。
+连续两个完整空观察才判冷；近期访问、PEBS 命中、估计重用间隔和近期 refault 提高保护优先级。
+观察时检查 PFN、VMA 代次和采样 epoch；迟到的样本不能覆写新的负观察。
+VMA 写锁释放/降级和 zap 的 TLB gather 会使旧历史失效，避免 MADV_DONTNEED 后地址重用继续训练旧页。
+
+x86 原生 young-bit 清理不保证刷新 TLB。为使负观察有效，只有参与跟踪的独占 4 KiB 匿名页在观察周期边界刷新对应 TLB；刷新完成前状态保持未知。
+共享页、大页、MMU notifier 管理的映射及不完整观察不会当作冷页证据。
+这部分增加的扫描/TLB 成本必须包含在服务器吞吐、延迟和 CPU 数据中，不能仅凭合并 WR 数推断收益。
+
+回收在最多 32 个候选中排序，顺序考虑冷热、脏页写入成本和最近使用时间。
+该排序不永久排除任何候选；原生回收保留需求进展能力。
+已选中的冷脏 order-0 页只有在同一 mm/VMA/代次和 swap 设备时才进入最多 16 页的批次。
+批次按虚拟地址排序后分配连续远端位置，使用 SG 写入，不合并本地 folio，也不加入未选中的邻页。
+
+逻辑 swap entry 到物理远端页的映射独立于读写批次。写入完成前映射不可读，部分失效按页释放位置。
+写入失败保留脏的本地源页；源页的锁、回收引用和 writeback 状态覆盖提交至完成，随后可走原有单页/native writeout 路径。
+后端异步操作的 SRCU 引用覆盖整个 submit/poll 生命周期，卸载等待完成，后端重注册使用新的映射代次，旧远端数据不会误读成本地 swap 数据。
+
+主动回收使用近期可预测流和压力共同触发的小预留（最多 32 页且不超过容量的 1/16），refault 频繁时取消预留与预取。
+策略模式只启动一个预留回收 worker，避免每个 worker 的最小扫描量把小预留放大。
+memcg 工作链的 css 引用和自重排状态通过锁同步。
+
+* 2026-11-04 修正
+
+针对 [[file:policy-results-20261103.md][11-03 矩阵]] 和代码审查的问题做了以下修正。内核 #16 上的 Memcached 消融和
+Redis/YCSB/匿名扫描结果见 [[file:policy-results-20261104.md][11-04 报告]]。#16 上发现的两处问题已在内核 #17 修复：
+=LARGE= 判定改为先检查 VMA 能否分配大于 4 KiB 的 folio（=hermit_swapin_large_allowed()=）；
+=hermit_policy_observe()= 改为在建表之前排除大 folio、共享页和带 MMU notifier 的映射。
+#17 完整矩阵发现一个新问题，尚未修复：=policy_stream()= 的 64 个槽每槽只存一个流，
+两个线程哈希冲突时会互相清零，8 线程扫描约三分之一的运行中有 2 个线程始终停在 4 KiB 批次。
+
+- 回收排序：=shrink_folio_list()= 从链表尾取页，排序改为扫描尾部 32 页、把最优页放到尾部，每次 pass 只排一次（原来每取一页排一次、扫描的是头部）。hint 与 ghost 记录合并为一次 rmap walk。
+- 主动回收：policy 模式不再替换 =apt_reclaim= 的 headroom 和 worker 数；只有设置 =RESERVE= 位才启用小预留。
+- 失效范围：删除 =mmap_write_unlock=、=mmap_write_downgrade=、=tlb_gather_mmu= 中的 mm 级 generation 递增；=unmap_page_range()= 只删除被 zap 范围内的逐页状态。PEBS 历史不再因 VMA 修改被整体清空，仍按 TTL 老化。启用/停止 mm 采样仍作为新会话。
+- 冷页判定：默认 1 个空观察区间即判冷（原为 2 个），区间下限从 14 µs 改为 =policy_cold_us=（默认 1000 µs）。观察起点的 TLB flush 加入回收的 unmap batch，=shrink_folio_list= / =shrink_active_list= 末尾统一刷新，非回收上下文仍立即刷新。跟踪表默认 32768 页（=policy_pages_max=）。
+- PEBS：跨区域足迹按 mm 共享，只有预读反馈按线程隔离。无 load 样本的窗口不再覆盖历史；同一区域的重复窗口只算一次证据。4 KiB 预测使用独立门槛 =pebs_predict_regions=2=、=pebs_predict_samples=8=。
+- 换入：同流连续时按 2 倍增长（原为每次 +1），上限 =policy_swapin_max=（默认 64 页），分为最多 4 个 16 页 SG 批次，全部提交后再轮询。PTE 快照和完成后重验各只取一次 PTE 锁。连续流长度达到上限 2 倍时（=LARGE= 位）回到原大 folio 路径，由 =alloc_swap_folio()= 选择最大合法 order。
+
+** 消融开关 =policy_features=
+
+| 位 | 名称 | 默认 | 作用 |
+|----+---------+------+--------------------------------------|
+| 0x01 | SWAPIN | 开 | 4 KiB 预测 SG 换入；关闭则走原 mTHP 路径 |
+| 0x02 | PEBS | 开 | PEBS 足迹投票延长批次 |
+| 0x04 | SORT | 开 | 回收尾部排序 |
+| 0x08 | OBSERVE | 开 | young 位冷页观察 |
+| 0x10 | FLUSH | 开 | 观察起点 TLB flush（批量） |
+| 0x20 | BATCH | 开 | 冷脏页 SG 合并换出 |
+| 0x40 | RESERVE | 关 | 用策略小预留替换 apt_reclaim 水位 |
+| 0x80 | LARGE | 开 | 长顺序流使用大 folio |
+
+上述八位的默认值原为 =0xbf=；加入下节 MGLRU 协同后默认值为 =0x1bf=。=pebs_perf_matrix.py --policy-features= 对所有 policy 单元设置该掩码并在退出时恢复；=run_workload_matrix.py= 把它记入 controls 快照，运行中被改动会报错。
+
+** 新增计数
+
+=policy_stats= 保留原 7 个字段及顺序，追加 =started_epochs=、=young_epochs=、=short_epochs=、=table_evictions=、=unmapped_4k=、=sorted_lists=、=large_streams=。=pebs_order_stats= 追加 =samples_target_mm=、=samples_in_window= 和 =predict_*=（调用、无表项、区域不足、样本不足、投票不足、成功延长）。
+
+* 2026-11-04 MGLRU 协同
+
+此前本地构建配置未启用 =CONFIG_LRU_GEN=。启用原生 MGLRU 后，Hermit 的
+PTE 冷观察与 MGLRU 的 accessed-bit 老化没有相同的观察周期语义；同时，对
+MGLRU 已筛选的候选再次执行 Hermit 的 32 页排序会重复走 rmap。
+
+本版让 MGLRU 负责驻留页的老化、代际/tier 保护和引用复查，Hermit 负责
+已选中页的远端传输，以及换入预测和逐页 refault 反馈：
+
+- =evict_folios()= 显式传递候选来源，保留 =ignore_references=false=。
+  不能在隔离后读取 folio generation 来推断来源，因为隔离会清掉 generation bits。
+  普通 reclaim、compaction 和 =reclaim_folio_list()= 不获得该资格。
+- =policy_features= 新增 bit 8 (=0x100=, =MGLRU=)，默认掩码从 =0xbf= 改为
+  =0x1bf=。此位启用时跳过 MGLRU 候选上的 Hermit 排序，并允许已通过原生引用检查的
+  独占匿名 order-0 页参与 SG 写出。仍要求同一 mm/VMA/代次/swap 设备，且批次只包含
+  已选中的页；共享页、KSM、大 folio、MMU notifier 映射、rmap 竞争和状态分配失败回退原路径。
+- =hint.mglru= 与 =hint.cold= 分开。MGLRU 回收资格不是“完整空观察”的证明。
+  MGLRU 运行时始终跳过 Hermit 的 PTE 冷观察及其额外 TLB 刷新，即使关闭 bit 8 也不
+  用 MGLRU 清过 accessed bit 的区间推断负观察。
+- 第一次换出的页也建立有界的 ghost 条目，不依赖此前已经发生 swapin/冷观察。
+  后续需求缺页继续使用现有近期 refault 反馈；表满沿用原有淘汰规则。
+- 运行时切换 MGLRU 会更新独立的 aging epoch，使跨开关的传统 LRU 冷观察失效，
+  保留 PEBS/换入流历史。配置切换仍应放在测试单元之间，每个单元启动新负载。
+
+新增 =policy_stats= 字段：=mglru_candidates= 表示通过来源和映射资格检查的候选，
+尚未保证 unmap/writeout 成功；=mglru_sort_bypasses= 表示跳过的排序调用数。
+二者都不是成功 RDMA WR 数。矩阵快照增加 MGLRU enabled/min_ttl_ms，工作负载矩阵
+会把运行中 MGLRU 配置变化判为配置漂移；活动判定接受 =mglru_candidates=。
+
+本地构建配置启用 =CONFIG_LRU_GEN=y=、=CONFIG_LRU_GEN_ENABLED=y= 和
+=CONFIG_LRU_GEN_STATS=y=；宿主机和远端服务器需分别确认实际启动的内核。
+复现配置与开关如下（在待测 Hermit 内核上执行）：
+
+#+begin_src sh
+linux-stable/scripts/config --file linux-stable/.config -e LRU_GEN -e LRU_GEN_ENABLED -e LRU_GEN_STATS
+make -C linux-stable olddefconfig
+# 构建、启动该内核后：
+echo y > /sys/kernel/mm/lru_gen/enabled
+echo 0x1bf > /sys/kernel/debug/hermit/policy_features
+cat /sys/kernel/mm/lru_gen/enabled
+cat /sys/kernel/debug/hermit/policy_stats
+#+end_src
+
+=pebs_mode=1=、=pebs_enabled=1= 以及目标 mm 的策略参与条件仍适用。
+只写 =pebs_enabled=1= 不会启动 PEBS 采样，正式实验应使用现有矩阵的采样入口。
+
+建议以相同 memory.max、相同工作负载和 4/64/2048 KiB 最大分配档位分别测四组：
+
+| 对照 | MGLRU | 策略 | policy_features |
+|------+-------+------+-----------------|
+| 原生传统 LRU + Hermit 后端 | off | off | 无关 |
+| 原生 MGLRU + Hermit 后端 | on | off | 无关 |
+| 现有 Hermit 策略 | off | policy | 0xbf |
+| MGLRU 协同 Hermit | on | policy | 0x1bf |
+
+另用 MGLRU on + policy + =0xbf= 消融 bit 8，区分 MGLRU 本身的收益与协同收益。
+每组至少三次，记录吞吐、p99、CPU/op、PSI、workingset_refault_anon、读写字节和实际 WR。
+不要直接把本地 DRAM/QEMU 结果当作 RDMA 性能提升。
+
+关于大小页：本版保留已有 mTHP/THP 换入决策和长顺序流回退。
+MGLRU 的 generation 属于整个 folio，不能据此知道 64 KiB/2 MiB 内哪些 4 KiB 子页被访问。
+后续可以用代际驻留时长和 refault 约束大 folio 的收益窗口，再用 PEBS 子页 footprint
+评估是否值得保留/拆分；本版没有实现按 generation 自动拆分、提升或改变分配尺寸。
+
+** 本地验证
+
+- =CONFIG_LRU_GEN=n= 下编译 =hermit_policy.o=、=vmscan.o= 通过。
+- =CONFIG_LRU_GEN=y= 下完整 =bzImage= 构建（#35）及 DRAM/ramdisk 模块编译通过；
+  另外对 =vmscan.c= 强制取消 =CONFIG_HERMIT= 宏的条件编译检查通过。
+- 54 项 Python unittest、真实 C 函数提取的回收/换入/冷观察/MGLRU/PEBS 回归通过。
+  C 回归启用 ASan/UBSan；沙箱 ptrace 与 LeakSanitizer 不兼容，因此使用
+  =ASAN_OPTIONS=detect_leaks=0=。策略测试另行检查所有模拟分配均被释放。
+- QEMU TCG + DRAM、2 GiB guest RAM、128 MiB memory.max、256 MiB 匿名负载：
+  MGLRU 4 KiB → 传统 LRU 4 KiB → MGLRU 64 KiB → MGLRU 2 MiB 四阶段均通过
+  换入校验和、零后端错误、零 OOM kill、零额外 ramdisk 写入检查。64 KiB/2 MiB
+  均确认发生相应大 folio 分配。MGLRU 阶段 =observed_4k= 增量为零。
+- MGLRU 4 KiB 阶段观测到 98,526 个合格候选，跳过 5,786 次排序；kprobe trace 中
+  有 4,969 条 =hermit_swap_write_batch= 调用记录，证明批量写出路径实际执行。
+  这些是正确性 smoke 计数，不是 RDMA WR 数或性能对比结果。
+
+日志及可复现的 QEMU init/驱动脚本位于
+[[file:../../artifacts/mglru-20261104/][artifacts/mglru-20261104/]]，摘要见
+[[file:../../artifacts/mglru-20261104/smoke-result.log][smoke-result.log]]。
+该测试通过 debugfs 开启策略并使用 demand-stream 证据，没有硬件 PEBS 采样或真实 RDMA。
+尚未在 dnet 服务器启动该内核并测量吞吐/p99/CPU 收益。
+
+* 计数语义
+
+- =/sys/kernel/debug/hermit/policy_stats=：逐页观察、冷观察、无效观察、迟到样本、预测页、refault 和候选排序次数。
+- =order_stats=：按 folio order 的后端结果；批次成员按 order 0 记账，不代表 WR 数。
+- RDMA =/sys/module/rswap_client/parameters/wr_stats= 保留原 order 表，并附加 pages/batch_write_wrs/batch_read_wrs/bytes 表。两表相加才是实际发出的 WR 和字节，包括重试；批次允许非 2 的幂页数。
+- DRAM 按实际逐页 copy 统计，不能把其批次页数换算成节省的 RDMA WR。
+- swap 页数和实际 RDMA WR 是两个不同指标，应同时看吞吐、延迟、CPU、PSI 和读写字节。
+
+* 服务器矩阵
+
+入口：=tools/rdma/run_policy_app_matrix.py=。
+配置模板：=tools/rdma/policy_app_matrix.example.json=。
+SQLite 负载：=tools/rdma/policy_app_worker.py=。
+
+沿用 =tools/rdma/pebs/run_workload_matrix.py= 和 =tools/rdma/sweep_common.sh= 的模式、采样周期和最大分配档位定义：
+
+| 模式 | PEBS 采样 | 策略决策 | 对照用途 |
+|------+-----------+----------+----------|
+| off | 不启动，pebs_enabled=0 | 关闭 | baseline，保留 Hermit 后端及其普通换入/换出路径 |
+| static | 启动，pebs_mode=0 | 关闭 | 观察采样开销，按现有分配/后端规则运行 |
+| policy | 启动，pebs_mode=1 | 开启 | 4 KiB 预测、冷页选择和合并策略 |
+
+默认页面档位 =4 16 32 64 128 256 512 1024 2048 KiB=，语义为 =max-allocation-v1=：
+所有不大于该档位且内核支持的匿名 THP/mTHP 尺寸均可分配，大于档位的尺寸禁用；4 KiB 档禁用 THP/mTHP。
+档位不是强制页大小，也不是 RDMA 请求上限。policy 的预测、有效性和记账仍以 4 KiB 为单位，合法的相邻选中页可以合并传输。
+例如 max4k 下也可能产生由多个独立 4 KiB 页组成的 RDMA 请求；实际 folio/WR 尺寸另行记录。
+脚本保留 remote_order_mask，不设置 pebs_force_order；后端必须支持所选上限以内的 order（全九档需要 effective_order_mask 覆盖 0x3fd）。
+
+默认 LOAD 采样周期 =19997 1999 199=，STORE 周期 =1500003=，采样时关闭自适应周期调整。
+每个应用/并发/内存预算/页面档位/重复形成一个块：off，以及三档周期各自的 static、policy，共 7 个单元；块内用固定种子随机排序。
+同一块的 static 和 policy 都与该块的 off 配对，不跨页面档位、预算或重复借用 baseline。
+
+负载为 GNU sort、SQLite query、SQLite update、GAPBS BFS 和 PageRank。
+默认并发 1/8、内存峰值比例 90/70/50%、重复 3 次，完整矩阵为 =5 × 2 × 3 × 9 × 3 × 7 = 5670= 个单元（其中 810 个 off）。
+可在配置里缩减 =page_sizes_kb=、=periods=、=concurrency=、=ratios= 和 =repeats=；=modes= 必须保留 off。
+sort/GAPBS 的并发是线程数；SQLite 的并发是拥有独立内存数据库的 worker 数，所以按每个应用和并发分别校准预算。
+SQLite query 延迟单位为查询，update 延迟单位为 transaction_size 条更新组成的事务。
+
+prepare 生成 sort 文本和 SQLite 数据库，图文件由配置指定，不下载或生成图数据。
+它以 off、最大待测分配档位、memory.max=max、memory.swap.max=0 对每个应用/并发校准一次，记录 cgroup memory.peak。
+该峰值包含收费的文件缓存和内核内存，不是单个进程的 RSS。按比例取整为 4 KiB 后，绝对预算冻结在 manifest；所有模式和页面档位共享该预算。
+校准也会运行应用；按服务器可用物理内存调整数据规模，尤其 SQLite 8 个独立数据库的总量。
+
+准备现有的 cgroup v2 memory controller、swap、远端后端和可执行程序；配置里的应用用户必须可以读取脚本、图和输入目录。
+准备好所需的后端 order mask，并保持 pebs_force_order=0。
+模板 controls 中的普通 Hermit 参数在整个矩阵内保持一致，例如 bypass_swapcache、apt_reclaim；这些不随 off/static/policy 改动。
+采样控制由各单元管理，不应在 controls 中再写 pebs_mode、pebs_enabled、pebs_all 或采样周期。
+静态和策略路径使用 pebs_all=1 跟踪经过 exec 的各负载地址空间；off 不启动采样。
+
+脚本在退出时恢复其修改的 Hermit 控制项和全部 THP/mTHP enabled 设置，检测到已有 PEBS 会话则退出。
+它不安装程序、不创建 swap、不挂载 debugfs、不修改父 cgroup controller、不启动/卸载后端、不切换内核或重启。
+运行前的 THP、zswap、swappiness 必须与 prepare 时一致；运行时只按矩阵改变 THP/mTHP 分配上限。
+
+以下从仓库根目录运行。先编辑配置中的 user、cpus、程序/图路径和规模：
+
+#+begin_src sh
+cp tools/rdma/policy_app_matrix.example.json /data/hermit-apps.json
+
+# 预览配置、校准计划和矩阵数量；不需要 root、不执行负载。
+python3 tools/rdma/run_policy_app_matrix.py prepare \
+  --config /data/hermit-apps.json --workdir /data/hermit-frozen \
+  --manifest /data/hermit-manifest.json --dry-run
+
+# 以 off 校准一次并冻结输入和预算，生成 version-2 manifest。
+sudo python3 tools/rdma/run_policy_app_matrix.py prepare \
+  --config /data/hermit-apps.json --workdir /data/hermit-frozen \
+  --manifest /data/hermit-manifest.json
+
+# 可先加 --dry-run 查看完整调度；同一内核内运行全部模式。
+sudo python3 tools/rdma/run_policy_app_matrix.py run \
+  --manifest /data/hermit-manifest.json --output /data/hermit-matrix
+
+# 一个结果目录内按相同页面档位的 off 配对。
+python3 tools/rdma/run_policy_app_matrix.py compare \
+  --run /data/hermit-matrix --output /data/hermit-comparison
+#+end_src
+
+run 的可选 --label 只标记本次结果名称，baseline 始终由单元的 off 模式决定。
+prepare/workdir、manifest 和 run/output 都要求新路径，防止覆写冻结输入或已有结果。
+旧 version-1 双内核 manifest 不适用于此矩阵，需要用更新后的配置 prepare。
+
+compare 输出 paired.csv、paired.json 和 summary.json，包含失败/超时/中断/缺失项，只对双方成功且预算一致的单元计算 speedup。
+process_speedup 为 off 耗时 / 当前模式耗时；WR、swap 页数、CPU 和 p99 reduction_pct 为相对 off 的下降百分比，正值表示减少；off 为零时比例留空。
+run 另输出 granularity.csv，按实际尺寸统计 folio 换入/换出、RDMA READ/WRITE WR 及字节；SG WR 和原有 WR 计数按实际尺寸相加。
+
+每个单元保存 command、模式/采样周期/页面档位、配置、应用输出、正确性结果、总耗时、CPU 时间、memory.peak、前后 THP/内核/cgroup/PSI/实际 WR 快照和差值。
+完整进程计数包含加载及程序内验证；SQLite 另报不含加载/验证的操作阶段吞吐和延迟。
+sort 使用独立有序性检查和冻结的输出 SHA-256；成功输出删除以节省空间，失败输出保留。
+SQLite 检查确定性查询/更新结果和 quick_check；GAPBS 要求验证 PASS 且无 FAIL，保存原始日志。
+系统 vmstat、后端 WR 和 sampler CPU 是全机统计，需在受控服务器环境解释；cgroup 统计另行保留。
+
+* 本地检查边界
+
+内核集成阶段已完成受影响内核对象、DRAM 后端对象及 RDMA 后端对象编译。
+本次矩阵调整完成 Python 语法、prepare/run dry-run，以及临时数据上的模式切换/失败恢复和同档位配对检查；未修改主机控制或执行应用。
+本机 RDMA 对象检查使用内核自带头文件；没有服务器匹配的 OFED，未完成该环境下的模块链接/装载验证。
+服务器需先构建完整内核以更新 Module.symvers，再用同一内核构建 rswap；backend ABI 已变化，旧模块不可混用。
+
+未运行 QEMU、回归矩阵、服务器工作负载或性能实验。实际 swap 次数、吞吐和延迟收益以服务器配对结果为准。

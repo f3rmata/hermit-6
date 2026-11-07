@@ -107,6 +107,9 @@ struct fs_rdma_req {
 	void *io_context;
 	size_t dma_len;
 	enum dma_data_direction dma_dir;
+	/* Base-page SG requests need not be physically contiguous locally. */
+	struct ib_sge batch_sge[16];
+	unsigned int batch_nr;
 };
 
 struct two_sided_rdma_send {
@@ -133,6 +136,7 @@ struct two_sided_rdma_recv {
  * Build a QP for each core on cpu server.
  */
 struct rswap_rdma_queue {
+	unsigned int max_send_sge;
 	struct rdma_cm_id *cm_id;
 
 	struct ib_cq *cq;

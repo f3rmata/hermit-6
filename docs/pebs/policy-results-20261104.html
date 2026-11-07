@@ -1,0 +1,403 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+	"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+<title>policy-results-20261104.html</title>
+<meta http-equiv="Content-Type" content="application/xhtml+xml;charset=utf-8"/>
+<link rel="stylesheet" type="text/css" media="all" href="https://cdn.jsdelivr.net/npm/github-markdown-css/github-markdown.min.css"  />
+<link rel="stylesheet" type="text/css" media="all" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release/build/styles/github.min.css"  /><meta name='viewport' content='width=device-width, initial-scale=1, shrink-to-fit=no'><style> body { box-sizing: border-box; max-width: 740px; width: 100%; margin: 40px auto; padding: 0 10px; } </style><script id='MathJax-script' async src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'></script><script src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release/build/highlight.min.js'></script><script>document.addEventListener('DOMContentLoaded', () => { document.body.classList.add('markdown-body'); document.querySelectorAll('pre[lang] > code').forEach((code) => { code.classList.add(code.parentElement.lang); }); document.querySelectorAll('pre > code').forEach((code) => { hljs.highlightBlock(code); }); });</script>
+</head>
+
+<body>
+
+[WARNING] Deprecated: --mathjax. Use --math-method=mathjax[:URL] instead.
+<h1 id="hermit-4-kib-策略修正后的消融与矩阵测试结果">Hermit 4 KiB
+策略修正后的消融与矩阵测试结果</h1>
+<!-- > 更新：2026-11-05。运行于 dnet-61，涉及两个内核： -->
+<!-- > `#16` 包含 2026-11-04 的修正；`#17` 在此基础上修复了 `LARGE` 判定和冷页观察建表顺序两处缺陷。 -->
+<!-- > 本文包含三组测试： -->
+<!-- > 1. 内核 #16 上 6 组 `policy_features` 掩码、2 档页面上限的 24 个 Memcached 样本； -->
+<!-- > 2. 内核 #16 上 Redis、YCSB、匿名扫描负载 3 档页面上限的 36 个 smoke 样本； -->
+<!-- > 3. **内核 #17 上同样四个负载、9 档页面上限、3 个采样周期的 252 个样本**（见“内核 #17 完整矩阵”一节）。 -->
+<!-- > -->
+<!-- > 修正内容与开关定义见 [内核集成说明](kernel-policy-integration.org) 的“2026-11-04 修正”； -->
+<!-- > 上一轮结果见 [11-03 策略矩阵](policy-results-20261103.md)。不同内核的结果只作方向参考。 -->
+<!-- 修正后，policy 在 4 KiB 上限下仍比同次 off 慢 **41.2%**（默认掩码 `0xbf`），在 2 MiB 上限下快 **9.3 倍**。 -->
+<!-- 4 KiB 上限下 policy 与 off 的读 WR/op、读 KiB/op 几乎相同，剩余退化来自**策略路径的 CPU 开销**： -->
+<!-- 每次操作的服务端 CPU 从约 26 µs 增至 42 µs。 -->
+<!-- 单项开关中，关闭冷页观察（`0xb7`）在两档上限下吞吐都最高：4 KiB 上限下降幅缩小到 −22.5%，2 MiB 上限下达到 173,926 ops/s。 -->
+<!-- 冷页观察的跟踪表频繁轮换，开启的观察区间只有约 1.7% 能完成。PEBS 的 4 KiB 预测在 Memcached 上没有延长任何一个批次。 -->
+<!-- 每个单元只运行一次。同一配置的 4 KiB off 吞吐在 194,781 至 247,392 ops/s 之间，相差约 27%。 -->
+<!-- 因此掩码之间小于约 15% 的吞吐差异不能视为结论，需要重复实验确认。 -->
+<!-- 在 Redis、YCSB 和匿名扫描负载上，默认策略只在 off 发生整块过度读取时领先： -->
+<!-- Redis 2 MiB 上限 +91.8%，`anon-1t-chunk64k` 2 MiB 上限约 21 倍。其余 10 个单元都慢于 off，降幅为 4.5%–70.4%。 -->
+<!-- 测试同时暴露了两处代码问题：长顺序流在 4 KiB 上限下也会切到大 folio 路径，导致 SG 批次无法形成； -->
+<!-- 冷页观察对大 folio 仍然创建跟踪表项，在匿名扫描中产生数百万次无效观察。详见“其他负载”。 -->
+<!-- 内核 #17 修复了这两处问题。完整矩阵显示：YCSB 4 KiB 档的读请求已全部走 SG 批次，各档降幅比 #16 普遍缩小 5–10 个百分点， -->
+<!-- 但仍慢于 off 18%–25%；8 线程全扫描在 16 KiB 以上的正常单元只慢 5%–9%（#16 为 31%–35%）。 -->
+<!-- 新发现一个问题：8 线程全扫描的 24 个 policy 单元中有 8 个固定有 2 个线程退回 4 KiB 批次，慢 21%–41%， -->
+<!-- 与流状态槽位的哈希冲突一致。领先的单元仍然只出现在 off 整块过度读取的档位。 -->
+<h2 id="测试范围">测试范围</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>项目</th>
+<th>设置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>负载</td>
+<td>80 万条、1 KiB value；90% GET、10% update；预热 30 s，测量 120
+s，<code>qps=0</code></td>
+</tr>
+<tr>
+<td>并发与绑核</td>
+<td>服务端 CPU 0–7，客户端 16–31，sampler 0–7；连接参数 32</td>
+</tr>
+<tr>
+<td>内存限制</td>
+<td><code>memory.high=640 MiB</code>，<code>memory.max=2048 MiB</code></td>
+</tr>
+<tr>
+<td>回收配置</td>
+<td>驱动设置
+<code>apt_reclaim=Y</code>、<code>reclaim_mode=1</code>、headroom 16384
+页、<code>sthd_cnt=4</code></td>
+</tr>
+<tr>
+<td>后端</td>
+<td><code>remote_order_mask=0x3fd</code>、<code>bypass_swapcache=Y</code>、<code>pebs_force_order=0</code></td>
+</tr>
+<tr>
+<td>页面上限</td>
+<td>4 KiB、2048 KiB（<code>max-allocation-v1</code>）</td>
+</tr>
+<tr>
+<td>单元</td>
+<td>每个掩码一次 off 和一次 policy-medium（load 周期 1999，store 周期
+1500003）</td>
+</tr>
+</tbody>
+</table>
+<!-- `off` 关闭采样和策略，不受 `policy_features` 影响；每个掩码目录里的 off 都是同一配置的重复运行。 -->
+<!-- 驱动在开始前写入掩码，结束后恢复为 `0xbf`，6 个 `restore.json` 均无清理错误。 -->
+<!-- 24 个样本均标记有效，没有 OOM、Memcached eviction 或 miss；dmesg 只有开机时的固件提示 -->
+<h2 id="吞吐">吞吐</h2>
+<figure>
+<img src="assets/20261104-memcached-ablation/throughput-vs-page.png"
+alt="吞吐随最大页面大小的变化" />
+<figcaption aria-hidden="true">吞吐随最大页面大小的变化</figcaption>
+</figure>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>掩码</th>
+<th>与默认相比</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0xbf</code></td>
+<td>默认</td>
+<td>全部修正后的策略</td>
+</tr>
+<tr>
+<td><code>0xaf</code></td>
+<td>关闭 FLUSH</td>
+<td>观察起点不刷新 TLB</td>
+</tr>
+<tr>
+<td><code>0xb7</code></td>
+<td>关闭 OBSERVE</td>
+<td>不做 young 位冷页观察，因而也没有冷页合并换出</td>
+</tr>
+<tr>
+<td><code>0xbb</code></td>
+<td>关闭 SORT</td>
+<td>回收不排序</td>
+</tr>
+<tr>
+<td><code>0xbe</code></td>
+<td>关闭 SWAPIN</td>
+<td>不走 4 KiB 预测 SG 换入，改走原 mTHP 路径</td>
+</tr>
+<tr>
+<td><code>0x7f</code></td>
+<td>打开 RESERVE、关闭 LARGE</td>
+<td>用策略小预留替换 <code>apt_reclaim</code> 水位，接近 11-03
+的回收行为</td>
+</tr>
+</tbody>
+</table>
+<figure>
+<img src="assets/20261104-memcached-ablation/throughput.png"
+alt="各掩码的 off 与 policy 吞吐" />
+<figcaption aria-hidden="true">各掩码的 off 与 policy 吞吐</figcaption>
+</figure>
+<h2 id="kib-上限网络工作量相同cpu-开销不同">4 KiB
+上限：网络工作量相同，CPU 开销不同</h2>
+<figure>
+<img src="assets/20261104-memcached-ablation/per-op-4k.png"
+alt="4 KiB 上限下每次操作的读请求、读字节和读 p99" />
+<figcaption aria-hidden="true">4 KiB 上限下每次操作的读请求、读字节和读
+p99</figcaption>
+</figure>
+<p>4 KiB 上限下，所有掩码的 policy 读 WR/op 在 0.615–0.648 之间，off 为
+0.621–0.628；读 KiB/op 都约为 2.5。 <code>predicted_4k</code>
+每次运行只有 2,400–5,700 页，相对约 1,100 万次读请求可以忽略，Memcached
+的随机访问几乎没有触发预取。 实际平均读大小为 4.00 KiB，policy
+在这一档并没有减少或合并读请求。</p>
+<p>policy 的写 WR/op 为 0.538–0.570，比 off 的约 0.625 低
+9–14%。这来自冷页 SG 合并换出，以及 policy 下换出页数的减少；
+<code>0xb7</code> 没有合并写，写 WR/op 仍降到
+0.553，所以这部分下降不能全部归于合并。</p>
+<figure>
+<img src="assets/20261104-memcached-ablation/cpu-per-op.png"
+alt="每次操作的服务端 CPU" />
+<figcaption aria-hidden="true">每次操作的服务端 CPU</figcaption>
+</figure>
+<p>服务端 CPU/op 按 8 个服务端 CPU
+的占用率、测量时长和完成操作数计算，包含该 CPU 集合上的内核工作。 4 KiB
+off 为 26.2–26.4 µs/op，policy 如下：</p>
+<table>
+<thead>
+<tr>
+<th>掩码</th>
+<th style="text-align: right;">4 KiB policy</th>
+<th style="text-align: right;">2 MiB policy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0xbf</code></td>
+<td style="text-align: right;">42.2</td>
+<td style="text-align: right;">43.3</td>
+</tr>
+<tr>
+<td><code>0xaf</code></td>
+<td style="text-align: right;">42.5</td>
+<td style="text-align: right;">89.6</td>
+</tr>
+<tr>
+<td><code>0xb7</code></td>
+<td style="text-align: right;"><strong>31.4</strong></td>
+<td style="text-align: right;"><strong>31.6</strong></td>
+</tr>
+<tr>
+<td><code>0xbb</code></td>
+<td style="text-align: right;">37.2</td>
+<td style="text-align: right;">39.3</td>
+</tr>
+<tr>
+<td><code>0xbe</code></td>
+<td style="text-align: right;">43.4</td>
+<td style="text-align: right;">66.6</td>
+</tr>
+<tr>
+<td><code>0x7f</code></td>
+<td style="text-align: right;">42.3</td>
+<td style="text-align: right;">51.4</td>
+</tr>
+</tbody>
+</table>
+<p>关闭冷页观察每次操作节省约 11 µs，关闭回收排序节省约 5
+µs；两者都关时的开销尚未测量。 2 MiB off 为 627–687 µs/op，主要花在整块
+2 MiB 读入（读 KiB/op 约 190）。policy 用 4 KiB
+读取避免了这部分过度读取，所以在这一档大幅领先。</p>
+<p>Memcached 客户端 CPU 在所有单元中都是 99.81–99.88%，接近其 16 个 CPU
+的容量。4 KiB off 的吞吐可能受客户端限制， 如果是这样，4 KiB 档的
+policy/off 比例会低估服务端的实际差距。CPU/op
+不受这个限制影响，更适合比较掩码。</p>
+<h2
+id="冷页观察区间大多在完成前被挤出">冷页观察：区间大多在完成前被挤出</h2>
+<figure>
+<img src="assets/20261104-memcached-ablation/cold-lifecycle.png"
+alt="冷页观察生命周期计数" />
+<figcaption aria-hidden="true">冷页观察生命周期计数</figcaption>
+</figure>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+</colgroup>
+<thead>
+<tr>
+<th>掩码</th>
+<th>上限</th>
+<th style="text-align: right;">开启区间</th>
+<th style="text-align: right;">完成区间</th>
+<th style="text-align: right;">完成比例</th>
+<th style="text-align: right;">判冷</th>
+<th style="text-align: right;">表淘汰</th>
+<th style="text-align: right;"><code>invalid_epochs</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0xbf</code></td>
+<td>4 KiB</td>
+<td style="text-align: right;">37,161,751</td>
+<td style="text-align: right;">647,407</td>
+<td style="text-align: right;">1.7%</td>
+<td style="text-align: right;">610,991</td>
+<td style="text-align: right;">45,993,814</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><code>0xbf</code></td>
+<td>2 MiB</td>
+<td style="text-align: right;">20,933,879</td>
+<td style="text-align: right;">1,095,150</td>
+<td style="text-align: right;">5.2%</td>
+<td style="text-align: right;">1,022,141</td>
+<td style="text-align: right;">31,206,992</td>
+<td style="text-align: right;">5,083,233</td>
+</tr>
+<tr>
+<td><code>0xaf</code></td>
+<td>4 KiB</td>
+<td style="text-align: right;">38,386,159</td>
+<td style="text-align: right;">202,365</td>
+<td style="text-align: right;">0.5%</td>
+<td style="text-align: right;">194,024</td>
+<td style="text-align: right;">47,865,723</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><code>0xaf</code></td>
+<td>2 MiB</td>
+<td style="text-align: right;">15,552,594</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0%</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">77,580,402</td>
+<td style="text-align: right;">56,083,102</td>
+</tr>
+<tr>
+<td><code>0xbb</code></td>
+<td>4 KiB</td>
+<td style="text-align: right;">37,308,630</td>
+<td style="text-align: right;">1,486,270</td>
+<td style="text-align: right;">4.0%</td>
+<td style="text-align: right;">1,381,881</td>
+<td style="text-align: right;">45,728,464</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><code>0x7f</code></td>
+<td>4 KiB</td>
+<td style="text-align: right;">36,781,514</td>
+<td style="text-align: right;">808,771</td>
+<td style="text-align: right;">2.2%</td>
+<td style="text-align: right;">757,005</td>
+<td style="text-align: right;">45,462,255</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+<p>冷页判定第一次在实机上产生结果：<code>0xbf</code> 4 KiB 有 61
+万次判冷（11-03 为 0），完成的区间中 94% 判冷。 但每次运行有约 4600
+万次表淘汰，是 32,768 项上限的 1400
+倍。绝大多数页刚开启观察区间就被挤出表， 为它们做的 rmap 查找、加锁和
+TLB 刷新都没有产生证据。这与关闭观察后 CPU/op 下降 11 µs 相符。</p>
+<p>冷页合并换出也已执行：<code>0xbf</code> 4 KiB 发出 212,030 个 SG 写
+WR，平均每个只合并 1.33 页； 各掩码的平均合并页数为
+1.30–1.64。合并后的写请求仍很小，减少的写 WR 不足以抵消观察开销。</p>
+<p><code>0xaf</code> 2 MiB 一格的观察链路异常：开启了 1555
+万个区间，完成数为 0，<code>invalid_epochs</code> 有 5608 万。 同掩码的
+4 KiB 一格完成了 20 万个区间。这一格吞吐偏低（72,526 ops/s）、CPU/op
+偏高（89.6 µs）， 不能据此认为“关闭 TLB
+刷新会变慢”。原因尚未确定；一个待验证的推测是 2 MiB 上限下初始驻留的 THP
+被判为无效观察， 而未刷新的 TLB
+改变了之后的观察时序。需要重复运行确认它是否可复现。</p>
+<h2
+id="pebs样本进入窗口但不足以支持-4-kib-预测">PEBS：样本进入窗口，但不足以支持
+4 KiB 预测</h2>
+<figure>
+<img src="assets/20261104-memcached-ablation/pebs-funnel.png"
+alt="PEBS 样本链路与 4 KiB 预测结果" />
+<figcaption aria-hidden="true">PEBS 样本链路与 4 KiB
+预测结果</figcaption>
+</figure>
+<p>以 <code>0xbf</code> 4 KiB 为例，测量期间采样 325,416 条，其中 27,117
+条（8.3%）属于已跟踪的 Memcached 地址空间， 6,398 条落入活动观察窗口。4
+KiB 预测器被调用 9,098,764 次，98.8% 因有效区域少于 2 个而放弃，
+<code>predict_extended</code> 为 0。其余掩码的计数相近。</p>
+<p>Memcached 的 1 KiB value 散布在大量 2 MiB
+区域中，同一故障指令很少在两个以上区域留下带样本的窗口，
+足迹投票无从开始。这说明 PEBS 预测在这类随机小对象负载上不起作用</p>
+<h2 id="内核-17-完整矩阵redisycsb-与匿名扫描">内核 #17
+完整矩阵：Redis、YCSB 与匿名扫描</h2>
+<h3 id="测试范围与数据合并">测试范围与数据合并</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>项目</th>
+<th>设置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>负载</td>
+<td>Redis、YCSB、<code>anon-8t-full</code>、<code>anon-1t-chunk64k</code>，定义同上节</td>
+</tr>
+<tr>
+<td>页面上限</td>
+<td>4、16、32、64、128、256、512、1024、2048 KiB</td>
+</tr>
+<tr>
+<td>单元</td>
+<td>每个负载、每档上限一个块：off，以及 static/policy 各三个 load
+周期（999、1999、19999）；store 周期 1500003</td>
+</tr>
+<tr>
+<td>规模</td>
+<td>4 × 9 × 7 = 252 个单元，每个运行一次，全部可用</td>
+</tr>
+<tr>
+<td>掩码</td>
+<td><code>policy_features=0xbf</code></td>
+</tr>
+</tbody>
+</table>
+<p>static 相对 off 的变化在 −6.2% 到 +2.8%
+之间，采样本身的开销很小。除下文的 8 线程扫描外，
+三个采样周期之间的吞吐差异最大为 13.3%（YCSB 4 KiB），其余多在 5%
+以内，说明采样周期基本不影响策略效果。 这与 PEBS 预测很少生效一致。</p>
+<h3 id="吞吐随最大页面大小的变化">吞吐随最大页面大小的变化</h3>
+<figure>
+<img src="assets/20261105-k17-matrix/throughput-vs-page.png"
+alt="内核 #17 四个负载的吞吐随最大页面大小变化" />
+<figcaption aria-hidden="true">内核 #17
+四个负载的吞吐随最大页面大小变化</figcaption>
+</figure>
+<p>policy 折线是同一档全部 policy
+单元的中位数，阴影是最小至最大范围。每档为三个采样周期各一个单元； 8
+线程全扫描的 256 KiB 档另做了 3 次重复，共 12 个单元。</p>
+
+</body>
+</html>

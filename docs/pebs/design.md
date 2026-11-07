@@ -4,6 +4,11 @@
 > `CONFIG_MEMCG`。新内核矩阵暴露的置信门槛、并发预读反馈和开销问题见
 > [PEBS 策略设计问题与改进方案](policy-design-review.md)。
 > 历史设计与验证记录见 [PEBS 历史报告](../archive/pebs/)。
+>
+> **注意**：本文描述 `pebs_mode=1` 的 mTHP 选页设计。当前 policy 模式默认改走
+> 4 KiB 预测 SG 换入、冷页观察和回收排序，见
+> [内核集成说明](kernel-policy-integration.org)（含 2026-11-04 修正与
+> `policy_features` 消融开关）。`policy_features` 清除 `SWAPIN` 位后才恢复本文的路径。
 
 ## 1. 目标
 

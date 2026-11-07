@@ -185,6 +185,7 @@ MEMCACHED_MAX_CONN=${MEMCACHED_MAX_CONN:-32768}
 STHD_CNT=${STHD_CNT:-16}
 RECLAIM_MODE=${RECLAIM_MODE:-}
 RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-}
+RECLAIM_STOP_HEADROOM_PAGES=${RECLAIM_STOP_HEADROOM_PAGES:-0}
 LAZY_POLL=${LAZY_POLL:-N}
 BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-Y}
 HERMIT_SWAPOUT_POLICY=${HERMIT_SWAPOUT_POLICY:-exclusive}
@@ -594,6 +595,16 @@ configure_hermit_mode() {
     return 0
   fi
 
+  if [ "$MODE" = hermit ] || [ "$MODE" = cgroup-hermit ]; then
+    if ! [[ "$RECLAIM_STOP_HEADROOM_PAGES" =~ ^[0-9]+$ ]]; then
+      rdma_die "RECLAIM_STOP_HEADROOM_PAGES must be a nonnegative page count"
+    fi
+    if [ "$RECLAIM_STOP_HEADROOM_PAGES" != 0 ] && \
+       ! sudo_test -e /sys/kernel/debug/hermit/reclaim_stop_headroom_pages; then
+      rdma_die "requested reclaim hysteresis requires reclaim_stop_headroom_pages in the running kernel"
+    fi
+  fi
+
   for flag in bypass_swapcache batch_swapout batch_tlb batch_io batch_account \
               vaddr_swapout speculative_io speculative_lock lazy_poll \
               apt_reclaim exclusive_swapout swap_thread prefetch_thread; do
@@ -640,6 +651,8 @@ configure_hermit_mode() {
         set_debugfs_file /sys/kernel/debug/hermit/reclaim_headroom_pages \
           "$RECLAIM_HEADROOM_PAGES"
       fi
+      set_debugfs_file /sys/kernel/debug/hermit/reclaim_stop_headroom_pages \
+        "$RECLAIM_STOP_HEADROOM_PAGES"
       ;;
     cgroup-linux|linux|local)
       if sudo_test -d /sys/kernel/debug/rswap_rdma 2>/dev/null || \
@@ -936,6 +949,9 @@ save_config() {
       "$RECLAIM_HEADROOM_PAGES"
     printf 'reclaim_headroom_pages_actual=%s\n' \
       "$(read_hermit_counter reclaim_headroom_pages)"
+    printf 'reclaim_stop_headroom_pages_requested=%s\n' "$RECLAIM_STOP_HEADROOM_PAGES"
+    printf 'reclaim_stop_headroom_pages_actual=%s\n' \
+      "$(read_hermit_counter reclaim_stop_headroom_pages)"
     printf 'bypass_swapcache=%s\n' "$BYPASS_SWAPCACHE"
     printf 'lazy_poll=%s\n' "$LAZY_POLL"
     printf 'hermit_swapout_policy=%s\n' "$HERMIT_SWAPOUT_POLICY"

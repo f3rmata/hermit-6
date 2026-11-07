@@ -73,8 +73,11 @@ CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y
 # 防止压缩内存路径截获远端 swap I/O
 # CONFIG_ZSWAP is not set
 # CONFIG_ZRAM is not set
-# 若要与传统 LRU 基线对比才关闭；不是 Hermit 的 Kconfig 前提
-# CONFIG_LRU_GEN is not set
+# 启用 MGLRU；传统 LRU 对照可在同一内核通过 sysfs 关闭
+CONFIG_LRU_GEN=y
+CONFIG_LRU_GEN_ENABLED=y
+# 可选：保留历史代际统计，便于分析
+CONFIG_LRU_GEN_STATS=y
 # 可选：启用 memory.max 驱动的 Hermit 主动回收
 CONFIG_CGROUPS=y
 CONFIG_MEMCG=y

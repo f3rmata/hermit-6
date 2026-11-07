@@ -84,6 +84,16 @@ configure_page_size() {
   return 0
 }
 
+benchmark_memory_limit_mb() {
+  local resident=$1 ratio=$2
+  if [ -n "${MEMORY_LIMIT_MB:-}" ]; then
+    [[ "$MEMORY_LIMIT_MB" =~ ^[1-9][0-9]*$ ]] || rdma_die "MEMORY_LIMIT_MB must be a positive integer"
+    printf '%s\n' "$MEMORY_LIMIT_MB"
+  else
+    max_int 256 "$((resident * ratio / 100))"
+  fi
+}
+
 require_process_thp_enabled() {
   local pid=$1 output=$2 enabled
   sudo_cat "/proc/$pid/status" > "$output" || \
@@ -196,10 +206,17 @@ snapshot_sweep_stats() {
   snapshot_order_stats > "$1"
   snapshot_benchmark_pebs "$1.pebs"
   sudo_cat "$WR_STATS_FILE" > "$1.wr"
+  if sudo_test -e /sys/kernel/debug/hermit/policy_stats; then
+    sudo_cat /sys/kernel/debug/hermit/policy_stats > "$1.policy"
+  fi
+  cat /proc/vmstat > "$1.vmstat"
   local file
   for file in "${thp_files[@]}"; do
     printf '%s=%s\n' "$file" "$(selected_policy "$file")"
   done > "$1.thp"
+  for file in /sys/kernel/mm/lru_gen/enabled /sys/kernel/mm/lru_gen/min_ttl_ms; do
+    [ ! -r "$file" ] || printf '%s=%s\n' "$file" "$(cat "$file")"
+  done > "$1.mglru"
 }
 
 # order_stats measures folio requests, not actual WRs. Keep the historical

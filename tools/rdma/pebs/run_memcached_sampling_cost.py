@@ -25,7 +25,8 @@ def load_rows(folder):
 def summarize(folder):
     rows=load_rows(folder)
     groups={case:[r for r in rows if r['case']==case] for case in dict.fromkeys(r['case'] for r in rows)}
-    baseline={r['repeat']:r for r in groups['off-same-pages']}
+    baseline_case = 'off-same-pages' if 'off-same-pages' in groups else 'off'
+    baseline={r['repeat']:r for r in groups[baseline_case]}
     base4={r['repeat']:r for r in groups.get('off',[])}
     result=[]
     for case, samples in groups.items():
@@ -48,7 +49,7 @@ def summarize(folder):
     rates=set()
     for path in folder.glob('r*/before/perf-controls.json'):
         rates.add(json.loads(path.read_text())['perf_event_max_sample_rate'])
-    flags=['Fixed concurrency; no peak or saturation check was performed.', 'All cases preserve system page allocation; off is not a guaranteed 4 KiB baseline. Inspect pages-*/page-sizes.json for actual resident folio sizes.']
+    flags=['Fixed concurrency; no peak or saturation check was performed.', 'All cases preserve system page allocation and the backend mask; off disables PEBS. Inspect pages-*/page-sizes.json for actual resident folio sizes.']
     if folder.parent.name=='resident' and any(int(r['read_bytes'])>0 or int(r['write_bytes'])>0 for r in rows):
         flags.append('Resident phase has RDMA traffic; cannot interpret as a no-paging sampling-cost test')
     if len(rates)>1:flags.append('Perf sample-rate cap differs between runs')
@@ -59,8 +60,8 @@ def summarize(folder):
     with (folder/'sampling-cost.csv').open('w') as f:
         writer=csv.DictWriter(f,fieldnames=result[0]);writer.writeheader();writer.writerows(result)
     (folder/'sampling-cost.json').write_text(json.dumps(dict(rows=result,quality_flags=flags,perf_rate_caps=sorted(rates),load_selection='fixed-concurrency-no-calibration'),indent=2)+'\n')
-    lines=['# Memcached 双基线与 PEBS 采样和策略对照', '', '固定并发对照；未执行峰值或满载校准。', '',
-           '相对同页基线的吞吐损失 = 100 × (1 − 当前配置 QPS / 同一重复的 off-same-pages QPS)。正值为衰减；只有 static 行可称为采样开销，policy 行为采样加策略的净效果。范围不是置信区间。', '',
+    lines=['# Memcached PEBS 采样和策略对照', '', '固定并发对照；未执行峰值或满载校准。', '',
+           f'相对同页基线的吞吐损失 = 100 × (1 − 当前配置 QPS / 同一重复的 {baseline_case} QPS)。正值为衰减；只有 static 行可称为采样开销，policy 行为采样加策略的净效果。范围不是置信区间。', '',
            '| 配置 | QPS 中位数 | 配对吞吐损失 % [min, max] | read p99 µs | 服务端 CPU % | 客户端 CPU % |',
            '|---|---:|---:|---:|---:|---:|']
     for r in result:
@@ -98,7 +99,7 @@ def main():
     def command(phase):
         return base+['--memory-mb',str(2048 if phase=='resident' else 640),
             '--output',str(args.output/phase/'measurement'),'--connections',str(args.connections),
-            '--cases','off,off-same-pages,static-low,static-medium,static-high,policy-low,policy-medium,policy-high',
+            '--cases','off,static-low,static-medium,static-high,policy-low,policy-medium,policy-high',
             '--repeats',str(args.repeats),'--duration',str(args.duration),'--warmup',str(args.warmup)]
     if args.dry_run:
         print(json.dumps({phase:{'measurement':command(phase),

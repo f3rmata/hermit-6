@@ -1,0 +1,67 @@
+{
+  "seed": 73,
+  "user": "benchmark",
+  "cpus": "0-7",
+  "timeout_seconds": 1800,
+  "repeats": 3,
+  "concurrency": [
+    1,
+    8
+  ],
+  "ratios": [
+    90,
+    70,
+    50
+  ],
+  "page_sizes_kb": [
+    4,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048
+  ],
+  "modes": [
+    "off",
+    "static",
+    "policy"
+  ],
+  "periods": [
+    19997,
+    1999,
+    199
+  ],
+  "store_period": 1500003,
+  "sort": {
+    "binary": "/usr/bin/sort",
+    "rows": 16000000,
+    "record_bytes": 64,
+    "buffer_bytes": 2147483648
+  },
+  "sqlite": {
+    "rows": 4000000,
+    "payload_bytes": 192,
+    "operations": 100000,
+    "transaction_size": 128
+  },
+  "gapbs": {
+    "bfs": "/opt/gapbs/bfs",
+    "pr": "/opt/gapbs/pr",
+    "graph": "/data/graphs/kron.sg",
+    "trials": 3,
+    "verification_regex": "Verification\\s*:\\s*PASS"
+  },
+  "controls": {
+    "bypass_swapcache": "Y",
+    "speculative_io": "Y",
+    "lazy_poll": "N",
+    "apt_reclaim": "Y",
+    "sthd_cnt": "4",
+    "reclaim_mode": "1",
+    "reclaim_headroom_pages": "2048",
+    "reclaim_stop_headroom_pages": "0"
+  }
+}

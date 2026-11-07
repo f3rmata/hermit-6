@@ -48,7 +48,8 @@ def test_policy():
 #define GFP_ATOMIC 0
 #define __GFP_NOWARN 0
 #define div64_u64(a, b) ((u64)(a) / (b))
-#define DIV_ROUND_UP_ULL(a, b) (((u64)(a) + (b) - 1) / (b))
+#define DIV_ROUND_UP_ULL(a, b) (((u64)(a) + (b) - 1) / (u32)(b))
+#define DIV64_U64_ROUND_UP(a, b) (((u64)(a) + (u64)(b) - 1) / (u64)(b))
 #define cmpxchg(p, old, value) __sync_val_compare_and_swap(p, old, value)
 typedef int spinlock_t;
 #define spin_lock_init(p) (*(p) = 0)
@@ -66,7 +67,21 @@ static unsigned long hash_long(unsigned long x, unsigned int bits)
 static u64 clock_ns;
 static u64 ktime_get_ns(void) { return clock_ns; }
 struct hermit_pebs_state;
-struct mm_struct { struct hermit_pebs_state *hermit_pebs; bool hermit_pebs_enabled; };
+typedef struct { long counter; } atomic64_t;
+#define atomic64_inc(p) (++(p)->counter)
+#define atomic64_read(p) ((p)->counter)
+struct mm_struct {
+    struct hermit_pebs_state *hermit_pebs; bool hermit_pebs_enabled;
+    atomic64_t hermit_vma_generation;
+};
+/* One fake thread; tests switch identity to model per-thread feedback. */
+struct task_struct { int pid; u64 start_time; };
+static struct task_struct fake_task = { .pid = 100, .start_time = 1 };
+#define current (&fake_task)
+static int task_pid_nr(struct task_struct *t) { return t->pid; }
+#define HERMIT_SWAPIN_MAX 64
+static bool hermit_pebs_tracks(struct mm_struct *mm);
+static bool hermit_policy_active(struct mm_struct *mm);
 struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end; };
 struct vm_fault {
     struct vm_area_struct *vma;
@@ -130,6 +145,14 @@ struct perf_buffer { unsigned int nr_pages; void *data_pages[2]; };
 #define page_order(rb) 0
 static unsigned long transport_mask = 0x3fd;
 static unsigned long hermit_backend_effective_order_mask(void) { return transport_mask; }
+'''
+    # Same predicate as mm/hermit_policy.c, defined after the PEBS globals.
+    active = r'''
+static bool hermit_policy_active(struct mm_struct *mm)
+{
+    return hermit_pebs_enabled && hermit_pebs_mode == HERMIT_PEBS_MODE_POLICY &&
+           (hermit_pebs_all || mm->hermit_pebs_enabled);
+}
 '''
     tests = r'''
 static const unsigned long pc_a = 0x1000, pc_b = 0x2000;
@@ -509,9 +532,61 @@ static void sparse_sampling_trace(unsigned int touched, unsigned int cap)
     assert(allocations == 0);
 }
 
+static unsigned int predict(struct mm_struct *mm, unsigned long addr, unsigned long pc)
+{
+    struct vm_area_struct vma = { .vm_mm = mm, .vm_end = ULONG_MAX };
+    struct vm_fault vmf = { .vma = &vma, .address = addr, .hermit_fault_pc = pc };
+    return hermit_pebs_predict_pages(&vmf);
+}
+
+/* 4 KiB predictor: footprints are shared across threads of one mm, empty
+ * windows never evict evidence, repeated regions count once, and gates are
+ * reported through the new phase counters. */
+static void predict_tests(void)
+{
+    struct mm_struct mm = { .hermit_pebs_enabled = true };
+    hermit_pebs_mode = HERMIT_PEBS_MODE_POLICY; hermit_pebs_enabled = 1;
+    hermit_pebs_all = 0; hermit_pebs_pc_max = 4096;
+    hermit_pebs_region_max = HERMIT_PEBS_MAX_REGIONS;
+    clock_ns += ms; hermit_pebs_epoch = clock_ns;
+    long calls = hermit_policy_counters[HPC_PRED_CALLS].counter;
+    assert(predict(&mm, address(99, 0), pc_a) == 1);
+    assert(hermit_policy_counters[HPC_PRED_CALLS].counter == calls + 1);
+    /* Thread A trains region 1, thread B trains region 2. */
+    fake_task.pid = 101; train(&mm, 1, 16, pc_a);
+    fake_task.pid = 102; train(&mm, 2, 16, pc_a);
+    long extended = hermit_policy_counters[HPC_PRED_EXTENDED].counter;
+    fake_task.pid = 103;   /* a third thread sees both footprints */
+    assert(predict(&mm, address(99, 0), pc_a) == 16);
+    assert(hermit_policy_counters[HPC_PRED_EXTENDED].counter == extended + 1);
+    /* Empty windows (demand only, no PEBS load) do not push out evidence. */
+    for (unsigned int i = 0; i < 16; i++) {
+        clock_ns += 30 * ms;
+        hermit_pebs_fault(&mm, address(40 + i, 0), pc_a, clock_ns);
+        clock_ns += 20 * ms;
+        (void)predict(&mm, address(98, 0), pc_a);
+    }
+    assert(predict(&mm, address(99, 0), pc_a) == 16);
+    /* Retraining the same region repeatedly is one region of evidence. */
+    struct mm_struct one = { .hermit_pebs_enabled = true };
+    for (unsigned int i = 0; i < 4; i++) train(&one, 5, 16, pc_b);
+    long regions = hermit_policy_counters[HPC_PRED_FEW_REGIONS].counter;
+    assert(predict(&one, address(99, 0), pc_b) == 1);
+    assert(hermit_policy_counters[HPC_PRED_FEW_REGIONS].counter == regions + 1);
+    /* Votes stop at the first page without a 75% majority. */
+    struct mm_struct gap = { .hermit_pebs_enabled = true };
+    train(&gap, 1, 4, pc_b); train(&gap, 2, 4, pc_b); train(&gap, 3, 16, pc_b);
+    assert(predict(&gap, address(99, 0), pc_b) == 4);
+    fake_task.pid = 100;
+    hermit_pebs_mm_exit(&mm); hermit_pebs_mm_exit(&one); hermit_pebs_mm_exit(&gap);
+    assert(allocations == 0);
+    puts("PEBS 4 KiB predictor tests: PASS");
+}
+
 int main(void)
 {
     ring_tests(); window_tests(); model_tests(); table_tests(); readahead_tests();
+    predict_tests();
     sparse_sampling_trace(1, 9);
     sparse_sampling_trace(16, 9);
     sparse_sampling_trace(16, 4);
@@ -530,6 +605,7 @@ int main(void)
             section(source, 'struct hermit_pebs_sample {', 'static struct task_struct *hermit_pebsd;') +
             section(source, 'static void hermit_ring_copy(', 'static int hermit_pebs_read_events(') +
             section(source, 'u32 hermit_pebs_enabled;', '/* ---------- sampling period') +
+            active +
             section(source, '/* global counters */', '/* ---------- sampling ---------- */') +
             section(source, '/* ---------- swap-in policy', '/* ---------- syscalls') +
             section(source, '/* ---------- mm history lifetime', '/* ---------- debugfs') + tests)

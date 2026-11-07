@@ -27,6 +27,7 @@ Important environment:
   XGB_DATA_FILE=/path/to/train.libsvm (optional real dataset)
   XGB_DATA_FORMAT=csv|libsvm        (inferred from extension when unset)
   LOCAL_RATIO_PCT=70                (limit = resident MiB * ratio / 100)
+  MEMORY_LIMIT_MB=                  (absolute limit shared across comparison cases)
   BENCH_REPEATS=3
   BENCH_CPU=0
   XGB_ROUNDS=30
@@ -177,7 +178,7 @@ for kb in $PAGE_SIZES_KB; do
 
     resident_bytes=$(sudo_cat "$CGROUP/memory.current")
     resident_mb=$((resident_bytes / 1024 / 1024))
-    limit_mb=$(max_int 256 $((resident_mb * LOCAL_RATIO_PCT / 100)))
+    limit_mb=$(benchmark_memory_limit_mb "$resident_mb" "$LOCAL_RATIO_PCT")
     [ "$limit_mb" -lt "$resident_mb" ] || \
       rdma_die "computed limit ${limit_mb} MiB is not below resident ${resident_mb} MiB; lower LOCAL_RATIO_PCT or enlarge the workset"
     required_swap_mb=$((resident_mb - limit_mb))

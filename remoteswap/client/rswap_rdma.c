@@ -388,7 +388,8 @@ static int rswap_create_qp(struct rdma_session_context *rdma_session,
 	init_attr.cap.max_recv_wr = rdma_session->recv_queue_depth;
 	init_attr.cap.max_recv_sge = MAX_REQUEST_SGL;
 
-	init_attr.cap.max_send_sge = MAX_REQUEST_SGL;
+	init_attr.cap.max_send_sge = min_t(unsigned int, 16,
+			rdma_session->rdma_dev->dev->attrs.max_send_sge);
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	init_attr.qp_type = IB_QPT_RC;
 
@@ -399,6 +400,7 @@ static int rswap_create_qp(struct rdma_session_context *rdma_session,
 			     &init_attr);
 	if (!ret) {
 		rdma_queue->qp = rdma_queue->cm_id->qp;
+		rdma_queue->max_send_sge = init_attr.cap.max_send_sge;
 	} else {
 		pr_err("%s:  Create QP falied. errno : %d \n", __func__, ret);
 	}

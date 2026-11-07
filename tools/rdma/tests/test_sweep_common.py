@@ -17,6 +17,28 @@ def shell(script, *args, check=True):
 
 
 class SweepTests(unittest.TestCase):
+    def test_absolute_memory_budget(self):
+        self.assertEqual(shell('MEMORY_LIMIT_MB=512; benchmark_memory_limit_mb 2000 70').stdout.strip(),'512')
+        self.assertEqual(shell('unset MEMORY_LIMIT_MB; benchmark_memory_limit_mb 2000 70').stdout.strip(),'1400')
+        self.assertNotEqual(shell('MEMORY_LIMIT_MB=bad; benchmark_memory_limit_mb 2000 70',check=False).returncode,0)
+
+    def test_standard_ycsb_mix_is_preserved(self):
+        source=(COMMON.parent/'run_ycsb_page_sweep.sh').read_text()
+        start=source.index('generate_workload_file() {')
+        definition=source[start:source.index('\n}\n',start)+3]
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);profile=root/'workloada';output=root/'generated'
+            profile.write_text('workload=site.ycsb.workloads.CoreWorkload\nreadproportion=0.5\nupdateproportion=0.5\n')
+            shell(definition+'''\nYCSB_WORKLOAD_FILE=$1; YCSB_RECORDCOUNT=100
+                YCSB_OPERATIONCOUNT=1000; YCSB_FIELDCOUNT=10; YCSB_FIELDLENGTH=100
+                YCSB_READALLFIELDS=true; BINDING=redis
+                generate_workload_file "$2" 6379
+                ''',profile,output)
+            text=output.read_text()
+            self.assertIn('updateproportion=0.5',text)
+            self.assertEqual(text.count('readproportion='),1)
+            self.assertIn('fieldlength=100',text)
+
     def test_process_thp_disable_is_rejected_and_status_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

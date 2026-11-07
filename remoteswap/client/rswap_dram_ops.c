@@ -13,11 +13,6 @@ module_param(force_local, bool, 0644);
 MODULE_PARM_DESC(force_local,
 		 "force native swap writes (diagnostic validation only)");
 
-static size_t rswap_entry_offset(swp_entry_t entry)
-{
-	return (size_t)swp_offset(entry) << PAGE_SHIFT;
-}
-
 static int rswap_hermit_store(struct hermit_io *io)
 {
 	int ret;
@@ -26,7 +21,7 @@ static int rswap_hermit_store(struct hermit_io *io)
 		return -EOPNOTSUPP;
 
 	io->fallback = io->folio_order > 0;
-	ret = rswap_dram_write_folio(io->folio, rswap_entry_offset(io->entry));
+	ret = rswap_dram_write_folio(io->folio, (size_t)io->remote_offset << PAGE_SHIFT);
 	if (unlikely(ret))
 		pr_err_ratelimited("rswap_dram: store failed for entry 0x%lx: %d\n",
 				   io->entry.val, ret);
@@ -41,7 +36,7 @@ static int rswap_hermit_load(struct hermit_io *io, bool async)
 	(void)async;
 
 	io->fallback = io->folio_order > 0;
-	ret = rswap_dram_read_folio(io->folio, rswap_entry_offset(io->entry));
+	ret = rswap_dram_read_folio(io->folio, (size_t)io->remote_offset << PAGE_SHIFT);
 	if (unlikely(ret && ret != -ENOENT))
 		pr_err_ratelimited("rswap_dram: load failed for entry 0x%lx: %d\n",
 				   io->entry.val, ret);
@@ -56,11 +51,34 @@ static int rswap_hermit_poll(struct hermit_io *io, bool wait)
 	return 0;
 }
 
-static const struct hermit_backend_ops rswap_hermit_ops = {
+/* DRAM has no WR coalescing: report and complete each base page. */
+static int rswap_hermit_batch(struct hermit_batch *batch)
+{
+	unsigned int i;
+
+	for (i = 0; i < batch->nr; i++) {
+		size_t off = (size_t)batch->offsets[i] << PAGE_SHIFT;
+
+		batch->status[i] = batch->write ?
+			(force_local ? -EOPNOTSUPP :
+			 rswap_dram_write(folio_page(batch->folios[i], 0), off)) :
+			rswap_dram_read(folio_page(batch->folios[i], 0), off);
+	}
+	return 0;
+}
+
+static int rswap_hermit_batch_poll(struct hermit_batch *batch, bool wait)
+{
+	return 0;
+}
+
+static struct hermit_backend_ops rswap_hermit_ops = {
 	.supported_order_mask = BIT(0),
 	.load = rswap_hermit_load,
 	.store = rswap_hermit_store,
 	.poll = rswap_hermit_poll,
+	.submit_batch = rswap_hermit_batch,
+	.poll_batch = rswap_hermit_batch_poll,
 };
 
 int rswap_register_backend(void)
@@ -86,6 +104,8 @@ int rswap_client_init(char *server_ip, int server_port, int mem_size)
 	(void)server_ip;
 	(void)server_port;
 
+	rswap_hermit_ops.capacity_pages = (unsigned long)mem_size << (30 - PAGE_SHIFT);
+	rswap_hermit_ops.boundary_pages = 1UL << (30 - PAGE_SHIFT);
 	return rswap_init_local_dram(mem_size);
 }
 

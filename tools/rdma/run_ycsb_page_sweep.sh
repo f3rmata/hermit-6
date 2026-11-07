@@ -36,6 +36,8 @@ Important environment:
   YCSB_READALLFIELDS=true           (whole-record GETs)
   YCSB_REQUESTDISTRIBUTION=uniform  (uniform | zipfian)
   YCSB_WORKLOAD=custom              (custom generated CoreWorkload)
+  YCSB_WORKLOAD_FILE=               (official workload file; preserves its operation mix)
+  MEMORY_LIMIT_MB=                  (absolute limit shared across comparison cases)
   LOCAL_RATIO_PCT=70                (cgroup memory.max = resident * ratio / 100)
   BENCH_REPEATS=3
   BENCH_CPUS=0                      (YCSB Java client CPU set)
@@ -192,6 +194,20 @@ ycsb_parse_field() {
 
 generate_workload_file() {
   local file=$1 port=$2
+  if [ -n "${YCSB_WORKLOAD_FILE:-}" ]; then
+    [ -r "$YCSB_WORKLOAD_FILE" ] || rdma_die "cannot read YCSB_WORKLOAD_FILE"
+    cp -- "$YCSB_WORKLOAD_FILE" "$file"
+    # The official file supplies operation proportions; these append only
+    # dataset size and connection settings, consistently across baselines.
+    cat >> "$file" <<EOF
+
+recordcount=$YCSB_RECORDCOUNT
+operationcount=$YCSB_OPERATIONCOUNT
+fieldcount=$YCSB_FIELDCOUNT
+fieldlength=$YCSB_FIELDLENGTH
+readallfields=$YCSB_READALLFIELDS
+EOF
+  else
   cat > "$file" <<EOF
 workload=site.ycsb.workloads.CoreWorkload
 recordcount=$YCSB_RECORDCOUNT
@@ -205,6 +221,7 @@ scanproportion=0.0
 insertproportion=0.0
 requestdistribution=$YCSB_REQUESTDISTRIBUTION
 EOF
+  fi
   if [ "$BINDING" = redis ]; then
     cat >> "$file" <<EOF
 redis.host=127.0.0.1
@@ -328,7 +345,7 @@ for kb in $PAGE_SIZES_KB; do
 
     resident_bytes=$(sudo_cat "$CGROUP/memory.current")
     resident_mb=$((resident_bytes / 1024 / 1024))
-    limit_mb=$(max_int 256 $((resident_mb * LOCAL_RATIO_PCT / 100)))
+    limit_mb=$(benchmark_memory_limit_mb "$resident_mb" "$LOCAL_RATIO_PCT")
     [ "$limit_mb" -lt "$resident_mb" ] || \
       rdma_die "computed limit ${limit_mb} MiB is not below resident ${resident_mb} MiB; lower LOCAL_RATIO_PCT or enlarge the dataset"
     required_swap_mb=$((resident_mb - limit_mb))
@@ -370,7 +387,7 @@ for kb in $PAGE_SIZES_KB; do
     protocol_gib=$(awk -v b="$total_store_bytes" 'BEGIN { printf "%.6f", b/1073741824 }')
 
     # ----------------------------------------------------------------------
-    # Swap-in phase: run YCSB read-only workload under the same hard budget.
+    # Swap-in phase: run the configured operation mix under the same hard budget.
     # ----------------------------------------------------------------------
     snapshot_fixed_memory_budget "$CGROUP" "$run_dir" before-swapin "$((limit_mb * 1024 * 1024))"
     snapshot_sweep_stats "$load_before"
@@ -397,6 +414,9 @@ for kb in $PAGE_SIZES_KB; do
     [ "${read_ops:-0}" -gt 0 ] || rdma_die "YCSB run reported no READ operations; see $run_log"
     [ "${read_ok:-0}" -eq "$read_ops" ] || \
       rdma_die "YCSB READ failures: ok=$read_ok ops=$read_ops; see $run_log"
+    # Standard A/B/F include writes: successful READs alone are insufficient.
+    awk -F', *' '$2 ~ /^Return=/ && $2 != "Return=OK" && ($3 + 0) > 0 { bad=1 }
+      END { exit bad }' "$run_log" || rdma_die "YCSB operation failures; see $run_log"
 
     run_sec=$(awk -v ms="$run_time_ms" 'BEGIN { printf "%.6f", ms / 1000 }')
     useful_bytes=$((read_ops * YCSB_VALUE_SIZE))

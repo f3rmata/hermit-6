@@ -18,6 +18,7 @@ RDMA = Path(__file__).resolve().parents[1]
 ROOT = Path(__file__).resolve().parents[3]
 KERNEL = ROOT / 'linux-stable'
 TOOLS = RDMA
+sys.path.insert(0, str(RDMA / 'pebs'))
 
 COST_PATH = RDMA / 'pebs/run_memcached_sampling_cost.py'
 cost_spec = importlib.util.spec_from_file_location('cost', COST_PATH)
@@ -76,7 +77,7 @@ class FixedConcurrencyTests(unittest.TestCase):
             self.assertEqual(section['selection'],'fixed-concurrency-no-calibration')
             cmd=section['measurement']
             self.assertEqual(cmd[cmd.index('--connections')+1],'32')
-            self.assertEqual(cmd[cmd.index('--cases')+1],'off,off-same-pages,static-low,static-medium,static-high,policy-low,policy-medium,policy-high')
+            self.assertEqual(cmd[cmd.index('--cases')+1],'off,static-low,static-medium,static-high,policy-low,policy-medium,policy-high')
             self.assertEqual(cmd[cmd.index('--thp')+1],'preserve')
             self.assertNotIn('--page-kb',cmd)
             self.assertEqual(cmd[cmd.index('--qps')+1],'0')
@@ -288,9 +289,10 @@ class MatrixTests(unittest.TestCase):
     def test_subset_remains_paired(self):
         args=types.SimpleNamespace(periods=[1999],suites=['redis'],pages=[64],repeats=2,seed=7,store_period=1500003)
         rows=matrix.plan(args)
-        self.assertEqual(len(rows),6)
+        self.assertEqual(len(rows),8)
         for repeat in (1,2):
             self.assertEqual({r['case'] for r in rows if r['repeat']==repeat},{'off','static-1999','policy-1999'})
+            self.assertEqual([r['case'] for r in rows if r['repeat']==repeat and r['page_kb']==4], ['off'])
 
     def test_reject_hidden_backend_candidate_restrictions(self):
         for ceiling, mask in [(4, 1), (64, 0x1d), (2048, 0x3fd), (64, 0x3fd)]:
@@ -358,7 +360,8 @@ class MatrixTests(unittest.TestCase):
     def test_policy_changes_ignore_only_sampling_controls(self):
         baseline = {'controls': {'remote_order_mask':'0x3fd', 'pebs_force_order':'0',
                                 'pebs_mode':'0', 'pebs_load_period':'1999', 'pebs_min_samples':'32'},
-                    'thp': {'enabled':'[madvise]'}}
+                    'thp': {'enabled':'[madvise]'},
+                    'mglru': {'enabled':'0x0007', 'min_ttl_ms':'0'}}
         current = json.loads(json.dumps(baseline))
         current['controls'].update(pebs_mode='1', pebs_load_period='199', pebs_order_stats='sampled: 5')
         self.assertEqual(matrix.policy_changes(baseline, current), [])
@@ -368,6 +371,10 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual(len(matrix.policy_changes(baseline, changed)), 1)
         current['thp']['enabled'] = '[never]'
         self.assertTrue(matrix.policy_changes(baseline, current))
+        changed = json.loads(json.dumps(baseline))
+        changed['mglru']['enabled'] = '0x0000'
+        self.assertEqual(matrix.policy_changes(baseline, changed),
+                         ['policy configuration changed: mglru/enabled'])
 
     def test_measurement_pairs_performance_with_all_orders_and_actual_wrs(self):
         with tempfile.TemporaryDirectory() as directory:

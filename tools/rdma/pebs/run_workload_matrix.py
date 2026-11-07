@@ -24,13 +24,15 @@ import sys
 import time
 
 from page_selection_metrics import table
+from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, counter_delta, wr_delta,
+                            policy_delta, policy_activity, read_optional, write_comparisons)
 
 RDMA = Path(__file__).resolve().parents[1]
 DEBUG = Path('/sys/kernel/debug/hermit')
 MEMORY_POLICY = 'fixed-max-v1'
 PAGE_POLICY = 'max-allocation-v1'
 WR_STATS = Path('/sys/module/rswap_client/parameters/wr_stats')
-SAMPLING_CONTROLS = ['pebs_mode', 'pebs_load_period', 'pebs_store_period']
+SAMPLING_CONTROLS = ['pebs_mode', 'pebs_load_period', 'pebs_store_period', 'pebs_adaptive']
 SUITES = {
     'anon-1t-full': ('run_anon_swapout_sweep.sh', dict(BENCH_THREADS=1, BENCH_CPUS='0', ACCESS_RATIOS='100')),
     'anon-1t-chunk64k': ('run_anon_swapout_sweep.sh', dict(BENCH_THREADS=1, BENCH_CPUS='0', ACCESS_RATIOS='chunk64k')),
@@ -46,7 +48,9 @@ bypass_swapcache lazy_poll reclaim_headroom_pages reclaim_mode speculative_io
 speculative_lock sthd_cnt vaddr_swapout exclusive_swapout swap_thread prefetch_thread'''.split()
 CONTROLS += '''effective_order_mask pebs_all pebs_window_ms pebs_history_ms
 pebs_min_regions pebs_min_samples pebs_pc_max pebs_wr_cost_ns pebs_fixed_cost_ns
-pebs_bw_mibps pebs_min_f pebs_hysteresis pebs_cooling_period pebs_region_max'''.split()
+pebs_bw_mibps pebs_min_f pebs_hysteresis pebs_cooling_period pebs_region_max
+policy_features policy_cold_us policy_cold_epochs policy_pages_max policy_swapin_max
+pebs_predict_regions pebs_predict_samples'''.split()
 
 
 def command(args, **kwargs):
@@ -85,7 +89,7 @@ def snapshot_sources(destination):
     """Keep relative imports usable when running the archived workload scripts."""
     paths = [p for p in RDMA.iterdir() if p.suffix in ('.sh', '.py', '.c')]
     paths += [Path(__file__).resolve(), RDMA/'pebs/enable_pebs_pid.py',
-              RDMA/'pebs/page_selection_metrics.py']
+              RDMA/'pebs/page_selection_metrics.py', RDMA/'pebs/matrix_metrics.py']
     for path in paths:
         target = destination/path.relative_to(RDMA)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -98,17 +102,20 @@ def snapshot_sources(destination):
 
 def policy_settings():
     return {'controls': {k: read(DEBUG/k) for k in CONTROLS if exists(DEBUG/k)},
+            'mglru': {name: read_optional(Path('/sys/kernel/mm/lru_gen')/name)
+                      for name in ('enabled', 'min_ttl_ms')},
             'thp': {str(p): p.read_text().strip() for p in sorted(
                 Path('/sys/kernel/mm/transparent_hugepage').glob('**/enabled'))}}
 
 
 def policy_changes(baseline, current):
     changes = []
-    for section in ('controls', 'thp'):
-        for key in baseline[section].keys() | current[section].keys():
+    for section in ('controls', 'thp', 'mglru'):
+        old, new = baseline.get(section, {}), current.get(section, {})
+        for key in old.keys() | new.keys():
             if section == 'controls' and key in SAMPLING_CONTROLS + ['pebs_enabled', 'pebs_order_stats']:
                 continue
-            if baseline[section].get(key) != current[section].get(key):
+            if old.get(key) != new.get(key):
                 changes.append(f'policy configuration changed: {section}/{key}')
     return sorted(changes)
 
@@ -118,11 +125,12 @@ def snapshot(path):
     data = {'time_ns': time.time_ns(), 'uname': list(platform.uname()),
             'controls': settings['controls'] |
                         {'pebs_enabled':read(DEBUG/'pebs_enabled'), 'pebs_order_stats':read(DEBUG/'pebs_order_stats')},
-            'thp': settings['thp'], 'wr_stats': read(WR_STATS),
+            'thp': settings['thp'], 'mglru': settings['mglru'], 'wr_stats': read(WR_STATS),
             'order_stats': read(DEBUG/'order_stats'),
             'perf': {p.name: p.read_text().strip() for p in Path('/proc/sys/kernel').glob('perf_*')},
             'cpu_stat': Path('/proc/stat').read_text(),
             'swaps': Path('/proc/swaps').read_text(), 'vmstat': Path('/proc/vmstat').read_text()}
+    data['policy_stats'] = read(DEBUG/'policy_stats') if exists(DEBUG/'policy_stats') else None
     save_json(path, data)
     return data
 
@@ -133,11 +141,13 @@ def plan(args):
         cases.extend([(f'static-{period}', 0, period), (f'policy-{period}', 1, period)])
     rng = random.Random(args.seed)
     rows = []
-    for repeat, suite, page in itertools.product(range(1, args.repeats+1), args.suites, args.pages):
-        block = cases.copy()
+    pages = args.pages if 4 in args.pages else [4, *args.pages]
+    for repeat, suite, page in itertools.product(range(1, args.repeats+1), args.suites, pages):
+        block = cases.copy() if page in args.pages else [cases[0]]
         rng.shuffle(block)
         for label, mode, period in block:
             rows.append(dict(suite=suite, page_kb=page, max_page_kb=page, repeat=repeat, case=label,
+                             baseline_role='4KiB-only' if page == 4 and label == 'off' else '',
                              mode=mode, load_period=period, store_period=args.store_period))
     return rows
 
@@ -161,21 +171,11 @@ def validate_swapin_path(bypass_swapcache):
 
 def check_policy_activity(row, measurement):
     application = [r for r in measurement['granularity'] if r['phase'] == 'application']
-    counts = [r['pebs_decisions'] for r in application]
+    counts = [r['pebs_decisions'] for r in application if r['order'] is not None and r['order'] != 1]
     decisions = sum(counts) if counts and all(v is not None for v in counts) else None
-    # A 4 KiB ceiling has no large candidates and may bypass the selector.
-    # For larger ceilings, selecting order 0 is still a real, valid decision.
-    required = row['mode'] == 1 and row['page_kb'] > 4
-    activity = dict(required=required, application_decisions=decisions,
-                    path_exercised=decisions > 0 if decisions is not None else None)
-    issues = []
-    if required and decisions is None:
-        issues.append('missing application-phase PEBS decision counters')
-    elif required and decisions == 0:
-        issues.append('policy selection was not exercised: zero application-phase decisions with '
-                      f'a {row["page_kb"]} KiB ceiling; check direct swap-in and legal swap-in candidates; '
-                      'PEBS samples or actual_order counters alone do not validate the policy path')
-    return activity, issues
+    policy = measurement.get('policy', {}).get('application')
+    wrs = {r['size_kib']: r for r in application} if policy is not None else {}
+    return policy_activity(row['mode'], row['page_kb'], decisions, policy, wrs)
 
 
 def environment(args):
@@ -251,15 +251,6 @@ def validate_results(folder, row):
     return issues
 
 
-def counter_delta(before, after):
-    if before.keys() != after.keys():
-        raise ValueError('counter schema changed')
-    delta = {k: after[k] - before[k] for k in before}
-    if any(v < 0 for v in delta.values()):
-        raise ValueError('counter reset during measurement')
-    return delta
-
-
 def table_delta(before, after):
     a, b = table(before.read_text()), table(after.read_text())
     if a.keys() != b.keys():
@@ -295,6 +286,8 @@ def collect_measurement(folder, row):
     performance = dict(metric=metric, unit=unit, throughput=throughput, duration_sec=seconds)
     histogram = []
     allocation_settings = {}
+    policy = {}
+    swap = {}
     for phase, suffix in [('populate', ''), ('application', '-swapin')]:
         paths = list(folder.rglob(f'order-before{suffix}.txt'))
         if len(paths) != 1:
@@ -302,7 +295,15 @@ def collect_measurement(folder, row):
         before = paths[0]
         after = before.with_name(before.name.replace('before', 'after', 1))
         folios = table_delta(before, after)
-        wrs = table_delta(Path(str(before)+'.wr'), Path(str(after)+'.wr'))
+        wrs = wr_delta(Path(str(before)+'.wr').read_text(), Path(str(after)+'.wr').read_text())
+        policy[phase] = policy_delta(read_optional(str(before)+'.policy'), read_optional(str(after)+'.policy'))
+        vmstat = [read_optional(str(p)+'.vmstat') for p in (before, after)]
+        if any(v is not None for v in vmstat):
+            if any(v is None for v in vmstat):
+                raise ValueError('missing vmstat snapshot')
+            swap[phase] = counter_delta(*[{k: int(v) for k, v in
+                                          (line.split() for line in text.splitlines())
+                                          if k in ('pswpin', 'pswpout')} for text in vmstat])
         thp_before, thp_after = (Path(str(p)+'.thp').read_text() for p in (before, after))
         if not thp_before.strip() or thp_before != thp_after:
             raise ValueError('THP settings missing or changed during measurement')
@@ -321,19 +322,24 @@ def collect_measurement(folder, row):
             raise ValueError('missing PEBS order counters')
         decisions = counter_delta(*pebs)
         total_read = sum(v['read_bytes'] for v in wrs.values())
-        for order in sorted(folios.keys() | wrs.keys(), key=int):
-            f, w = folios.get(order, {}), wrs.get(order, {})
-            size = 4096 << int(order)
-            histogram.append(dict(phase=phase, order=int(order), size_kib=size//1024,
+        folios_by_size = {4 << int(order): values for order, values in folios.items()}
+        for size_kib in sorted(folios_by_size.keys() | wrs.keys()):
+            pages = size_kib // 4
+            order = pages.bit_length() - 1 if pages & (pages - 1) == 0 else None
+            f, w = folios_by_size.get(size_kib, {}), wrs.get(size_kib, {})
+            size = size_kib * 1024
+            histogram.append(dict(phase=phase, order=order, size_kib=size_kib,
                 folio_stores=f.get('stores', 0), folio_loads=f.get('loads', 0),
                 folio_store_bytes=f.get('stores', 0)*size, folio_load_bytes=f.get('loads', 0)*size,
                 folio_fallback_4k=f.get('fallback_4k', 0), folio_errors=f.get('errors', 0),
                 write_wrs=w.get('write_wrs', 0), read_wrs=w.get('read_wrs', 0),
                 write_bytes=w.get('write_bytes', 0), read_bytes=w.get('read_bytes', 0),
+                **{'batch_' + k: w.get('batch_' + k, 0) for k in WR_FIELDS},
                 read_byte_share=w.get('read_bytes', 0)/total_read if total_read else 0,
-                pebs_decisions=decisions.get(order), pebs_actual_swapins=decisions.get('actual_order_'+order)))
+                pebs_decisions=decisions.get(str(order)), pebs_actual_swapins=decisions.get('actual_order_'+str(order))))
     return dict(page_policy=PAGE_POLICY, max_page_kb=row['page_kb'], performance=performance,
-                workload=record, allocation_settings=allocation_settings, granularity=histogram)
+                workload=record, allocation_settings=allocation_settings, granularity=histogram,
+                policy=policy, swap=swap)
 
 
 def append_csv(path, rows):
@@ -350,7 +356,7 @@ def main():
     ap.add_argument('--suites', nargs='+', choices=SUITES, default=list(SUITES))
     ap.add_argument('--pages', nargs='+', type=int, choices=[4,16,32,64,128,256,512,1024,2048],
                     default=[4,16,32,64,128,256,512,1024,2048],
-                    help='maximum allocation sizes in KiB; all smaller THP orders remain eligible')
+                    help='maximum allocation sizes in KiB; smaller orders stay eligible; always includes a 4KiB/off reference')
     ap.add_argument('--periods', nargs='+', type=int, default=[19997,1999,199])
     ap.add_argument('--store-period', type=int, default=1500003)
     ap.add_argument('--repeats', type=int, default=3)
@@ -450,7 +456,7 @@ def main():
             cg = Path(f'/sys/fs/cgroup/hermit-pebs-{os.getpid()}-{index}')
             if cg.exists(): raise RuntimeError(f'cgroup already exists: {cg}')
             if row['mode'] is not None:
-                for k,v in dict(pebs_mode=row['mode'],pebs_load_period=row['load_period'],
+                for k,v in dict(pebs_mode=row['mode'],pebs_adaptive=0,pebs_load_period=row['load_period'],
                                 pebs_store_period=row['store_period']).items(): write(DEBUG/k,v)
             before = snapshot(folder/'before.json')
             changes = policy_changes(baseline, before)
@@ -502,11 +508,18 @@ def main():
                 perf_rate_changed=before['perf']!=after['perf']))
             if measurement is not None:
                 identity = dict(run_id=name, suite=row['suite'], max_page_kb=row['page_kb'],
-                                repeat=row['repeat'], case=row['case'], usable=valid)
+                                repeat=row['repeat'], case=row['case'], usable=valid,
+                                baseline_role=row['baseline_role'])
                 activity_columns = {'application_policy_decisions': policy_activity['application_decisions'],
                                     'policy_path_exercised': policy_activity['path_exercised']} if policy_activity else {
                                     'application_policy_decisions': None, 'policy_path_exercised': None}
-                append_csv(args.output/'summary.csv', [identity | measurement['performance'] | delta | activity_columns])
+                counters = {key: sum(r[key] for r in measurement['granularity'] if r['phase'] == 'application')
+                            for key in WR_FIELDS}
+                counters.update({'policy_' + k: (measurement['policy']['application'] or {}).get(k)
+                                 for k in POLICY_FIELDS})
+                counters.update({k: measurement['swap'].get('application', {}).get(k) for k in ('pswpin', 'pswpout')})
+                counters.update({k: measurement['workload'].get(k) for k in ('read_avg_us', 'read_p95_us', 'read_p99_us')})
+                append_csv(args.output/'summary.csv', [identity | measurement['performance'] | delta | activity_columns | counters])
                 append_csv(args.output/'granularity.csv', [identity | r for r in measurement['granularity']])
             if not valid: raise RuntimeError(f'{name}: {"; ".join(issues)}; see status.json and run.log')
         failed=False
@@ -541,6 +554,7 @@ def main():
             attempt('verify '+path,verify)
         attempt('final snapshot',lambda:snapshot(args.output/'after.json'))
         attempt('dmesg',lambda:(args.output/'dmesg-after.txt').write_text(command(['sudo','-n','dmesg'])))
+        attempt('paired comparison',lambda:write_comparisons(args.output))
         save_json(args.output/'completion.json',dict(completed=not failed,restore_errors=restore_errors))
         if restore_errors: print('RESTORE ERRORS: '+str(restore_errors),file=sys.stderr)
     if restore_errors: raise RuntimeError('environment restore incomplete; see completion.json and restore.json')
