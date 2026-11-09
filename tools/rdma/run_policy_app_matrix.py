@@ -33,8 +33,8 @@ PAGE_POLICY = 'max-allocation-v1'
 SAMPLING_CONTROLS = ('pebs_mode', 'pebs_all', 'pebs_adaptive',
                      'pebs_load_period', 'pebs_store_period')
 PAIR_KEYS = ('application', 'concurrency', 'ratio', 'max_page_kb', 'repeat')
-# debugfs reads can execute test hooks, including pebs_test_eval and
-# pebs_ring_test. Snapshot only known passive counters and configuration.
+# debugfs reads can execute test hooks such as pebs_ring_test.
+# Snapshot only known passive counters and configuration.
 HERMIT_SNAPSHOT_FILES = (
     'order_stats', 'pebs_order_stats', 'policy_stats',
     'remote_order_mask', 'effective_order_mask',
@@ -42,11 +42,11 @@ HERMIT_SNAPSHOT_FILES = (
     'batch_account', 'vaddr_swapout', 'speculative_io', 'speculative_lock',
     'lazy_poll', 'apt_reclaim', 'sthd_cnt', 'reclaim_mode',
     'reclaim_headroom_pages', 'reclaim_stop_headroom_pages',
-    'pebs_enabled', 'pebs_all', 'pebs_mode', 'pebs_force_order',
+    'pebs_enabled', 'pebs_all', 'pebs_mode',
     'pebs_adaptive', 'pebs_load_period', 'pebs_store_period',
-    'pebs_window_ms', 'pebs_history_ms', 'pebs_min_regions', 'pebs_min_samples',
-    'pebs_pc_max', 'pebs_wr_cost_ns', 'pebs_fixed_cost_ns', 'pebs_bw_mibps',
-    'pebs_min_f', 'pebs_hysteresis', 'pebs_cooling_period', 'pebs_region_max',
+    'pebs_window_ms', 'pebs_history_ms', 'pebs_pc_max',
+    'pebs_fixed_cost_ns', 'pebs_region_max',
+    'pebs_predict_regions', 'pebs_predict_samples',
 )
 DRAM_SNAPSHOT_FILES = ('stores', 'loads', 'load_misses', 'errors')
 
@@ -111,7 +111,7 @@ def load_config(path):
     c.setdefault('store_period', 1500003)
     c.setdefault('timeout_seconds', 1800)
     c.setdefault('controls', {})
-    owned = set(SAMPLING_CONTROLS) | {'pebs_enabled', 'pebs_force_order', 'remote_order_mask'}
+    owned = set(SAMPLING_CONTROLS) | {'pebs_enabled', 'remote_order_mask'}
     if owned & c['controls'].keys():
         raise ValueError('controls must not override sampling or backend orders; use modes/periods/store_period: '
                          + ', '.join(sorted(owned & c['controls'].keys())))
@@ -329,8 +329,6 @@ def require_host(config):
         raise RuntimeError('rswap force_local is enabled; remote-swap measurements would be invalid')
     if read(DEBUG / 'pebs_enabled') != '0':
         raise RuntimeError('a PEBS session is already active; script will not stop somebody else\'s session')
-    if int(read(DEBUG / 'pebs_force_order'), 0):
-        raise RuntimeError('disable pebs_force_order before the matrix; allocation ceilings must not force reads')
     required = ((1 << (max(config['page_sizes_kb']) // 4).bit_length()) - 1) & ~2
     if int(read(DEBUG / 'effective_order_mask'), 0) & required != required:
         raise RuntimeError(f'backend orders exclude selected ceilings; configure remote_order_mask/backend '
@@ -414,7 +412,7 @@ def case_controls(cell, thp):
 def verify_case(state, cell):
     if state['thp'] != page_settings(cell['max_page_kb'], state['thp']):
         raise RuntimeError('THP allocation ceiling changed during the cell')
-    expected = sampling_settings(cell) | {'pebs_enabled': int(cell['mode'] is not None), 'pebs_force_order': 0}
+    expected = sampling_settings(cell) | {'pebs_enabled': int(cell['mode'] is not None)}
     for key, value in expected.items():
         if int(state['values'].get('hermit/' + key, '-1'), 0) != value:
             raise RuntimeError('sampling configuration mismatch: ' + key)

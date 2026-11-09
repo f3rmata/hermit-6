@@ -37,6 +37,8 @@ Important environment:
   BENCH_CPUS=0                       (taskset CPU list, e.g. 0-7)
   BENCH_CPU=0                        (legacy alias used if BENCH_CPUS is unset)
   SWAPOUT_TRIGGER=memory-max         (memory-max or parallel-fault)
+  MIN_RESIDENT_PCT=50                (parallel-fault: minimum resident share of LIMIT_MB
+                                      after populate; MGLRU can reclaim below the limit)
   QUIET_INTERVAL_SEC=1
   QUIET_SAMPLES=3
   QUIET_TIMEOUT_SEC=120
@@ -71,6 +73,7 @@ BENCH_CPU=${BENCH_CPU:-0}
 BENCH_CPUS=${BENCH_CPUS:-$BENCH_CPU}
 BENCH_THREADS=${BENCH_THREADS:-1}
 SWAPOUT_TRIGGER=${SWAPOUT_TRIGGER:-memory-max}
+MIN_RESIDENT_PCT=${MIN_RESIDENT_PCT:-50}
 READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-300}
 SWAPIN_TIMEOUT_SEC=${SWAPIN_TIMEOUT_SEC:-300}
 RUN_ID=${requested_run_id:-"$(date +%Y%m%d-%H%M%S)-anon-sparse-swapio"}
@@ -113,6 +116,8 @@ wait_for_log() {
 [[ "$ACCESS_SEED" =~ ^[0-9]+$ ]] || rdma_die "ACCESS_SEED must be an unsigned integer"
 [[ "$BENCH_THREADS" =~ ^[0-9]+$ ]] && [ "$BENCH_THREADS" -gt 0 ] || \
   rdma_die "BENCH_THREADS must be a positive integer"
+[[ "$MIN_RESIDENT_PCT" =~ ^[0-9]+$ ]] && [ "$MIN_RESIDENT_PCT" -ge 1 ] && [ "$MIN_RESIDENT_PCT" -le 100 ] || \
+  rdma_die "MIN_RESIDENT_PCT must be an integer in [1, 100]"
 command -v taskset >/dev/null 2>&1 || rdma_die "taskset is required"
 taskset -c "$BENCH_CPUS" true >/dev/null 2>&1 || \
   rdma_die "invalid or unavailable BENCH_CPUS CPU list: $BENCH_CPUS"
@@ -242,7 +247,10 @@ for kb in $PAGE_SIZES_KB; do
     resident_bytes=$(sudo_cat "$CGROUP/memory.current")
 
     if [ "$SWAPOUT_TRIGGER" = parallel-fault ]; then
-      minimum_resident_bytes=$((LIMIT_MB * 1024 * 1024 * 8 / 10))
+      # Concurrent faults under the final limit can reclaim below it; MGLRU
+      # overshoots further for large folios. The floor only rejects a run
+      # that never populated; the actual residency is recorded below.
+      minimum_resident_bytes=$((LIMIT_MB * 1024 * 1024 * MIN_RESIDENT_PCT / 100))
       last_change_ns=$ready_ns
     else
       sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-before.txt"

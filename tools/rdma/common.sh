@@ -1015,7 +1015,7 @@ snapshot_benchmark_pebs() {
     printf 'timestamp_ns=%s\n' "$(date +%s%N)"
     sudo_cat /sys/kernel/debug/hermit/pebs_order_stats
     local key
-    for key in remote_order_mask effective_order_mask pebs_enabled pebs_mode pebs_force_order; do
+    for key in remote_order_mask effective_order_mask pebs_enabled pebs_mode; do
       printf '%s=' "$key"
       sudo_cat "/sys/kernel/debug/hermit/$key"
     done

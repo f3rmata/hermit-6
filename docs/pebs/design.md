@@ -1,14 +1,16 @@
-# Hermit PEBS 设计与实现
+# Hermit PEBS mTHP 选阶历史设计（已移除）
 
 > 状态：2026-10-26。PEBS 历史按 mm 保存，不依赖 cgroup；`CONFIG_HERMIT` 不要求
 > `CONFIG_MEMCG`。新内核矩阵暴露的置信门槛、并发预读反馈和开销问题见
 > [PEBS 策略设计问题与改进方案](policy-design-review.md)。
 > 历史设计与验证记录见 [PEBS 历史报告](../archive/pebs/)。
 >
-> **注意**：本文描述 `pebs_mode=1` 的 mTHP 选页设计。当前 policy 模式默认改走
-> 4 KiB 预测 SG 换入、冷页观察和回收排序，见
-> [内核集成说明](kernel-policy-integration.org)（含 2026-11-04 修正与
-> `policy_features` 消融开关）。`policy_features` 清除 `SWAPIN` 位后才恢复本文的路径。
+> **2026-11-09 更新**：本文保留旧实验的设计背景。mTHP 成本选阶、PTE young-bit
+> 预读反馈、强制 order 和相关 debugfs 测试接口已从当前代码删除；下文的模型、
+> 选阶参数及回放命令描述历史版本，不作为当前操作说明。
+> 当前 4 KiB 预测、SG 换入及回收协同见[内核集成说明](kernel-policy-integration.org)。
+> 清除 `SWAPIN` 位后走最大合法 folio 路径，不再启用本文的旧模型。
+> 最新实测见 [11-09 报告](policy-results-20261109.md)。
 
 ## 1. 目标
 

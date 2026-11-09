@@ -7,9 +7,12 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import signal
 import types
 import unittest
 from unittest.mock import patch
@@ -202,6 +205,95 @@ class MatrixTests(unittest.TestCase):
                                                      '--dry-run'], text=True)
             self.assertEqual(json.loads(archived_plan)['samples'], 1323)
 
+    def test_opt_in_density_and_graph_suites(self):
+        self.assertEqual(matrix.DEFAULT_SUITES, ['anon-1t-full', 'anon-1t-chunk64k', 'anon-8t-full',
+                                                 'anon-8t-chunk64k', 'redis', 'ycsb', 'xgboost'])
+        density = [s for s in matrix.SUITES if s.startswith('anon-1t-d')]
+        self.assertEqual(len(density), 6)
+        for name in density:
+            script, env = matrix.SUITES[name]
+            self.assertEqual(script, 'run_anon_swapout_sweep.sh')
+            # Exactly one combination per suite: the driver must write one row.
+            for key in ('ACCESS_RATIOS', 'ACCESS_ORDERS', 'ACCESS_LOCALITIES'):
+                self.assertEqual(len(env[key].split()), 1, (name, key))
+            self.assertEqual(env['ACCESS_ORDERS'], 'random')
+        for kernel in ('bfs', 'pr'):
+            script, env = matrix.SUITES[f'gapbs-{kernel}']
+            self.assertEqual((script, env['GAPBS_KERNEL']), ('run_gapbs_page_sweep.sh', kernel))
+        out = subprocess.check_output(['python3', str(RDMA/'pebs/run_workload_matrix.py'), '--dry-run',
+                                       '--suites', 'gapbs-bfs', 'anon-1t-d1p-high', '--pages', '64',
+                                       '--periods', '1999', '--repeats', '1', '--gapbs-scale', '20'], text=True)
+        data = json.loads(out)
+        self.assertEqual(data['samples'], 2 * 4)   # 64 KiB block of 3 + 4 KiB off reference, per suite
+        self.assertEqual((data['environment']['GAPBS_SCALE'], data['environment']['GAPBS_DEGREE']), ('20', '16'))
+        plain = json.loads(subprocess.check_output(['python3', str(RDMA/'pebs/run_workload_matrix.py'),
+                                                    '--dry-run', '--suites', 'redis'], text=True))
+        self.assertNotIn('GAPBS_DIR', plain['environment'])
+
+    def test_gapbs_results_require_every_trial_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = root/'gapbs-swapio-summary.csv'
+            header = 'page_kb,limit_mb,trials,verified_trials,trial_sec_total,trials_per_sec,target_errors_delta\n'
+            (root/'memory-policy.txt').write_text('fixed-max-v1\n')
+            for phase in ('before-swapin', 'after-swapin'):
+                (root/f'memory-max-{phase}.txt').write_text(str(256*1024**2)+'\n')
+            row = {'suite': 'gapbs-bfs', 'page_kb': 64}
+            summary.write_text(header + '64,256,16,16,2.5,6.4,0\n')
+            self.assertEqual(matrix.validate_results(root, row), [])
+            summary.write_text(header + '64,256,16,15,2.5,6.4,0\n')
+            self.assertTrue(any('verified_trials' in s for s in matrix.validate_results(root, row)))
+            summary.write_text(header + '64,256,0,0,2.5,6.4,0\n')
+            self.assertTrue(any('verified_trials' in s for s in matrix.validate_results(root, row)))
+
+    def test_gapbs_hook_pauses_after_build_and_wraps_the_original_kernel(self):
+        """Compile the hook against a stub GAPBS layout and drive its protocol."""
+        if not shutil.which('g++'):
+            self.skipTest('g++ unavailable')
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory)/'src'; src.mkdir()
+            (src/'benchmark.h').write_text(r'''
+#ifndef BENCHMARK_H_
+#define BENCHMARK_H_
+#include <cstdio>
+struct CLApp { int num_trials() const { return 2; } };
+template<typename G, typename K, typename A, typename V>
+void BenchmarkKernel(const CLApp &, const G &g, K k, A, V v) {
+  for (int i = 0; i < 2; i++) { k(g); std::printf("Trial Time:          0.25\n");
+    std::printf("Verification:           %s\n", v(g) ? "PASS" : "FAIL"); }
+  std::printf("Average Time:        0.25\n");
+}
+#endif
+''')
+            (src/'bfs.cc').write_text(r'''
+#include "benchmark.h"
+struct Graph { long long num_nodes() const { return 8; } long long num_edges() const { return 12; } };
+int main() { CLApp cli; Graph g; int runs = 0;
+  BenchmarkKernel(cli, g, [&](const Graph &) { runs++; return 0; }, 0, [](const Graph &) { return true; });
+  std::printf("runs=%d\n", runs); return runs == 2 ? 0 : 3; }
+''')
+            binary = Path(directory)/'bfs'
+            subprocess.run(['g++', '-std=c++11', '-Wall', '-Werror', '-fopenmp', '-pthread', '-I', str(src),
+                            '-include', str(RDMA/'gapbs_hermit_hook.h'), '-o', str(binary), str(src/'bfs.cc')],
+                           check=True, capture_output=True)
+            proc = subprocess.Popen([str(binary)], stdout=subprocess.PIPE, text=True)
+            ready = proc.stdout.readline()
+            self.assertRegex(ready, r'^READY pid=\d+ nodes=8 edges=12$')
+            # Nothing runs until the driver signals; a stray signal must not kill it.
+            time.sleep(0.2)
+            self.assertIsNone(proc.poll())
+            proc.send_signal(signal.SIGUSR2)
+            lines = [proc.stdout.readline() for _ in range(7)]
+            self.assertEqual(lines[0], 'RUN\n')
+            self.assertEqual(sum(l.startswith('Trial Time:') for l in lines), 2)
+            self.assertEqual(sum('PASS' in l for l in lines), 2)
+            self.assertRegex(lines[-1], r'^DONE sec=\d+\.\d{6}$')
+            time.sleep(0.2)
+            self.assertIsNone(proc.poll())   # still alive: the driver snapshots the live cgroup
+            proc.send_signal(signal.SIGUSR2)
+            self.assertEqual(proc.stdout.readline(), 'runs=2\n')
+            self.assertEqual(proc.wait(timeout=10), 0)
+
     def test_default_plan_and_baseline_parameters(self):
         result = subprocess.check_output(['python3', str(RDMA/'pebs/run_workload_matrix.py'), '--dry-run'], text=True)
         data = json.loads(result)
@@ -358,14 +450,14 @@ class MatrixTests(unittest.TestCase):
         self.assertTrue(any('missing' in issue for issue in issues))
 
     def test_policy_changes_ignore_only_sampling_controls(self):
-        baseline = {'controls': {'remote_order_mask':'0x3fd', 'pebs_force_order':'0',
-                                'pebs_mode':'0', 'pebs_load_period':'1999', 'pebs_min_samples':'32'},
+        baseline = {'controls': {'remote_order_mask':'0x3fd', 'policy_swapin_max':'64',
+                                'pebs_mode':'0', 'pebs_load_period':'1999', 'pebs_predict_samples':'8'},
                     'thp': {'enabled':'[madvise]'},
                     'mglru': {'enabled':'0x0007', 'min_ttl_ms':'0'}}
         current = json.loads(json.dumps(baseline))
         current['controls'].update(pebs_mode='1', pebs_load_period='199', pebs_order_stats='sampled: 5')
         self.assertEqual(matrix.policy_changes(baseline, current), [])
-        for key in ('remote_order_mask', 'pebs_force_order', 'pebs_min_samples'):
+        for key in ('remote_order_mask', 'policy_swapin_max', 'pebs_predict_samples'):
             changed = json.loads(json.dumps(current))
             changed['controls'][key] = '7'
             self.assertEqual(len(matrix.policy_changes(baseline, changed)), 1)
@@ -401,6 +493,16 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual((large['folio_loads'], large['read_wrs'], large['read_bytes']), (2, 1, 65536))
             self.assertEqual((large['folio_fallback_4k'], large['pebs_decisions'], large['pebs_actual_swapins']), (1, 3, 2))
             self.assertEqual(large['read_byte_share'], 0.5)
+            # Current kernels keep actual sizes but no longer make folio-order decisions.
+            saved_pebs = {p: p.read_text() for p in root.glob('*.pebs')}
+            for p, text in saved_pebs.items():
+                p.write_text('\n'.join(s for s in text.splitlines() if s.startswith('actual_'))+'\n')
+            result = matrix.collect_measurement(root, row)
+            self.assertTrue(all(r['pebs_decisions'] is None for r in result['granularity']))
+            self.assertEqual([r['pebs_actual_swapins'] for r in result['granularity']
+                              if r['phase'] == 'application'], [0, 2])
+            for p, text in saved_pebs.items():
+                p.write_text(text)
             # Older kernels lack actual_order_N: missing data must not become zero.
             for p in root.glob('*.pebs'):
                 p.write_text('\n'.join(s for s in p.read_text().splitlines() if not s.startswith('actual_'))+'\n')
@@ -435,7 +537,7 @@ class ScopeTests(unittest.TestCase):
         text = (KERNEL / 'mm/hermit_pebs.c').read_text()
         self.assertIn('hermit_pebs_mm_exit', text)
         self.assertIn('hermit_pebs_get_mm', text)
-        self.assertIn('hermit_swapin_order(struct vm_fault *vmf', text)
+        self.assertIn('hermit_pebs_predict_pages(struct vm_fault *vmf', text)
         self.assertNotIn('#include <linux/memcontrol.h>', text)
         self.assertNotIn('get_mem_cgroup_from_mm', text)
         self.assertNotIn('hermit_pebs_memcg', text)
@@ -444,10 +546,9 @@ class ScopeTests(unittest.TestCase):
         page_io = (KERNEL / 'mm/page_io.c').read_text()
         self.assertNotIn('get_mem_cgroup_from_folio', page_io)
         memory = (KERNEL / 'mm/memory.c').read_text()
-        block = memory.split('PEBS policy:', 1)[1].split('#endif', 1)[0]
-        self.assertIn('hermit_swapin_order(', block)
-        self.assertIn('hermit_swapin_order(vmf, orders)', block)
-        self.assertNotIn('get_mem_cgroup_from_mm', block)
+        self.assertIn('hermit_pebs_fault(vma->vm_mm,', memory)
+        self.assertIn('hermit_pebs_account_swapin(vma->vm_mm, folio_order(folio))', memory)
+        self.assertNotIn('hermit_swapin_order(', memory)
 
     def test_pid_enable_helper_uses_syscall(self):
         helper = TOOLS / 'pebs' / 'enable_pebs_pid.py'
@@ -556,8 +657,9 @@ class MicrobenchTests(unittest.TestCase):
                                     f'0 {count} {count} {4096 * count} {4096 * count}\n')
         (path/'order_stats').write_text('order size_bytes stores loads fallback_4k errors\n'
                                       f'0 4096 {count} {count} 0 0\n')
-        (path/'pebs_order_stats').write_text('order: decisions\n'
-                                           f'0: {count}\nsampled: {count}\nlost: 0\nthrottled: 0\nunknown: 0\n')
+        (path/'pebs_order_stats').write_text(
+            f'actual_order_0: {count}\npredict_calls: {count}\n'
+            f'sampled: {count}\nlost: 0\nthrottled: 0\n')
         (path/'perf.json').write_text('{}')
         (path/'time.json').write_text(json.dumps({'end': count}))
 

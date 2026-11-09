@@ -1,6 +1,54 @@
 #+TITLE: Hermit 4 KiB 策略内核集成与 off/static/policy 应用矩阵
 #+DATE: 2026-11-01
 
+* 2026-11-09 清理旧 mTHP 选阶
+
+旧的 =hermit_swapin_order()= 成本选阶、young-bit 预读反馈、历史 order 滞回和
+专用 PTE 安装逻辑已删除。=SWAPIN= 开启时继续使用 4 KiB 预测 SG 路径；长流
+通过 =LARGE= 条件后，以及关闭 =SWAPIN= 时，均由 =alloc_swap_folio()= 选择最大
+合法 folio，并保留远端连续性检查、分配失败和 memcg charge 失败降级。
+
+PEBS 的 mm 生命周期、窗口、跨区域足迹和 =pebs_predict_regions/samples= 保留。
+删除的 debugfs 节点包括 =pebs_force_order=、=pebs_min_regions/samples=、
+=pebs_bw_mibps=、=pebs_wr_cost_ns=、=pebs_hysteresis=、=pebs_min_f=、
+=pebs_cooling_period= 和 =pebs_test_eval/offset/candidates=。
+=pebs_fixed_cost_ns= 仍被冷观察区间下限使用，保留该参数及原行为。
+
+=pebs_order_stats= 保留采样、窗口、预测原因和 =actual_order_N= 实际映射计数，
+移除旧选阶决策行及 =unknown/forced/pebs_selected/readahead_*= 等模型专用计数。
+工具继续解析历史结果；新结果缺失的旧选阶字段留空，不记作零次决策。
+QEMU 保留 =pebs_ring_test=，不再运行成本模型测试或接受 =FORCE_ORDER= 配置。
+下文各日期记录保留当时的实现背景。
+
+* 2026-11-08 MGLRU 下的流与批次修正（内核 #18–#20）
+
+实测结果见 [[file:policy-results-20261109.md][11-09 报告]]。三项修改依次进入 #18、#19、#20：
+
+- 流表组相联（#18）：=policy_stream()= 原来用 =fault_pc ^ current= 哈希到 64 个槽、每槽一个流，
+  两个线程冲突时互相清零（11-05 报告中 8 线程扫描约 1/3 的单元有 2 个线程停在 4 KiB 批次）。
+  现在是 8 组 × 8 路，组内按 线程/启动时间/PC/VMA/代次/epoch 精确匹配；缺失时先替换空闲或失效的路，
+  再替换空闲最久的流。替换一个 1 秒内仍活动的流时计入 =stream_evictions=。只有安装路径会新建流，
+  预测路径只查不建。#20 上 8 线程全扫描的 =stream_evictions= 全部为 0，GAPBS BFS 每单元约 1,000 次。
+- MGLRU refault 判定（#19）：MGLRU 下 =do_swap_page()= 在换入前读取 swap shadow，
+  =hermit_shadow_refault()= 要求 =workingset_test_recent()= 为真 *且* shadow 带 workingset 位，
+  结果存入 =vmf->hermit_refault=。#18 只看前者，MGLRU 换出后很快再读回的页几乎都被算作 refault，
+  =refault/swapin= 达到 1.0，refault 的指数平均超过 25% 阈值后预测被关掉。MGLRU 下安装路径不再查逐页 ghost 表项，
+  refault 页的保护交给 MGLRU 自己。
+- 运行长度封顶（#20）：=hermit_swapin_pages()= 把实际读入页数写入 =vmf->hermit_batch_pages=，
+  安装路径记下该批次覆盖的地址范围。流断开时 =policy_stream_break()= 把用过预测的访问段长度存入 =fit=
+  （最多 1024 页），并在访问段于批次中途结束时计入 =batch_overruns=。下一段的预测批次不超过
+  =fit= 减去当前位置（=capped_batches= 计数），段比 =fit= 长时越过后继续翻倍。
+  =hermit_policy_large()= 另要求剩余长度不少于 2 × =policy_swapin_max=，否则留在可截短的 4 KiB 批次上。
+
+=policy_stats= 在 =large_streams= 后追加 =stream_evictions=、=batch_overruns=、=capped_batches=，
+其后为 =mglru_candidates=、=mglru_sort_bypasses=。=run_workload_matrix.py= 新增按需选择的
+=anon-1t-d{50,25,6.25}-high=、=anon-1t-d{25,6.25}-low=、=anon-1t-d1p-high= 密度负载和
+=gapbs-bfs=/=gapbs-pr=（=--gapbs=、=--gapbs-scale=，默认 scale 24）；默认负载集合不变。
+=run_anon_swapout_sweep.sh= 的驻留下限改为 =MIN_RESIDENT_PCT=（默认 50%），MGLRU 下换出更积极，原下限会误判失败。
+
+#20 的主要结论：同一份代码在 MGLRU（=0x1bf=）下 GAPBS、Memcached 和分散访问都快于最佳档位的 off，
+在传统 LRU（=0xbf=）下 GAPBS BFS 慢 25%–58%、Memcached 4 KiB 档慢 39%。当前策略应以 MGLRU 为前提。
+
 * 内核路径
 
 本次将策略接入真实的 reclaim、swap fault、swapcache 和 RDMA/DRAM 后端。
@@ -40,8 +88,8 @@ memcg 工作链的 css 引用和自重排状态通过锁同步。
 Redis/YCSB/匿名扫描结果见 [[file:policy-results-20261104.md][11-04 报告]]。#16 上发现的两处问题已在内核 #17 修复：
 =LARGE= 判定改为先检查 VMA 能否分配大于 4 KiB 的 folio（=hermit_swapin_large_allowed()=）；
 =hermit_policy_observe()= 改为在建表之前排除大 folio、共享页和带 MMU notifier 的映射。
-#17 完整矩阵发现一个新问题，尚未修复：=policy_stream()= 的 64 个槽每槽只存一个流，
-两个线程哈希冲突时会互相清零，8 线程扫描约三分之一的运行中有 2 个线程始终停在 4 KiB 批次。
+#17 完整矩阵发现 =policy_stream()= 的 64 个槽每槽只存一个流，两个线程哈希冲突时会互相清零，
+8 线程扫描约三分之一的运行中有 2 个线程始终停在 4 KiB 批次。该问题已在 #18 改为组相联流表，见上文 2026-11-08 一节。
 
 - 回收排序：=shrink_folio_list()= 从链表尾取页，排序改为扫描尾部 32 页、把最优页放到尾部，每次 pass 只排一次（原来每取一页排一次、扫描的是头部）。hint 与 ghost 记录合并为一次 rmap walk。
 - 主动回收：policy 模式不再替换 =apt_reclaim= 的 headroom 和 worker 数；只有设置 =RESERVE= 位才启用小预留。
@@ -67,7 +115,8 @@ Redis/YCSB/匿名扫描结果见 [[file:policy-results-20261104.md][11-04 报告
 
 ** 新增计数
 
-=policy_stats= 保留原 7 个字段及顺序，追加 =started_epochs=、=young_epochs=、=short_epochs=、=table_evictions=、=unmapped_4k=、=sorted_lists=、=large_streams=。=pebs_order_stats= 追加 =samples_target_mm=、=samples_in_window= 和 =predict_*=（调用、无表项、区域不足、样本不足、投票不足、成功延长）。
+=policy_stats= 保留原 7 个字段及顺序，追加 =started_epochs=、=young_epochs=、=short_epochs=、=table_evictions=、=unmapped_4k=、=sorted_lists=、=large_streams=；
+#18–#20 又追加 =stream_evictions=、=batch_overruns=、=capped_batches=（见 2026-11-08 一节）。=pebs_order_stats= 追加 =samples_target_mm=、=samples_in_window= 和 =predict_*=（调用、无表项、区域不足、样本不足、投票不足、成功延长）。
 
 * 2026-11-04 MGLRU 协同
 
@@ -125,6 +174,7 @@ cat /sys/kernel/debug/hermit/policy_stats
 | MGLRU 协同 Hermit | on | policy | 0x1bf |
 
 另用 MGLRU on + policy + =0xbf= 消融 bit 8，区分 MGLRU 本身的收益与协同收益。
+内核 #20 已测第 3、4 组与各自的 off（传统 LRU 组未跑完）；bit 8 消融尚未测。
 每组至少三次，记录吞吐、p99、CPU/op、PSI、workingset_refault_anon、读写字节和实际 WR。
 不要直接把本地 DRAM/QEMU 结果当作 RDMA 性能提升。
 
@@ -153,7 +203,7 @@ MGLRU 的 generation 属于整个 folio，不能据此知道 64 KiB/2 MiB 内哪
 [[file:../../artifacts/mglru-20261104/][artifacts/mglru-20261104/]]，摘要见
 [[file:../../artifacts/mglru-20261104/smoke-result.log][smoke-result.log]]。
 该测试通过 debugfs 开启策略并使用 demand-stream 证据，没有硬件 PEBS 采样或真实 RDMA。
-尚未在 dnet 服务器启动该内核并测量吞吐/p99/CPU 收益。
+dnet-61 上的实测见 [[file:policy-results-20261109.md][11-09 报告]]（内核 #20）。
 
 * 计数语义
 
@@ -181,7 +231,7 @@ SQLite 负载：=tools/rdma/policy_app_worker.py=。
 所有不大于该档位且内核支持的匿名 THP/mTHP 尺寸均可分配，大于档位的尺寸禁用；4 KiB 档禁用 THP/mTHP。
 档位不是强制页大小，也不是 RDMA 请求上限。policy 的预测、有效性和记账仍以 4 KiB 为单位，合法的相邻选中页可以合并传输。
 例如 max4k 下也可能产生由多个独立 4 KiB 页组成的 RDMA 请求；实际 folio/WR 尺寸另行记录。
-脚本保留 remote_order_mask，不设置 pebs_force_order；后端必须支持所选上限以内的 order（全九档需要 effective_order_mask 覆盖 0x3fd）。
+脚本保留 remote_order_mask；后端必须支持所选上限以内的 order（全九档需要 effective_order_mask 覆盖 0x3fd）。
 
 默认 LOAD 采样周期 =19997 1999 199=，STORE 周期 =1500003=，采样时关闭自适应周期调整。
 每个应用/并发/内存预算/页面档位/重复形成一个块：off，以及三档周期各自的 static、policy，共 7 个单元；块内用固定种子随机排序。
@@ -199,7 +249,7 @@ prepare 生成 sort 文本和 SQLite 数据库，图文件由配置指定，不�
 校准也会运行应用；按服务器可用物理内存调整数据规模，尤其 SQLite 8 个独立数据库的总量。
 
 准备现有的 cgroup v2 memory controller、swap、远端后端和可执行程序；配置里的应用用户必须可以读取脚本、图和输入目录。
-准备好所需的后端 order mask，并保持 pebs_force_order=0。
+准备好所需的后端 order mask。
 模板 controls 中的普通 Hermit 参数在整个矩阵内保持一致，例如 bypass_swapcache、apt_reclaim；这些不随 off/static/policy 改动。
 采样控制由各单元管理，不应在 controls 中再写 pebs_mode、pebs_enabled、pebs_all 或采样周期。
 静态和策略路径使用 pebs_all=1 跟踪经过 exec 的各负载地址空间；off 不启动采样。

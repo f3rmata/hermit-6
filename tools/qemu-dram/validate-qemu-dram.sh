@@ -26,7 +26,6 @@ LAZY_POLL=${LAZY_POLL:-N}
 RECLAIM_MODE=${RECLAIM_MODE:-}
 RECLAIM_HEADROOM_PAGES=${RECLAIM_HEADROOM_PAGES:-}
 REMOTE_ORDER_MASK=${REMOTE_ORDER_MASK:-0x1}
-FORCE_ORDER=${FORCE_ORDER:-}
 THP_SIZE_KB=${THP_SIZE_KB:-0}
 MEMHOG_READY_TIMEOUT_SEC=${MEMHOG_READY_TIMEOUT_SEC:-180}
 
@@ -292,44 +291,12 @@ configure_hermit() {
         set_hermit_flag reclaim_headroom_pages $RECLAIM_HEADROOM_PAGES
     fi
     set_hermit_flag remote_order_mask $REMOTE_ORDER_MASK
-    if [ -n "$FORCE_ORDER" ]; then
-        set_hermit_flag pebs_enabled 1
-        set_hermit_flag pebs_force_order $FORCE_ORDER
-    fi
 }
 
-check_pebs_unit() {
-    pebs=/sys/kernel/debug/hermit/pebs_test_eval
-
-    if [ ! -w "\$pebs" ]; then
-        echo "PEBS_UNIT: status=unavailable"
-        return 1
-    fi
-
-    check_pattern() {
-        label=\$1
-        expected=\$2
-        words=\$3
-
-        printf '%s' "\$words" > "\$pebs"
-        decision=\$(awk -F': ' '/^decision:/ { print \$2 }' "\$pebs")
-        echo "PEBS_UNIT: label=\$label expected=\$expected decision=\$decision"
-        [ "\$decision" = "\$expected" ]
-    }
-
-    full="0xffffffffffffffff 0xffffffffffffffff 0xffffffffffffffff 0xffffffffffffffff 0xffffffffffffffff 0xffffffffffffffff 0xffffffffffffffff 0xffffffffffffffff"
-    chunk64="0xffff 0xffff 0xffff 0xffff 0xffff 0xffff 0xffff 0xffff"
-    single="0x1 0x0 0x0 0x0 0x0 0x0 0x0 0x0"
-
-    rc=0
+check_pebs_ring() {
     ring_result=\$(cat /sys/kernel/debug/hermit/pebs_ring_test)
     echo "PEBS_RING: status=\$ring_result"
-    [ "\$ring_result" = pass ] || rc=1
-    check_pattern full_scan 9 "\$full" || rc=1
-    check_pattern chunk64k 4 "\$chunk64" || rc=1
-    check_pattern single_page 0 "\$single" || rc=1
-    echo "PEBS_UNIT: status=\$([ "\$rc" -eq 0 ] && echo pass || echo fail)"
-    return "\$rc"
+    [ "\$ring_result" = pass ]
 }
 
 verify_remote_order_mask() {
@@ -397,7 +364,7 @@ fi
 mdev -s
 mount -t debugfs none /sys/kernel/debug
 
-run_step check_pebs_unit check_pebs_unit || {
+run_step check_pebs_ring check_pebs_ring || {
     echo "VALIDATION: FAIL"
     poweroff -f
 }
@@ -535,7 +502,7 @@ if [ "$THP_SIZE_KB" -gt 0 ]; then
     if ! emit_validation_check large_stores_before_gt_0 "\${LARGE_STORES_BEFORE:-0}" gt 0; then
         VALIDATION_PASS=0
     fi
-    # DRAM always copies base pages, including forced-order tests.
+    # DRAM always copies base pages, including large-folio tests.
     if ! emit_validation_check large_fallbacks_before_gt_0 "\${LARGE_FALLBACKS_BEFORE:-0}" gt 0; then
         VALIDATION_PASS=0
     fi
@@ -585,7 +552,7 @@ run_qemu() {
 
 extract_summary() {
     if [ -f "$SERIAL_LOG" ]; then
-        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|PEBS_UNIT|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
+        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
     fi
 }
 

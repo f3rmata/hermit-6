@@ -14,7 +14,8 @@
 
 ## PEBS
 
-当前设计、实测结论和操作步骤见 [PEBS 设计](../../docs/pebs/design.md)
+当前设计和操作步骤见 [策略内核集成](../../docs/pebs/kernel-policy-integration.org)。
+旧 mTHP 成本选阶和强制 order 接口已移除；[旧设计](../../docs/pebs/design.md)仅用于解释历史实验。
 
 - Memcached 采样开销：`pebs/run_memcached_sampling_cost.py`，固定并发，比较同页大小的采样开关。
 - 多负载矩阵：`pebs/run_workload_matrix.py`，默认 1323 个样本（去掉 XGBoost 为 1134），PEBS 按工作负载 pid 启用。`--pages` 表示每轮**最大分配页大小**，保留全部较小 THP 档位。
@@ -40,14 +41,21 @@ python3 tools/rdma/pebs/run_workload_matrix.py \
 
 移除 `--dry-run` 才执行负载。每轮只设置 THP 分配上限，例如 64KiB 轮允许 4/16/32/64KiB，2MiB 轮允许所有较小档位；实际分配及预取粒度由内核和 Hermit 决定。off/static/policy 和采样周期仍按原来的配对、随机顺序、重复次数运行。
 
+`--suites` 还可选两组不在默认集合中的负载：
+
+- 访问密度：`anon-1t-d50-high`、`anon-1t-d25-high`、`anon-1t-d6.25-high`（每个 2 MiB 区域访问一段连续页）、`anon-1t-d25-low`、`anon-1t-d6.25-low`（按互质步长分散）和 `anon-1t-d1p-high`（每区域 1 页），均为单线程、随机区域顺序。
+- 图负载：`gapbs-bfs`（16 次 trial）和 `gapbs-pr`（4 次 trial），8 线程，每次 trial 都验证。需要 `--gapbs` 指向 GAPBS 1.5 源码目录（默认 `~/pebs-apps-20261031/gapbs-1.5`）和 g++；`--gapbs-scale` 默认 24。`run_gapbs_page_sweep.sh` 以 `-include tools/rdma/gapbs_hermit_hook.h` 编译，建图完成后等待 SIGUSR2，降低 `memory.max` 后再开始计时。
+
+内核 #20 的测试用法和结果见 [11-09 报告](../../docs/pebs/policy-results-20261109.md)：`--periods 1999 --repeats 3`，九档上限。传统 LRU 下 GAPBS BFS 在 2048 KiB 上限、`LOCAL_RATIO_PCT=70` 时会触发 memcg OOM；`memory-events-after.txt` 早于 trial，判断 OOM 要看 `dmesg-after.txt`。
+
 Redis 及 YCSB 的 Redis 服务统一使用 `--disable-thp no`，启动完成后、装载数据前保存
 `redis-*-status-before.txt` / `server-status-before.txt`，要求 `/proc/PID/status` 的
 `THP_enabled: 1`。Redis 7.4.1 默认 `disable-thp yes`：发现顶层 THP 为 `always`
 就会通过 `PR_SET_THP_DISABLE` 禁止整个进程使用大页，使 2MiB 轮次退化为 4KiB，
-绕过 PEBS 选页；仅记录 sysfs 不能发现这种进程级限制。4KiB 轮次仍由 THP 上限
+禁止大 folio 路径；仅记录 sysfs 不能发现这种进程级限制。4KiB 轮次仍由 THP 上限
 禁止分配大页。已有的零决策校验继续保留。
 
-运行前应准备好 Hermit、RDMA 和 swap。多负载脚本保留 `remote_order_mask`、`pebs_force_order`、学习阈值以及回收/批处理参数，只记录其值；固定周期 case 设置 `pebs_adaptive=0`。启用强制 order 或后端缺少上限以内的档位会在启动检查中报错。例如完整 4KiB–2MiB 矩阵要求 `effective_order_mask` 包含 `0x3fd`，旧实验恢复的 `0x1` 不满足条件。脚本不会替换这个掩码。退出时恢复本次修改的 THP 设置及采样模式/周期/自适应开关。
+运行前应准备好 Hermit、RDMA 和 swap。多负载脚本保留 `remote_order_mask`、学习阈值以及回收/批处理参数，只记录其值；固定周期 case 设置 `pebs_adaptive=0`。后端缺少上限以内的档位会在启动检查中报错。例如完整 4KiB–2MiB 矩阵要求 `effective_order_mask` 包含 `0x3fd`，旧实验恢复的 `0x1` 不满足条件。脚本不会替换这个掩码。退出时恢复本次修改的 THP 设置及采样模式/周期/自适应开关。
 
 矩阵为保持 off/static 的直接换入条件，启动前要求 `bypass_swapcache=Y`。新内核的 policy 组使用独立的 4 KiB 预测及批次换入路径。采样量非零不能证明策略参与换页。先在空闲测试机上完成以下一次性准备，off/static/policy 全程使用相同设置：
 
@@ -57,10 +65,10 @@ printf '0x3fd\n' | sudo tee /sys/kernel/debug/hermit/remote_order_mask
 printf 'Y\n' | sudo tee /sys/kernel/debug/hermit/bypass_swapcache
 sudo cat /sys/kernel/debug/hermit/effective_order_mask \
   /sys/kernel/debug/hermit/bypass_swapcache \
-  /sys/kernel/debug/hermit/pebs_force_order /sys/kernel/debug/hermit/pebs_enabled
+  /sys/kernel/debug/hermit/pebs_enabled
 ```
 
-预期依次为 `0x3fd`、`Y`、`0`、`0`。多负载脚本不会自动改写 `bypass_swapcache`，也不会在结束时撤销上述手工准备。以下为可选的 7 次小矩阵（包含一个 4KiB-only 对照，输出目录必须不存在）：
+预期依次为 `0x3fd`、`Y`、`0`。多负载脚本不会自动改写 `bypass_swapcache`，也不会在结束时撤销上述手工准备。以下为可选的 7 次小矩阵（包含一个 4KiB-only 对照，输出目录必须不存在）：
 
 ```sh
 python3 -u tools/rdma/pebs/run_workload_matrix.py \
@@ -138,7 +146,7 @@ python3 -m pytest tools/rdma/tests -q
 ```
 
 - `test_kernel_paths.py`：提取生产源码并编译宿主机 C harness，覆盖 RDMA 提交边界、失败排空、远端读取错误、换入分配回退和最大粒度换出。
-- `test_pebs_policy.py`：执行生产窗口、fault-PC 足迹表和代价模型，验证时间边界、跨区域学习、隔离、淘汰和失效。
+- `test_pebs_policy.py`：执行生产窗口、fault-PC 足迹表和 4 KiB 预测，验证时间边界、跨区域学习、隔离、淘汰和失效。
 - `test_pebs.py`：PEBS 作用域、mm 生命周期、Memcached 开销、THP、矩阵驱动、page-selection 微基准与绘图流程。
 
 QEMU 构建及回归仍位于 [tools/qemu-dram](../qemu-dram/)，其临时输出位于 `_work/`。

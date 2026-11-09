@@ -21,12 +21,18 @@ Linux 源码树内的 RDMA core。
 - 运行时 order 位图和逐 order store/load/fallback/error 统计；
 - 可选 memcg 集成：接近 =memory.max= 时的定向异步回收（=CONFIG_MEMCG=y= 时启用）；
 - QEMU DRAM checksum、vmstat、backend 计数和本地 swap 写扇区验证；
-- PEBS 页面大小策略（=mm/hermit_pebs.c=）：Intel PEBS 采样 + 2 MiB region
-  热度表 + 代价模型，在 swap-out/swap-in 路径按访问局部性自动选择传输
-  folio 粒度（syscall 473/474、debugfs =pebs_all= / =pebs_*=）。PEBS 历史
-  归属 =mm=，不依赖 cgroup；详见 =docs/pebs/design.md=。
+- PEBS 足迹预测（=mm/hermit_pebs.c=）：Intel PEBS 采样 + 2 MiB region
+  窗口，为 4 KiB 换入预测提供跨区域证据；=mm/hermit_policy.c= 管理连续流、
+  SG 批次和回收协同，长连续流使用最大合法大 folio。旧 mTHP 选阶模型已删除。
+  PEBS 历史归属 =mm=，不依赖 cgroup；接口为 syscall 473/474 和 debugfs
+  =pebs_all= / =pebs_*=，详见 =docs/pebs/kernel-policy-integration.org=；
+  当前策略以 MGLRU 为前提，最新实测见 =docs/pebs/policy-results-20261109.md=。
 
 详细迁移记录见 =docs/migration-6.18.md=。更早的 6.6/6.15 适配文档已删除。
+
+近期论文与当前策略的对照见
+[[file:docs/research/recent-pebs-mthp-literature-review-20261109.md][PEBS、mTHP 与远程内存：Zotero 全库文献对照]]，
+覆盖 Zotero 所有分类及未分类条目，并结合 11 月 9 日实验分析。
 
 * 目录
 
@@ -296,9 +302,9 @@ base-page submit 失败会在原请求完成后统一重试 4 KiB 路径。
 
 * PEBS 修复与观测
 
-常规回收在 =try_to_unmap()= 前调用 =hermit_swapout_order()=，在 anon_vma
-读锁内查询区域策略，随后通过调用参数把 order 传到写出路径。无有效样本时
-回退静态 mask，最终传输仍受 backend 能力约束。
+常规回收在 =try_to_unmap()= 前调用 =hermit_swapout_order()=，按原 folio 和
+backend 能力选择最大写出分片，通过调用参数把 order 传到写出路径。
+换出分片不查询 PEBS 预测。
 
 RDMA backend 支持中间 order 分段：2 MiB folio 选择 order 4 时发送 32 个
 64 KiB WR；任一分段失败后排空请求，再按 4 KiB 重试整个 folio。
@@ -306,7 +312,8 @@ RDMA backend 支持中间 order 分段：2 MiB folio 选择 order 4 时发送 32
 读写请求数及字节数（包括重试）；=order_stats= 仍按原始 folio order 记账。
 DRAM 始终按 base page 复制，大 folio 始终计入 =fallback_4k=。
 
-=pebs_test_eval= 与生产路径复用决策函数；=pebs_ring_test= 验证跨页、回绕
-读取以及 perf buffer 创建/销毁。QEMU 功能通过不能代替真实 PEBS 采样与
+=pebs_ring_test= 验证跨页、回绕读取以及 perf buffer 创建/销毁；窗口、历史和
+4 KiB 预测通过 =tools/rdma/tests/test_pebs_policy.py= 执行生产代码验证。
+QEMU 功能通过不能代替真实 PEBS 采样与
 RDMA 性能验证。已有 remote-only 标记但 backend 不可用时，读取返回错误，
 不会读取本地无效副本。

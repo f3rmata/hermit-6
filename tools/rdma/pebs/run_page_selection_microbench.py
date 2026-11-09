@@ -26,7 +26,7 @@ SCENARIOS = {'sparse': [1], 'density16': [16], 'density64': [64],
 CASES = {'fixed-4k': (4, None), 'fixed-64k': (64, None),
          'fixed-512k': (512, None), 'fixed-2048k': (2048, None),
          'all-off': (None, None), 'sample-only': (None, 0), 'dynamic': (None, 1)}
-CONTROLS = {'pebs_force_order': 0, 'pebs_adaptive': 0,
+CONTROLS = {'pebs_adaptive': 0,
             'reclaim_mode': 1, 'reclaim_headroom_pages': 16384, 'sthd_cnt': 4,
             'bypass_swapcache': 'Y', 'speculative_io': 'Y', 'lazy_poll': 'N',
             'apt_reclaim': 'Y'}
@@ -251,8 +251,9 @@ def main():
                     if (D/k).exists()},
                 'sources_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()},
                 'policy_tunables': {p.name: read(p).strip() for p in D.glob('pebs_*')
-                                    if p.name in ['pebs_fixed_cost_ns', 'pebs_bw_mibps', 'pebs_min_f',
-                                                  'pebs_hysteresis', 'pebs_cooling_period', 'pebs_region_max']}}
+                                    if p.name in ['pebs_fixed_cost_ns', 'pebs_region_max', 'pebs_pc_max',
+                                                  'pebs_window_ms', 'pebs_history_ms',
+                                                  'pebs_predict_regions', 'pebs_predict_samples']}}
     dump(out/'manifest.json', manifest)
     write(out/'lscpu.txt', subprocess.check_output(['lscpu', '-e'], text=True))
     write(out/'status', 'running')

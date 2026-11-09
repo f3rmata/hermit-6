@@ -180,7 +180,7 @@ def deltas(before, after):
         return {k: int(v) for k, v in re.findall(r'^\s*(\w+): (\d+)$',
                                                 read(p/'pebs_order_stats'), re.M)}
     a, b = pebs(before), pebs(after)
-    if not {'sampled', 'lost', 'throttled', 'unknown'} <= a.keys() or a.keys() != b.keys():
+    if not {'sampled', 'lost', 'throttled'} <= a.keys() or a.keys() != b.keys():
         raise ValueError('Missing PEBS counters')
     result['pebs'] = {k: b[k] - a[k] for k in a}
     if min(result['pebs'].values()) < 0:

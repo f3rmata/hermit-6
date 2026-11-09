@@ -42,13 +42,28 @@ SUITES = {
     'ycsb': ('run_ycsb_page_sweep.sh', dict(BENCH_CPUS='8-15', SERVER_CPUS='0-7')),
     'xgboost': ('run_xgboost_page_sweep.sh', dict(BENCH_CPU='0-3')),
 }
-CONTROLS = '''remote_order_mask pebs_mode pebs_force_order pebs_adaptive pebs_load_period
+# Opt-in suites; the default plan stays the original seven.
+DEFAULT_SUITES = list(SUITES)
+# Access-density sweep: one thread, regions visited in random order, a fixed
+# share of each 2 MiB region touched either as one contiguous run (high) or
+# scattered with a coprime stride (low). Each suite is exactly one
+# ratio/order/locality combination so the driver writes one summary row.
+for _ratio, _locality in [('50', 'high'), ('25', 'high'), ('25', 'low'),
+                          ('6.25', 'high'), ('6.25', 'low'), ('1p', 'high')]:
+    SUITES[f'anon-1t-d{_ratio}-{_locality}'] = ('run_anon_swapout_sweep.sh', dict(
+        BENCH_THREADS=1, BENCH_CPUS='0', ACCESS_RATIOS=_ratio,
+        ACCESS_ORDERS='random', ACCESS_LOCALITIES=_locality))
+# Graph kernels on a synthetic Kronecker graph; every trial is verified.
+SUITES['gapbs-bfs'] = ('run_gapbs_page_sweep.sh', dict(GAPBS_KERNEL='bfs', GAPBS_TRIALS=16,
+                                                       GAPBS_THREADS=8, BENCH_CPUS='0-7'))
+SUITES['gapbs-pr'] = ('run_gapbs_page_sweep.sh', dict(GAPBS_KERNEL='pr', GAPBS_TRIALS=4,
+                                                      GAPBS_THREADS=8, BENCH_CPUS='0-7'))
+CONTROLS = '''remote_order_mask pebs_mode pebs_adaptive pebs_load_period
 pebs_store_period apt_reclaim batch_account batch_io batch_swapout batch_tlb
 bypass_swapcache lazy_poll reclaim_headroom_pages reclaim_mode speculative_io
 speculative_lock sthd_cnt vaddr_swapout exclusive_swapout swap_thread prefetch_thread'''.split()
 CONTROLS += '''effective_order_mask pebs_all pebs_window_ms pebs_history_ms
-pebs_min_regions pebs_min_samples pebs_pc_max pebs_wr_cost_ns pebs_fixed_cost_ns
-pebs_bw_mibps pebs_min_f pebs_hysteresis pebs_cooling_period pebs_region_max
+pebs_pc_max pebs_fixed_cost_ns pebs_region_max
 policy_features policy_cold_us policy_cold_epochs policy_pages_max policy_swapin_max
 pebs_predict_regions pebs_predict_samples'''.split()
 
@@ -87,7 +102,7 @@ def save_json(path, value):
 
 def snapshot_sources(destination):
     """Keep relative imports usable when running the archived workload scripts."""
-    paths = [p for p in RDMA.iterdir() if p.suffix in ('.sh', '.py', '.c')]
+    paths = [p for p in RDMA.iterdir() if p.suffix in ('.sh', '.py', '.c', '.h')]
     paths += [Path(__file__).resolve(), RDMA/'pebs/enable_pebs_pid.py',
               RDMA/'pebs/page_selection_metrics.py', RDMA/'pebs/matrix_metrics.py']
     for path in paths:
@@ -198,6 +213,8 @@ def environment(args):
         XGB_DATA_FILE=args.higgs, XGB_DATA_FORMAT='csv', XGB_NTHREAD=4, XGB_ROUNDS=30,
         XGB_EXPECTED_METRIC_MIN=0.80, XGB_EXPECTED_METRIC_MAX=0.85,
     ).items()})
+    if any(s.startswith('gapbs-') for s in getattr(args, 'suites', ())):
+        env.update(GAPBS_DIR=str(args.gapbs), GAPBS_SCALE=str(args.gapbs_scale), GAPBS_DEGREE='16')
     return env
 
 
@@ -236,6 +253,10 @@ def validate_results(folder, row):
     if row['suite'] == 'ycsb':
         for key in ('read_ops', 'read_ok'):
             if float(record[key]) != 8192: issues.append(f'{key}={record[key]}, expected 8192')
+    if row['suite'].startswith('gapbs-'):
+        trials, verified = record.get('trials', ''), record.get('verified_trials', '')
+        if not trials.isdigit() or int(trials) < 1 or verified != trials:
+            issues.append(f'verified_trials={verified} of trials={trials}')
     # Check every order, not just the requested folio order.
     for before in folder.rglob('order-before*.txt'):
         after = before.with_name(before.name.replace('before','after',1))
@@ -275,6 +296,8 @@ def collect_measurement(folder, row):
         metric, unit, duration = 'get_qps', 'GET/s', 'bench_sec'
     elif suite == 'ycsb':
         metric, unit, duration = 'throughput_ops', 'ops/s', 'run_sec'
+    elif suite.startswith('gapbs-'):
+        metric, unit, duration = 'trials_per_sec', 'trials/s', 'trial_sec_total'
     else:
         metric, unit, duration = 'rounds_per_sec', 'rounds/s', 'train_sec'
     seconds = float(record[duration])
@@ -353,7 +376,8 @@ def append_csv(path, rows):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output', type=Path, default=RDMA/'results'/'pebs'/time.strftime('%Y%m%d-%H%M%S-workloads'))
-    ap.add_argument('--suites', nargs='+', choices=SUITES, default=list(SUITES))
+    ap.add_argument('--suites', nargs='+', choices=SUITES, default=DEFAULT_SUITES,
+                    help='default: the original seven; access-density (anon-1t-d*) and gapbs-* suites are opt-in')
     ap.add_argument('--pages', nargs='+', type=int, choices=[4,16,32,64,128,256,512,1024,2048],
                     default=[4,16,32,64,128,256,512,1024,2048],
                     help='maximum allocation sizes in KiB; smaller orders stay eligible; always includes a 4KiB/off reference')
@@ -366,10 +390,14 @@ def main():
     ap.add_argument('--ycsb', default=str(Path.home()/'ycsb-0.17.0/bin/ycsb'))
     ap.add_argument('--higgs', default=str(RDMA/'data/HIGGS.csv/HIGGS.csv'))
     ap.add_argument('--port', type=int, default=6399)
+    ap.add_argument('--gapbs', default=str(Path.home()/'pebs-apps-20261031/gapbs-1.5'),
+                    help='GAPBS checkout (src/ is compiled with gapbs_hermit_hook.h)')
+    ap.add_argument('--gapbs-scale', type=int, default=24, help='Kronecker graph scale (2^scale vertices)')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
     if min(args.periods+[args.store_period,args.repeats,args.timeout]) < 1:
         ap.error('periods, repeats and timeout must be positive')
+    if not 10 <= args.gapbs_scale <= 30: ap.error('--gapbs-scale must be in [10, 30]')
     for values in (args.periods, args.suites, args.pages):
         if len(set(values)) != len(values): ap.error('duplicate selections are not allowed')
     rows, env = plan(args), environment(args)
@@ -384,11 +412,9 @@ def main():
     command(['sudo','-n','true'])
     lock = open(f'/tmp/hermit-pebs-workloads-{os.getuid()}.lock', 'w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    for key in CONTROLS[:6]+['pebs_enabled','pebs_order_stats','order_stats']:
+    for key in ['remote_order_mask', *SAMPLING_CONTROLS, 'pebs_enabled', 'pebs_order_stats', 'order_stats']:
         read(DEBUG/key)
     if read(DEBUG/'pebs_enabled') != '0': ap.error('an existing PEBS session is active')
-    if int(read(DEBUG/'pebs_force_order'), 0):
-        ap.error('pebs_force_order is active; disable the forced-order experiment before observing policy')
     try:
         validate_backend_orders(max(args.pages), int(read(DEBUG/'effective_order_mask'), 0))
         validate_swapin_path(read(DEBUG/'bypass_swapcache'))
@@ -407,6 +433,10 @@ def main():
         if not os.access(args.redis,os.X_OK): ap.error(f'missing executable {args.redis}')
         with socket.socket() as sock: sock.bind(('127.0.0.1',args.port))
     if 'ycsb' in args.suites and not os.access(args.ycsb,os.X_OK): ap.error(f'missing executable {args.ycsb}')
+    if any(s.startswith('gapbs-') for s in args.suites):
+        for name in ('bfs.cc', 'pr.cc', 'benchmark.h'):
+            if not (Path(args.gapbs)/'src'/name).is_file(): ap.error(f'missing GAPBS source: {Path(args.gapbs)/"src"/name}')
+        if not shutil.which('g++'): ap.error('missing g++ for the GAPBS build')
     if 'xgboost' in args.suites:
         if not Path(args.higgs).is_file(): ap.error(f'missing HIGGS CSV: {args.higgs}')
         try:

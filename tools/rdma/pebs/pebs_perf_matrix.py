@@ -55,7 +55,7 @@ def collect_final_stats(port, run, server):
 
 def capture(folder, cg, pid):
     folder.mkdir()
-    for f in ['order_stats','pebs_order_stats','remote_order_mask','effective_order_mask','pebs_mode','pebs_force_order','pebs_enabled']:
+    for f in ['order_stats','pebs_order_stats','remote_order_mask','effective_order_mask','pebs_mode','pebs_enabled']:
         (folder/f).write_text(read(D/f))
     if (D/'policy_stats').exists():
         (folder/'policy_stats').write_text(read(D/'policy_stats'))
@@ -306,7 +306,7 @@ def main():
     if not Path('/sys/module/rswap_client').exists(): ap.error('RDMA backend is not loaded')
     if len(read('/proc/swaps').splitlines())<2: ap.error('no active swap device')
     if not Path('/sys/module/rswap_client/parameters/wr_stats').exists(): ap.error('loaded backend lacks RDMA WR counters')
-    controls=['remote_order_mask','pebs_mode','pebs_force_order','reclaim_mode','reclaim_headroom_pages','sthd_cnt','bypass_swapcache','speculative_io','lazy_poll','apt_reclaim']
+    controls=['remote_order_mask','pebs_mode','reclaim_mode','reclaim_headroom_pages','sthd_cnt','bypass_swapcache','speculative_io','lazy_poll','apt_reclaim']
     if (D/'reclaim_stop_headroom_pages').exists(): controls+=['reclaim_stop_headroom_pages']
     fixed=all((D/f).exists() for f in ['pebs_adaptive','pebs_load_period','pebs_store_period'])
     if args.require_fixed and not fixed: ap.error('running kernel has no fixed-period controls; install the patched kernel first')
@@ -319,7 +319,6 @@ def main():
     thp_control=Path('/sys/kernel/mm/transparent_hugepage/enabled')
     thp_saved={str(p):re.search(r'\[([^]]+)\]',read(p))[1] for p in thp_control.parent.rglob('enabled')}
     thp_before=re.search(r'\[([^]]+)\]',read(thp_control))[1]
-    if int(saved['pebs_force_order'], 0): ap.error('disable pebs_force_order before running')
     if args.pages:
         required = ((1 << (max(args.pages) // 4).bit_length()) - 1) & ~2
         if int(read(D/'effective_order_mask').strip(), 0) & required != required:
@@ -362,7 +361,7 @@ def main():
               'server_cpus':server_cpus,'client_cpus':client_cpus,'fixed_controls_available':fixed,
               'records':args.records,'valuesize':1024,'memory_high':args.memory_mb*1024**2,'memory_max':max(2048,args.memory_mb)*1024**2,'sampling':'no NumaMMa'}
     manifest['connection_limits']=connection_limits
-    manifest['policy_tunables']={k:read(D/k).strip() for k in ['pebs_fixed_cost_ns','pebs_bw_mibps','pebs_min_f','pebs_hysteresis','pebs_cooling_period','pebs_region_max']}
+    manifest['policy_tunables']={k:read(D/k).strip() for k in ['pebs_fixed_cost_ns','pebs_region_max','pebs_pc_max','pebs_window_ms','pebs_history_ms','pebs_predict_regions','pebs_predict_samples']}
     (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
     for command,name in [(['lscpu','-e'],'cpu-topology.txt'),(['uname','-a'],'uname.txt')]:
         (out/name).write_text(subprocess.check_output(command,text=True))
@@ -427,7 +426,6 @@ def main():
             write(cg/'memory.max',max(2048,args.memory_mb)*1024**2);write(cg/'memory.swap.max','max')
             if read(D/'remote_order_mask').strip() != saved['remote_order_mask']:
                 raise RuntimeError('External backend mask change detected')
-            write(D/'pebs_force_order',0)
             if mode is not None: write(D/'pebs_mode',mode)
             if fixed:
                 write(D/'pebs_adaptive',int(mode is not None and period is None));write(D/'pebs_load_period',period or 0);write(D/'pebs_store_period',1500003 if period else 0)
@@ -474,7 +472,7 @@ def main():
                  'baseline_role':cell['baseline_role'],**latency(read(run/'measure.log'))}
             row['duration_seconds']=float(read(run/'after/time'))-float(read(run/'before/time'))
             dt=float(read(run/'after/time'))-float(read(run/'before/time'))
-            for counter in ['sampled','lost','throttled','unknown']:
+            for counter in ['sampled','lost','throttled']:
                 values=[]
                 for tag in ['before','after']:
                     m=re.search(r'^'+counter+r': (\d+)$',read(run/tag/'pebs_order_stats'),re.M)
@@ -536,8 +534,8 @@ def main():
                 vals=[]
                 for tag in ['before','after']:
                     match=re.search(r'^\s*'+str(order_idx)+r': (\d+)$',read(run/tag/'pebs_order_stats'),re.M)
-                    vals.append(int(match[1]) if match else 0)
-                row[f'decisions_order{order_idx}']=vals[1]-vals[0]
+                    vals.append(int(match[1]) if match else None)
+                row[f'decisions_order{order_idx}']=vals[1]-vals[0] if None not in vals else None
             busy_before=0
             for tag in ['before','after']:
                 vals=list(map(int,read(run/tag/'system-stat').splitlines()[0].split()[1:]))
@@ -546,8 +544,11 @@ def main():
                 else:row['system_busy_cpu_seconds']=(busy-busy_before)/os.sysconf('SC_CLK_TCK')
             row['memcached_evictions']=int(re.search(r'STAT evictions (\d+)',read(run/'memcached.stats'))[1])
             row['workload_valid']=int(not any(row[k] for k in ['oom_kill_total','order_errors_delta','memcached_evictions','miss_pct','skipped_pct']))
+            # Legacy kernels reported order decisions; current policy activity
+            # comes from policy_stats and batch WRs, with missing fields left empty.
+            decisions=[row[f'decisions_order{i}'] for i in range(10)]
             activity,policy_issues=policy_activity(mode, (max_page_kb or 2048) if row['read_wrs']+row['write_wrs'] else 4,
-                sum(row[f'decisions_order{i}'] for i in range(10)),policy,wrs)
+                sum(decisions) if None not in decisions else None,policy,wrs)
             (run/'policy-activity.json').write_text(json.dumps(activity | {'validation_issues':policy_issues},indent=2)+'\n')
             row['valid']=row['workload_valid']*row['page_settings_unchanged']*int(mode is None or row['sampled_delta']>0)*int(not policy_issues)
             row['sampling_effective']=int(mode is not None and row['sampled_delta']>0)
