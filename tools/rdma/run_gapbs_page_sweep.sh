@@ -200,7 +200,6 @@ for kb in $PAGE_SIZES_KB; do
     snapshot_sweep_stats "$before"
     pswpout_before=$(read_vmstat_key pswpout)
     oom_before=$(memory_event oom_kill)
-    start_ns=$(date +%s%N)
     sudo_write "$((limit_mb * 1024 * 1024))" "$CGROUP/memory.max"
     wait_for_stores_quiet "$(date +%s%N)"
     snapshot_sweep_stats "$after"

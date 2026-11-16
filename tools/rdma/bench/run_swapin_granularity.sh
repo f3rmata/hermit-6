@@ -89,7 +89,10 @@ validate_sweep_host
 save_thp_state
 
 compile_bench() {
-  local source="$SCRIPT_DIR/swapin_granularity.c" target="${TMPDIR:-/tmp}/hermit-swapin-granularity-$(id -u)"
+  local source="$SCRIPT_DIR/swapin_granularity.c"
+  local target
+
+  target="${TMPDIR:-/tmp}/hermit-swapin-granularity-$(id -u)"
   if [ -n "$bin" ] && [ -x "$bin" ]; then
     return 0
   fi
