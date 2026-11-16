@@ -62,6 +62,8 @@ policy_mask_of() {
     no-pebs) printf '0x1bd' ;;
     no-batch) printf '0x19f' ;;
     medium-on) printf '0x3bf' ;;
+    fitstart-on) printf '0x5bf' ;;
+    ptebatch-on) printf '0x9bf' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -70,8 +72,8 @@ valid_policy_mask() {
   [[ "$1" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] || return 1
   local value
   value=$(( $1 ))
-  # Bits 0..9 exist; 0x400 is the next free bit.
-  [ "$value" -ge 0 ] && [ "$value" -le 1023 ]
+  # Bits 0..11 exist; 0x1000 is the next free bit.
+  [ "$value" -ge 0 ] && [ "$value" -le 4095 ]
 }
 
 # Per-order swap-in cost table (debugfs swapin_cost_stats). Rows are

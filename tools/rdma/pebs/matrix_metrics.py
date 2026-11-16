@@ -17,10 +17,12 @@ POLICY_MASKS = {
     'no-pebs': 0x1bd,   # PEBS footprint vote removed
     'no-batch': 0x19f,  # SG writeout of cold dirty pages removed
     'medium-on': 0x3bf,  # default + MEDIUM (fit-driven 16-64 KiB swap-in orders)
+    'fitstart-on': 0x5bf,  # default + FITSTART (fit-sized first batch of a segment)
+    'ptebatch-on': 0x9bf,  # default + PTEBATCH (map the pages a batch read ahead)
 }
 DEFAULT_POLICY_MASK = POLICY_MASKS['default']
-# Bits 0..9 exist; 0x400 is the next free bit.
-POLICY_MASK_MAX = 0x3ff
+# Bits 0..11 exist; 0x1000 is the next free bit.
+POLICY_MASK_MAX = 0xfff
 
 
 def policy_mask(value):

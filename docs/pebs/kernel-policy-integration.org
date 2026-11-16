@@ -484,3 +484,61 @@ extent 内一段对齐子区间的远端偏移同样连续，因此无需改动�
 K 段后 order 4；长度交替 → 不建议；6 页段 → 只允许 order 2，不越读；默认掩码关闭
 → 不建议；misaligned/fragmented extent → 4 KiB SG），以及 =alloc_swap_folio()=
 的 hint 裁剪、跳过 PTE 扫描、无直接回收位和 fallback 计数。
+
+* 2026-11-18 阶段 C：fit 起始批次 + 批次 PTE 安装
+
+阶段 B 之后换入已是 16–64 KiB 的 folio，但 4 KiB SG 批次仍有两个代价：每段开头都要
+从 1 页重新爬坡（1→2→4→…），以及预取到的每页仍要各自走一次 minor fault 才能映射。
+本阶段新增两个 bit，默认都关闭，=policy_features= 默认值仍是 =0x1bf=。
+
+** bit 10 (=0x400=) =FITSTART=
+
+=hermit_policy_predict()= 在 =run == 0=（段开头：新段的第一页，或刚装完一页之后）
+且流满足 =fit >= 2=、=fit_stable >= policy_fitstart_stable= 时，直接用
+=nr = min(fit - pos, policy_swapin_limit())= 起始，而不是 1 页；=pos= 与
+=policy_medium_order()= 相同（连续运行是 =sequential + 1=，否则 0）。因此永不越过
+学到的段长。不稳定或未学到长度时仍是原来的倍增。计数：=fitstart_batches=、
+=fitstart_pages=（含 demand page，故 =fitstart_pages - fitstart_batches= 是预取页数）。
+
+** bit 11 (=0x800=) =PTEBATCH=
+
+SG 批次读完、demand page 的 PTE 装好后，=do_swap_page()= 在同一次 PTE 锁内为批次里
+仍有效的预取页装 PTE（=hermit_batch_ptes()=），于是应用不再为每页各吃一次 minor
+fault。逐页复刻 =do_swap_page()= 的 swapcache 命中路径：
+
+- 门控（=hermit_policy_pte_install()=）：只在该批次整体落在已确认的段内时安装
+  （=pos + pages <= fit=，且 =fit_stable >= policy_fitstart_stable=）。越过 fit 的
+  投机预取保持 swap entry，照常缺页，让下一次运行能得到纠正。=uffd= 与
+  =FAULT_FLAG_VMA_LOCK= 下不安装。
+- 逐页重验：当前 PTE 必须仍等于批次规划时的 =pte_move_swp_offset(swap_pte, i)=
+  （偏移连续的同一 swap 条目，标志位不变）；folio 必须仍在 swapcache、=uptodate=、
+  order 0、anon、非 KSM；=folio_trylock= 成功（PTE 锁下只 trylock，绝不睡眠）。
+  任一条不满足即停止，剩余页计 =ptebatch_skipped=，已装的计 =ptebatch_installed=。
+- 安装语义完全同 =do_swap_page()=：=arch_swap_restore()=、=swap_free()=、
+  =should_try_to_free_swap()/folio_free_swap()=、=MM_ANONPAGES +1 / MM_SWAPENTS -1=、
+  =mk_pte()= + soft-dirty/uffd-wp、独占标记（=pte_swp_exclusive()= 或
+  =folio_ref_count() == 1=，受 =SWP_STABLE_WRITES= 约束）、=mkdir= 写入位、
+  =folio_add_anon_rmap_pte()=、=set_ptes()=。与旧 =hermit_set_swapin_ptes()=（见
+  =cccf12df09^= / =bce9c57631=）的区别：这里 PTE 是 **young**（旧代码置 old，
+  之后被回收惩罚），并且不重写已存在的 PTE。
+- 记账一致：=hermit_policy_installed()= 按 =1 + 已装预取页= 调用，等价于 N 页 folio
+  安装，=sequential/batch_start,end= 与逐页 minor fault 的结果相同。
+
+** 新增接口
+
+- tunable（debugfs，0600）：=policy_fitstart_stable=（默认 3，clamp 1..8），同时作为
+  FITSTART 与 PTEBATCH 的置信度门限。
+- =policy_stats= 追加：=fitstart_batches=、=fitstart_pages=、=ptebatch_installed=、
+  =ptebatch_skipped=。
+- 消融预设：=fitstart-on= = =0x5bf=、=ptebatch-on= = =0x9bf=（=matrix_metrics.py= 与
+  =sweep_common.sh= 同步；合法掩码上限升到 =0xfff=）。
+
+注意：PTEBATCH 生效时这些页不再缺页，=swapin_cost_stats= 的 =prefetch_hit_faults=
+会因此下降，这不是预取失效；请对照 =ptebatch_installed= 读数。
+
+测试：=test_kernel_paths.py= 新增两段重放——（1）32 页段的端到端重放：前 3 段仍是
+倍增（>2 次缺页），第 4 段起每段 1 次缺页，关闭 bit 后爬坡恢复，长度交替时永不
+触发；（2）=hermit_batch_ptes()= 的生产代码重放：happy path（present/young/writable、
+swap_free、rmap、mm 计数、引用转移）、PTE 变化、VMA/PMD 边界、非 uptodate、不在
+swapcache、order>0、KSM、trylock 失败、门控/uffd/VMA-lock/batch<2 的跳过，以及
+soft-dirty/uffd-wp 标记和 SWP_STABLE_WRITES 的独占降级。

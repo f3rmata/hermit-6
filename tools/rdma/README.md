@@ -24,7 +24,9 @@
 - 换入粒度微基准：`bench/run_swapin_granularity.sh`，逐 trial 报告 S 页段的墙钟、缺页和校验，逐单元差分 `swapin_cost_stats`；`--policy-features` 接受 `off` 及消融预设。
 
 两个矩阵入口都支持 `--policy-features`：给 policy 单元指定 `policy_features` 消融预设
-`default`（`0x1bf`）、`no-pebs`（`0x1bd`）、`no-batch`（`0x19f`）或原始掩码。
+`default`（`0x1bf`）、`no-pebs`（`0x1bd`）、`no-batch`（`0x19f`）、
+`medium-on`（`0x3bf`）、`fitstart-on`（`0x5bf`）、`ptebatch-on`（`0x9bf`）或原始掩码
+（上限 `0xfff`）。
 预设在同一矩阵内各自成为一个带标签的 case，与同一块的 `off`/`static` 共享 baseline；
 不传该参数时保持原行为（不改写 `policy_features`）。详见
 [策略内核集成](../../docs/pebs/kernel-policy-integration.org)。

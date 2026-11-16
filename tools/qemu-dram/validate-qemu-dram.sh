@@ -345,6 +345,57 @@ configure_swapin_cost() {
     [ "\$enabled" = 1 ] && [ "\$keys" -eq 20 ] && [ "\$prefetch" -eq 3 ]
 }
 
+# Phase C fit-sized first batches and batch PTE install: both bits are off in
+# the default mask. Turn them on for the whole run, together with the policy
+# mode they belong to (pebs_enabled/pebs_all/pebs_mode), so the SG batch and its
+# PTE installs run against real swap-ins instead of the native path. The
+# confidence threshold is lowered because the smoke only has a few hundred
+# sequential runs. The DRAM backend is order-0, so the 4 KiB SG batch is the
+# path under test here.
+configure_policy_ptebatch() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    features=/sys/kernel/debug/hermit/policy_features
+    stable=/sys/kernel/debug/hermit/policy_fitstart_stable
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$features" ] || [ ! -r "\$stable" ]; then
+        echo "POLICY_PTEBATCH: status=unavailable"
+        return 0
+    fi
+    mask=\$(cat "\$features")
+    rows=\$(grep -c '^fitstart_batches \|^fitstart_pages \|^ptebatch_installed \|^ptebatch_skipped ' "\$stats")
+    # The policy only runs in =policy= mode for mms selected by pebs_all or the
+    # per-pid interface; the swap-in batch these bits extend is policy-only.
+    printf '%s' 1 > /sys/kernel/debug/hermit/pebs_enabled || return 1
+    printf '%s' 1 > /sys/kernel/debug/hermit/pebs_all || return 1
+    printf '%s' 1 > /sys/kernel/debug/hermit/pebs_mode || return 1
+    printf '%s' "\$((mask | 0xc00))" > "\$features" || return 1
+    printf '%s' 1 > "\$stable" || return 1
+    after=\$(cat "\$features")
+    count=\$(awk '\$1 == "ptebatch_installed" { print \$2 }' "\$stats")
+    skip=\$(awk '\$1 == "ptebatch_skipped" { print \$2 }' "\$stats")
+    echo "POLICY_PTEBATCH: status=checked before=\$mask after=\$after rows=\$rows stable=\$(cat "\$stable") mode=\$(cat /sys/kernel/debug/hermit/pebs_mode) enabled=\$(cat /sys/kernel/debug/hermit/pebs_enabled) installed=\$count skipped=\$skip"
+    [ "\$rows" -eq 4 ] && [ "\$((after & 0xc00))" -eq 3072 ] &&
+        [ "\$(cat /sys/kernel/debug/hermit/pebs_mode)" -eq 1 ]
+}
+
+# Appended Phase C counters after the reload: how many batches started at the
+# learned length and how many prefetched pages became PTEs instead of faults.
+dump_policy_ptebatch() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    label=\${1:-after_reload}
+
+    [ -r "\$stats" ] || return 0
+    batches=\$(awk '\$1 == "fitstart_batches" { print \$2 }' "\$stats")
+    pages=\$(awk '\$1 == "fitstart_pages" { print \$2 }' "\$stats")
+    installed=\$(awk '\$1 == "ptebatch_installed" { print \$2 }' "\$stats")
+    skipped=\$(awk '\$1 == "ptebatch_skipped" { print \$2 }' "\$stats")
+    predicted=\$(awk '\$1 == "predicted_4k" { print \$2 }' "\$stats")
+    refault=\$(awk '\$1 == "refault_4k" { print \$2 }' "\$stats")
+    capped=\$(awk '\$1 == "capped_batches" { print \$2 }' "\$stats")
+    evictions=\$(awk '\$1 == "stream_evictions" { print \$2 }' "\$stats")
+    echo "POLICY_PTEBATCH: label=\$label batches=\$batches pages=\$pages installed=\$installed skipped=\$skipped predicted=\$predicted refault=\$refault capped=\$capped stream_evictions=\$evictions"
+}
+
 # Phase B fit-driven medium orders: the ablation bit is off in the default mask,
 # both tunables exist, and policy_stats carries the appended fields. The DRAM
 # backend is order-0 only, so the bit is left off and no medium read is expected.
@@ -427,6 +478,7 @@ run_step load_rswap_client insmod /rswap-client.ko rmsize=$RSWAP_MEM_GB $RSWAP_M
 run_step configure_hermit configure_hermit
 run_step configure_swapin_cost configure_swapin_cost
 run_step configure_policy_medium configure_policy_medium
+run_step configure_policy_ptebatch configure_policy_ptebatch
 run_step verify_remote_order_mask verify_remote_order_mask
 run_step configure_thp configure_thp
 run_step reset_hermit_stats /bin/hermit_swap_stats reset boot
@@ -502,6 +554,7 @@ dump_rswap_dram_stats after_reload
 dump_hermit_order_stats after_reload
 dump_swap_vmstat after_reload
 /bin/hermit_swap_stats stats after_reload
+dump_policy_ptebatch after_reload
 :> /tmp/dmesg.before.after_reload
 capture_dmesg /tmp/dmesg.after.after_reload
 emit_new_hermit_dmesg after_reload /tmp/dmesg.before.after_reload /tmp/dmesg.after.after_reload
@@ -619,7 +672,7 @@ run_qemu() {
 
 extract_summary() {
     if [ -f "$SERIAL_LOG" ]; then
-        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|POLICY_MEDIUM|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
+        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|POLICY_MEDIUM|POLICY_PTEBATCH|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
     fi
 }
 
