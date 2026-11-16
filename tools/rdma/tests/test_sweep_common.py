@@ -291,17 +291,18 @@ port = sys.argv[sys.argv.index('--port') + 1]
     def test_policy_mask_names_match_the_python_presets(self):
         expected = {'default': '0x1bf', 'no-pebs': '0x1bd', 'no-batch': '0x19f',
                     'medium-on': '0x3bf', 'fitstart-on': '0x5bf',
-                    'ptebatch-on': '0x9bf'}
+                    'ptebatch-on': '0x9bf', 'split-on': '0x11bf'}
         for name, mask in expected.items():
             with self.subTest(preset=name):
                 self.assertEqual(shell('policy_mask_of '+name).stdout.strip(), mask)
                 self.assertEqual(shell('valid_policy_mask '+mask).returncode, 0)
         self.assertEqual(shell('policy_mask_of 0x1ae').stdout.strip(), '0x1ae')
-        # Bits 0..11 are defined, so 0x200 (MEDIUM alone) and 0xfff are legal
-        # raw masks.
+        # Bits 0..12 are defined, so 0x200 (MEDIUM alone), 0xfff and 0x11bf
+        # (default|SPLIT) are legal raw masks.
         self.assertEqual(shell('valid_policy_mask 0x200').returncode, 0)
         self.assertEqual(shell('valid_policy_mask 0xfff').returncode, 0)
-        for bad in ('0x1000', '4096', 'zz', ''):
+        self.assertEqual(shell('valid_policy_mask 0x11bf').returncode, 0)
+        for bad in ('0x2000', '8192', 'zz', ''):
             with self.subTest(mask=bad):
                 self.assertNotEqual(shell('valid_policy_mask "$1"', bad, check=False).returncode, 0)
 

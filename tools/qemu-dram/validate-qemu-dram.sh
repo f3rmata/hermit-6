@@ -420,6 +420,47 @@ configure_policy_medium() {
         [ \$((mask & 0x200)) -eq 0 ]
 }
 
+# Phase D PEBS-guided split of resident large folios: the bit is off in the
+# default mask. The DRAM backend is order-0 only, so no 2 MiB folio exists and
+# no split can happen here; this checks the interface and that the bit is
+# inert. The heat histogram is fed by hermit_pebsd from load+store samples.
+configure_policy_split() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    features=/sys/kernel/debug/hermit/policy_features
+    heat=/sys/kernel/debug/hermit/pebs_heat_ms
+    rate=/sys/kernel/debug/hermit/policy_split_rate
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$features" ] || [ ! -r "\$heat" ] ||
+       [ ! -r "\$rate" ]; then
+        echo "POLICY_SPLIT: status=unavailable"
+        return 0
+    fi
+    mask=\$(cat "\$features")
+    rows=\$(grep -c '^split_' "\$stats")
+    skipped=\$(grep -c '^split_skipped_reason_' "\$stats")
+    done=\$(grep -c '^split_done_order[0-9][0-9]* ' "\$stats")
+    printf '%s' "\$((mask | 0x1000))" > "\$features" || return 1
+    after=\$(cat "\$features")
+    echo "POLICY_SPLIT: status=checked before=\$mask after=\$after rows=\$rows skip_rows=\$skipped order_rows=\$done heat_ms=\$(cat "\$heat") rate=\$(cat "\$rate") mode=\$(cat /sys/kernel/debug/hermit/pebs_mode)"
+    [ "\$rows" -eq 27 ] && [ "\$skipped" -eq 13 ] && [ "\$done" -eq 10 ] &&
+        [ "\$((after & 0x1000))" -eq 4096 ] && [ "\$(cat "\$heat")" -eq 1000 ]
+}
+
+# Appended Phase D counters after the reload. No large anonymous folio exists
+# with an order-0 backend, so "candidates=0" is the expected picture.
+dump_policy_split() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    label=\${1:-after_reload}
+
+    [ -r "\$stats" ] || return 0
+    candidates=\$(awk '\$1 == "split_candidates" { print \$2 }' "\$stats")
+    attempts=\$(awk '\$1 == "split_attempts" { print \$2 }' "\$stats")
+    pages=\$(awk '\$1 == "split_pages" { print \$2 }' "\$stats")
+    failures=\$(awk '\$1 == "split_failures" { print \$2 }' "\$stats")
+    unknown=\$(awk '\$1 == "split_skipped_reason_unknown" { print \$2 }' "\$stats")
+    echo "POLICY_SPLIT: label=\$label candidates=\$candidates attempts=\$attempts pages=\$pages failures=\$failures skipped_unknown=\$unknown"
+}
+
 configure_thp() {
     [ "$THP_SIZE_KB" -gt 0 ] || return 0
 
@@ -479,6 +520,7 @@ run_step configure_hermit configure_hermit
 run_step configure_swapin_cost configure_swapin_cost
 run_step configure_policy_medium configure_policy_medium
 run_step configure_policy_ptebatch configure_policy_ptebatch
+run_step configure_policy_split configure_policy_split
 run_step verify_remote_order_mask verify_remote_order_mask
 run_step configure_thp configure_thp
 run_step reset_hermit_stats /bin/hermit_swap_stats reset boot
@@ -555,6 +597,7 @@ dump_hermit_order_stats after_reload
 dump_swap_vmstat after_reload
 /bin/hermit_swap_stats stats after_reload
 dump_policy_ptebatch after_reload
+dump_policy_split after_reload
 :> /tmp/dmesg.before.after_reload
 capture_dmesg /tmp/dmesg.after.after_reload
 emit_new_hermit_dmesg after_reload /tmp/dmesg.before.after_reload /tmp/dmesg.after.after_reload
@@ -672,7 +715,7 @@ run_qemu() {
 
 extract_summary() {
     if [ -f "$SERIAL_LOG" ]; then
-        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|POLICY_MEDIUM|POLICY_PTEBATCH|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
+        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|POLICY_MEDIUM|POLICY_PTEBATCH|POLICY_SPLIT|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
     fi
 }
 

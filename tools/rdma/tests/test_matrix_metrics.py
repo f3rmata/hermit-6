@@ -143,6 +143,9 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual(metrics.policy_masks(['ptebatch-on']), [('ptebatch-on', 0x9bf)])
         self.assertEqual(0x5bf, metrics.DEFAULT_POLICY_MASK | 0x400)
         self.assertEqual(0x9bf, metrics.DEFAULT_POLICY_MASK | 0x800)
+        # Phase D adds SPLIT, a reclaim-side bit that is again a new preset.
+        self.assertEqual(metrics.policy_masks(['split-on']), [('split-on', 0x11bf)])
+        self.assertEqual(0x11bf, metrics.DEFAULT_POLICY_MASK | 0x1000)
         # Ablations only clear bits of the default mask.
         for _, mask in metrics.policy_masks(['default', 'no-pebs', 'no-batch']):
             self.assertEqual(mask & ~metrics.DEFAULT_POLICY_MASK, 0)
@@ -155,12 +158,13 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual(metrics.policy_masks(['default,no-pebs']),
                          [('default', 0x1bf), ('no-pebs', 0x1bd)])
         self.assertEqual(metrics.policy_masks(['default', 'default']), [('default', 0x1bf)])
-        # Bits 0..11 exist: 0x200 is MEDIUM alone, 0x5bf is default|FITSTART
-        # and 0x9bf is default|PTEBATCH.
+        # Bits 0..12 exist: 0x200 is MEDIUM alone, 0x5bf is default|FITSTART,
+        # 0x9bf is default|PTEBATCH and 0x11bf is default|SPLIT.
         self.assertEqual(metrics.policy_masks(['0x3bf']), [('f3bf', 0x3bf)])
         self.assertEqual(metrics.policy_masks(['512']), [('f200', 0x200)])
         self.assertEqual(metrics.policy_masks(['0xfff']), [('ffff', 0xfff)])
-        for bad in (['bogus'], ['0x1000'], ['4096'], ['-1'], []):
+        self.assertEqual(metrics.policy_masks(['0x11bf']), [('f11bf', 0x11bf)])
+        for bad in (['bogus'], ['0x2000'], ['8192'], ['-1'], []):
             with self.subTest(value=bad), self.assertRaises(ValueError):
                 metrics.policy_masks(bad)
 

@@ -542,3 +542,59 @@ fault。逐页复刻 =do_swap_page()= 的 swapcache 命中路径：
 swap_free、rmap、mm 计数、引用转移）、PTE 变化、VMA/PMD 边界、非 uptodate、不在
 swapcache、order>0、KSM、trylock 失败、门控/uffd/VMA-lock/batch<2 的跳过，以及
 soft-dirty/uffd-wp 标记和 SWP_STABLE_WRITES 的独占降级。
+
+* 2026-11-19 阶段 D：PEBS 引导的常驻大 folio 拆分（回收侧）
+
+Memcached 把 48% 的常驻字节保持在 512 KiB folio 里，而换入粒度是 4 KiB：这些
+folio 的冷子区间只是占着本地内存，从不被访问。阶段 D 用 PEBS 样本（不在缺页路径上）
+判断大 folio 里哪一段是热的，并在 MGLRU 回收时把 folio 拆到“热子序”的 order，让冷
+部分可以按小粒度换出。新 bit 默认关闭，=policy_features= 默认值仍是 =0x1bf=。
+
+** bit 12 (=0x1000=) =SPLIT=
+
+1) 聚合（=mm/hermit_pebs.c=）：每个 (mm, 2 MiB 区) 在原有 =hermit_region= 上增加一个
+   =u8 heat[512]=（每 4 KiB 子页一个饱和计数器）和 =heat_ns=。=hermit_pebsd= 的
+   =hermit_region_sample()= 把每个 load/store 样本计入对应子页（=hermit_heat_add()=），
+   每 =pebs_heat_ms=（默认 1000 ms）把所有计数器右移 1 位（指数衰减；长时间空闲一次
+   清零）。heat 缓冲只在 =SPLIT= 打开后按需 =kzalloc(GFP_NOWAIT)=（样本路径绝不睡眠），
+   区表仍是 =pebs_region_max= 个条目的 LRU 表，驱逐时复用 heat 缓冲，=mm= 退出时释放。
+   **没有样本 = unknown，绝不等于 cold**：=hermit_split_select()= 对样本不足的 folio
+   直接返回 =HERMIT_SPLIT_UNKNOWN=。
+
+2) 判定（=mm/hermit_split.c=，纯函数 =hermit_split_select()=，可单测）：
+   - 热集合 = 覆盖 80%（=policy_split_hot_cov=）样本的子页，即计数器直方图的尾部；
+   - 需要冷页占比 ≥ =policy_split_min_cold=（默认 25%），否则没有值得拆的余量；
+   - 冷子页的 PTE  accessed 位必须为 0（否则 =HERMIT_SPLIT_COLD_YOUNG= 否决）；
+   - 取“热页占比 ≥ 75%（=policy_split_hot_pct=）的最大对齐子 order”，且该 order 下
+     必须同时存在热块与冷块（TierBPF 式）。order 1 的匿名 folio 不能拆，跳过。
+
+3) 执行（=mm/vmscan.c= =shrink_folio_list()=，仅 =lru_gen_reclaim=，即 MGLRU 从最老
+   代挑出的 folio）：=hermit_split_try()= 做结构门控（anon、order ≥ 2、非 KSM、非
+   writeback、非 swapcache、=mapcount == nr_pages= 即单 mm 全映射、非 DMA-pinned、
+   =can_split_folio()=），再看预算与压力，然后用一次 =rmap_walk()= 找到唯一的 vma：
+   超过一个映射、=mm_has_notifiers()=、或取不到 heat 都记 skip；PTE 用
+   =page_vma_mapped_walk()= 读 young 位（PMD 映射时整 folio 共用一位）。最后在 folio
+   锁下 =split_folio_to_list_to_order()=，尾部分片进入同一次 =shrink_folio_list()=，
+   =sc->nr_scanned= 与 =nr_pages= 按新 order 修正。
+
+4) 预算与压力：=policy_split_rate=（默认 32 folios/s，1 s 窗口）限制拆分速率；
+   只有 memcg 用量 ≥ 75% 的 memory.max，或该 memcg 的 refault 分数
+   （=hermit_refault=）< =policy_split_refault_max=（默认 256）时才拆。
+
+** 新增接口
+
+- tunable（debugfs，0600）：=policy_split_rate=、=policy_split_hot_cov=、
+  =policy_split_hot_pct=、=policy_split_min_cold=、=policy_split_min_samples=（默认 16）、
+  =policy_split_refault_max=、=pebs_heat_ms=。
+- =policy_stats= 追加：=split_candidates=、=split_attempts=、=split_pages=、
+  =split_failures=、=split_done_order0..9=，以及 13 个
+  =split_skipped_reason_*=（=shared/ksm/writeback/swapcache/pinned/notifier/unknown/
+  all_hot/cold_young/no_order/budget/pressure/memory=）。
+- 消融预设：=split-on= = =0x11bf=（=matrix_metrics.py= 与 =sweep_common.sh= 同步；
+  合法掩码上限升到 =0x1fff=）。
+
+测试：=test_kernel_paths.py= 新增三段——（1）=hermit_split_select()= 的合成直方图用例
+（对齐/非对齐热点、80% 覆盖尾部、样本不足、全热、min_cold、young 否决、order 1 不可
+拆）；（2）=hermit_heat_add()/hermit_heat_decay()=（饱和、半衰、长空闲清零、时间倒退、
+越界索引、零周期）并打印每样本开销（≈10 ns，25k 样本/秒即 ≈0.03% 单核）；（3）预算
+窗口与 memcg 压力/refault 门限的边界。

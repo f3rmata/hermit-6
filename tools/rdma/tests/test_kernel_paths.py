@@ -1974,6 +1974,312 @@ int main(void)
         subprocess.run([str(binary)], check=True)
 
 
+def test_split_select():
+    """Hot subrange / split order selection over synthetic heat histograms."""
+    ROOT = Path(__file__).resolve().parents[3]
+    source = (ROOT / 'linux-stable/mm/hermit_split.c').read_text()
+    start = source.index('/* hermit_split:begin pure */')
+    end = source.index('/* hermit_split:end pure */')
+    function = source[start:end]
+    harness = r"""
+    #include <assert.h>
+    #include <stdbool.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <string.h>
+    typedef uint8_t u8;
+    typedef uint32_t u32;
+    #define U8_MAX 255
+    #define test_bit(nr, addr) \
+        (!!(((const unsigned long *)(addr))[(nr) / 64] & (1UL << ((nr) % 64))))
+    """
+    tests = r"""
+    #define NR 512
+    static unsigned long young[NR / 64];
+    static u8 heat[NR];
+    static struct hermit_split_rule rule = {
+        .hot_cov = 80, .hot_pct = 75, .min_cold = 25, .min_samples = 16,
+    };
+    static unsigned int order;
+
+    static int pick(void)
+    {
+        order = 99;
+        return hermit_split_select(heat, NR, 9, young, &rule, &order);
+    }
+
+    static void reset(void)
+    {
+        memset(heat, 0, sizeof(heat));
+        memset(young, 0, sizeof(young));
+    }
+
+    static void set_young(unsigned int page)
+    {
+        young[page / 64] |= 1UL << (page % 64);
+    }
+
+    static void hot(unsigned int from, unsigned int nr, u8 count)
+    {
+        for (unsigned int i = 0; i < nr; i++)
+            heat[from + i] = count;
+    }
+
+    int main(void)
+    {
+        /* An 8-page (32 KiB) hot block inside a 2 MiB folio is the largest
+         * aligned block that is >=75% hot, so the folio splits to order 3. */
+        reset(); hot(128, 8, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 3);
+        /* One page off the aligned boundary, 7 of the 8 pages of the order-3
+         * block are still hot, which is above the 75% bar. */
+        reset(); hot(129, 8, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 3);
+        /* Two pages inside a 16 KiB block are not enough for any block above
+         * order 0. */
+        reset(); hot(133, 2, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 0);
+        /* 80% coverage: a count-90 page and a count-10 page leave the
+         * count-10 page outside the hot set, so it is not protected. */
+        reset(); hot(0, 1, 90); hot(300, 1, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 0);
+        /* Coverage follows the tail of the histogram: 8 of 10 samples on one
+         * page still leave it alone in the hot set. */
+        reset(); hot(64, 1, 80); hot(65, 1, 20);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 0);
+        /* No samples at all is unknown, never cold. */
+        reset();
+        assert(pick() == HERMIT_SPLIT_UNKNOWN);
+        /* Too few samples for the configured evidence threshold. */
+        reset(); hot(128, 15, 1);
+        assert(pick() == HERMIT_SPLIT_UNKNOWN);
+        assert(rule.min_samples == 16);
+        /* A 256 KiB half is hot: the largest qualifying block is order 8. */
+        reset(); hot(256, 256, 4);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 8);
+        /* Every page hot -> nothing cold to evict. */
+        reset(); hot(0, NR, 7);
+        assert(pick() == HERMIT_SPLIT_ALL_HOT);
+        /* Cold pages below min_cold are not worth a split. */
+        reset(); hot(0, 500, 10);
+        assert(pick() == HERMIT_SPLIT_ALL_HOT);
+        /* A cold subpage that the MMU still marks accessed vetoes the split. */
+        reset(); hot(128, 8, 10);
+        set_young(192);                       /* a cold page */
+        assert(pick() == HERMIT_SPLIT_COLD_YOUNG);
+        /* ... but a young *hot* subpage is expected and harmless. */
+        reset(); hot(128, 8, 10);
+        set_young(128);                       /* a hot page */
+        assert(pick() == HERMIT_SPLIT_PICK && order == 3);
+        /* Order 1 anonymous folios cannot be split, so it is never returned:
+         * an order-2 folio with two hot and two cold pages goes to order 0. */
+        reset(); hot(0, 2, 10);
+        assert(hermit_split_select(heat, 4, 2, young, &rule, &order) ==
+               HERMIT_SPLIT_PICK && order == 0);
+        /* An order-1 folio is never a candidate: the split code does not
+         * support order-1 anonymous folios. */
+        reset(); hot(0, 2, 10);
+        assert(hermit_split_select(heat, 2, 1, young, &rule, &order) ==
+               HERMIT_SPLIT_NO_ORDER);
+        puts("Split selection tests: PASS");
+        return 0;
+    }
+    """
+    with tempfile.TemporaryDirectory(prefix='hermit-split-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + function + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall',
+                        '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                        '-g', str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+def test_heat_decay():
+    """Per-subpage PEBS heat counters: saturating add and halving decay."""
+    ROOT = Path(__file__).resolve().parents[3]
+    source = (ROOT / 'linux-stable/mm/hermit_pebs.c').read_text()
+    start = source.index('/* hermit_heat:begin */')
+    end = source.index('/* hermit_heat:end */')
+    function = source[start:end]
+    harness = r"""
+    #include <assert.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <string.h>
+    #include <time.h>
+    typedef uint8_t u8;
+    typedef uint64_t u64;
+    #define U8_MAX 255
+    #define HERMIT_REGION_NR_SUBPAGES 512
+    #define div_u64(a, b) ((a) / (b))
+    """
+    tests = r"""
+    static u8 heat[HERMIT_REGION_NR_SUBPAGES];
+    static u64 stamp;
+
+    static unsigned int total(void)
+    {
+        unsigned int i, sum = 0;
+
+        for (i = 0; i < HERMIT_REGION_NR_SUBPAGES; i++)
+            sum += heat[i];
+        return sum;
+    }
+
+    int main(void)
+    {
+        /* Counts accumulate per subpage; other subpages are untouched. */
+        memset(heat, 0, sizeof(heat)); stamp = 1000;
+        hermit_heat_add(heat, &stamp, 5, 1000, 1000);
+        hermit_heat_add(heat, &stamp, 5, 1200, 1000);
+        hermit_heat_add(heat, &stamp, 6, 1300, 1000);
+        assert(heat[5] == 2 && heat[6] == 1 && total() == 3);
+        assert(stamp == 1000);
+        /* Saturating counter. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        for (int i = 0; i < 1000; i++)
+            hermit_heat_add(heat, &stamp, 9, 1, 0);
+        assert(heat[9] == U8_MAX);
+        /* One period halves, three periods divide by eight. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        heat[1] = 200;
+        hermit_heat_decay(heat, &stamp, 999, 1000);
+        assert(heat[1] == 200 && stamp == 0);        /* not yet */
+        hermit_heat_decay(heat, &stamp, 1000, 1000);
+        assert(heat[1] == 100 && stamp == 1000);
+        heat[2] = 200;
+        hermit_heat_decay(heat, &stamp, 4000, 1000);
+        assert(heat[1] == 12 && heat[2] == 25 && stamp == 4000);
+        /* A long idle gap collapses to zero instead of shifting forever. */
+        heat[3] = 200;
+        hermit_heat_decay(heat, &stamp, 4000 + 8000, 1000);
+        assert(total() == 0 && stamp == 12000);
+        /* A timestamp from the future is pulled back, never used to decay. */
+        heat[4] = 9; stamp = 5000;
+        hermit_heat_add(heat, &stamp, 4, 4000, 1000);
+        assert(heat[4] == 10 && stamp == 4000);
+        /* Out-of-range subpage index is ignored, a zero period never decays. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        hermit_heat_add(heat, &stamp, HERMIT_REGION_NR_SUBPAGES, 10, 1000);
+        assert(total() == 0);
+        heat[7] = 100;
+        hermit_heat_decay(heat, &stamp, 100000, 0);
+        assert(heat[7] == 100);
+        /* Sample-path cost: the split policy adds one decay check and one
+         * increment per PEBS sample. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        struct timespec a, b;
+        const unsigned int n = 2000000;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        for (unsigned int i = 0; i < n; i++)
+            hermit_heat_add(heat, &stamp, i % HERMIT_REGION_NR_SUBPAGES,
+                            i / 8, 1000000000ULL);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        double ns = ((b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec)) / n;
+        printf("heat add: %.1f ns/sample\n", ns);
+        assert(ns < 1000.0);
+        puts("Heat decay tests: PASS");
+        return 0;
+    }
+    """
+    with tempfile.TemporaryDirectory(prefix='hermit-heat-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + function + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall',
+                        '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                        '-g', str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+def test_split_gates():
+    """Split budget (N per second) and memcg pressure/refault gate."""
+    ROOT = Path(__file__).resolve().parents[3]
+    source = (ROOT / 'linux-stable/mm/hermit_split.c').read_text()
+    budget = source[source.index('/* hermit_split:budget:begin */'):
+                    source.index('/* hermit_split:budget:end */')]
+    pressure = source[source.index('/* hermit_split:pressure:begin */'):
+                      source.index('/* hermit_split:pressure:end */')]
+    harness = r"""
+    #include <assert.h>
+    #include <stdbool.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    typedef uint32_t u32;
+    typedef struct { int counter; } atomic_t;
+    struct page_counter { unsigned long max; unsigned long usage; };
+    struct mem_cgroup { struct page_counter memory; atomic_t hermit_refault; };
+    #define CONFIG_MEMCG 1
+    #define HZ 100
+    #define PAGE_COUNTER_MAX LONG_MAX
+    #define READ_ONCE(x) (x)
+    #define time_after(a, b) ((long)((b) - (a)) < 0)
+    static unsigned long jiffies;
+    static u32 hermit_split_rate;
+    static u32 hermit_split_refault_max = 256;
+    static int atomic_read(atomic_t *v) { return v->counter; }
+    static int atomic_inc_return(atomic_t *v) { return ++v->counter; }
+    static void atomic_set(atomic_t *v, int n) { v->counter = n; }
+    static unsigned long harness_cmpxchg(unsigned long *p, unsigned long old,
+                                         unsigned long n)
+    { unsigned long o = *p; if (o == old) *p = n; return o; }
+    #define cmpxchg(p, o, n) harness_cmpxchg((unsigned long *)(p), (o), (n))
+    static unsigned long page_counter_read(struct page_counter *c)
+    { return c->usage; }
+    #include <limits.h>
+    """
+    tests = r"""
+    int main(void)
+    {
+        /* Two splits per second, then the budget refuses until the window
+         * rolls over. Zero means the policy is disabled. */
+        hermit_split_rate = 2; jiffies = 10 * HZ;
+        assert(hermit_split_budget());
+        assert(hermit_split_budget());
+        assert(!hermit_split_budget());
+        assert(!hermit_split_budget());
+        jiffies += HZ - 1;            /* still the same 1 s window */
+        assert(!hermit_split_budget());
+        jiffies += 2;                 /* the window expires strictly after 1 s */
+        assert(hermit_split_budget());
+        assert(hermit_split_budget());
+        assert(!hermit_split_budget());
+        hermit_split_rate = 0; jiffies += 10 * HZ;
+        assert(!hermit_split_budget());
+
+        /* No memcg (global reclaim) is always allowed. */
+        assert(hermit_split_under_pressure(NULL));
+        struct mem_cgroup memcg = {0};
+        /* Root memcg: no limit, so the refault score decides. */
+        memcg.memory.max = PAGE_COUNTER_MAX;
+        memcg.hermit_refault.counter = 0;
+        assert(hermit_split_under_pressure(&memcg));
+        memcg.hermit_refault.counter = 256;
+        assert(!hermit_split_under_pressure(&memcg));
+        memcg.hermit_refault.counter = 255;
+        assert(hermit_split_under_pressure(&memcg));
+        /* Near the limit, a high refault score no longer blocks the split. */
+        memcg.memory.max = 1000; memcg.memory.usage = 750;
+        memcg.hermit_refault.counter = 4096;
+        assert(hermit_split_under_pressure(&memcg));
+        memcg.memory.usage = 749;
+        assert(!hermit_split_under_pressure(&memcg));
+        memcg.memory.usage = 1000;
+        assert(hermit_split_under_pressure(&memcg));
+        puts("Split gate tests: PASS");
+        return 0;
+    }
+    """
+    with tempfile.TemporaryDirectory(prefix='hermit-splitgates-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + budget + pressure + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall',
+                        '-Wextra', '-Werror', '-Wno-unused-function',
+                        '-fsanitize=address,undefined', '-g',
+                        str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+
 if __name__ == '__main__':
     test_rdma_submission()
     test_remote_read()
@@ -1984,3 +2290,6 @@ if __name__ == '__main__':
     test_shadow_refault()
     test_swapin_cost()
     test_pte_batch_install()
+    test_split_select()
+    test_heat_decay()
+    test_split_gates()
