@@ -17,7 +17,8 @@
 # Options (or the matching environment variables):
 #   --pages "4 64 2048"        PAGE_SIZES_KB
 #   --policy-features "0x1bf"  POLICY_FEATURES  ("off" adds a PEBS-disabled cell;
-#                              also accepts default/no-pebs/no-batch and commas)
+#                              also accepts default/no-pebs/no-batch/medium-on and
+#                              commas)
 #   --segments "1 4 16 32 64 128"  SEGMENT_PAGES
 #   --trials N                 TRIALS
 #   --size-gib N               SIZE_GIB

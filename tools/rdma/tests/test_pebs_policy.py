@@ -292,9 +292,18 @@ static void accounting_tests(void)
     hermit_pebs_account_swapin(&mm, HERMIT_PEBS_MAX_ORDER + 1);
     assert(hermit_actual_orders[4].counter == before + 1);
     assert(!mm.hermit_pebs); /* Counting actual sizes must not create history. */
+    /* Phase B reads a 16/32/64 KiB extent as one folio instead of 4 KiB pages.
+     * The tiers stay separate, so a run can compare medium_used_orderN with the
+     * order-0 it costs on the batched path. */
+    for (unsigned int order = 2; order <= 4; order++)
+        hermit_pebs_account_swapin(&mm, order);
+    assert(hermit_actual_orders[2].counter == 1);
+    assert(hermit_actual_orders[3].counter == 1);
+    assert(hermit_actual_orders[4].counter == before + 2);
+    assert(hermit_actual_orders[0].counter == 0);
     hermit_pebs_enabled = 0;
     hermit_pebs_account_swapin(&mm, 4);
-    assert(hermit_actual_orders[4].counter == before + 1);
+    assert(hermit_actual_orders[4].counter == before + 2);
 }
 
 int main(void)

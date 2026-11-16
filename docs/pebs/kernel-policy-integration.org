@@ -439,3 +439,48 @@ verification）的 backend load 字节数除以 *trial 计时之和*，分母缺
   =store_phase_*=/=load_phase_*=；历史结果目录不改。
 - =sweep_common.sh= 新增 =elapsed_seconds=，=tests/test_sweep_common.py= 固定
   "分母必须是快照区间"这一约定；应用吞吐仍用 =trials_per_sec= 和 =trial_sec_total=。
+
+* 2026-11-17 阶段 B：按 fit 的中等 order 换入
+
+换出时按对齐 mTHP extent（例如 2 MiB extent 内的 64 KiB）写出的数据，换入时旧路径
+只读 order-0 页，extent 被永久拆成 4 KiB。本阶段新增 bit 9 (=0x200=, =MEDIUM=)，
+默认关闭，=policy_features= 默认值仍是 =0x1bf=。
+
+- =hermit_policy_large()= 改为 =hermit_policy_swapin_order(vmf, orders, &medium)=：
+  返回调用方可分配的最大 order，=-1= 表示继续用 4 KiB SG 批次。=LARGE= 分支的判据
+  与 #20 完全相同（=run >= 2 * policy_swapin_limit()= 且剩余长度足够），只是不再
+  返回布尔值；MEDIUM 分支给出 fit 驱动的 order。
+- 流的 fit 置信度：每次 run 结束时已记录的段长 =fit= 的 =ilog2= 若与上一次相同则累加
+  =fit_stable=，否则从 1 重新开始。=fit_stable >= policy_medium_stable=（默认 3）且
+  =fit >= 4= 页时，建议 =order = min(ilog2(fit), policy_medium_max_order)=
+  （默认 4，即 64 KiB）。两个新字段放在 =struct policy_stream= 原有的 padding 里，
+  流槽大小不变。
+- 不越读：folio 由 =ALIGN_DOWN(fault, 1 << order)= 分配，所以只有
+  =(pos & ((1 << order) - 1)) == 0= 且 =pos + (1 << order) <= fit= 的 order 才被建议
+  （pos 是本次缺页在段内的页号），否则降阶；降到 order < 2 就不建议。
+- 校验：=do_swap_page()= 在分配前用 =can_swapin_thp()= 在 PTE 锁下验证建议 order 的
+  对齐区间（连续 swap PTE、swapcache/zeromap 一致、远端连续）。失败即
+  =medium_fallback_extent= 并回到 4 KiB SG 批次；=thp_swap_suitable_orders()= 只保留
+  合法的更低 order。被采纳的 order 记在 =vmf->hermit_folio_order=，=alloc_swap_folio()=
+  据此裁剪候选 order 并跳过第二次 PTE 扫描（安装前的 PTE 批次重验仍在）。
+- 不触发直接 compaction：MEDIUM 的分配用
+  =(vma_thp_gfp_mask() & ~__GFP_DIRECT_RECLAIM) | __GFP_NORETRY | __GFP_NOWARN=；
+  分配或 memcg 计费失败记 =medium_fallback_alloc= 并回退到 base page。
+- 流记账一致：一次 N 页的 folio 换入与 N 页 SG 批次一样推进 =sequential= /
+  =batch_start,end=，所以 =fit= 学习不受换入方式影响（=hermit_policy_installed()=）。
+- 新 tunable（debugfs，0600）：=policy_medium_max_order=（默认 4，clamp 2..PMD_ORDER）、
+  =policy_medium_stable=（默认 3，clamp 1..8）。
+- =policy_stats= 追加（只追加，不改已有字段顺序）：=medium_suggested=、
+  =medium_used_order2= … =medium_used_order9=、=medium_fallback_alloc=、
+  =medium_fallback_extent=。每次建议只计一次，随后恰好落在某个 order 或某个 fallback
+  上，因此 =medium_suggested ≈ Σ medium_used_orderN + 两个 fallback=。
+
+后端子区间语义已验证：=hermit_backend_range_remote()= 只逐页检查 entry 远端有效，
+=hermit_io_offset()= 以 folio 自身的 order 遍历并要求 =offset == first + i=；更大的
+extent 内一段对齐子区间的远端偏移同样连续，因此无需改动，仍保留 =-ERANGE=
+（远端不连续）语义。
+
+测试：=tools/rdma/tests/test_kernel_paths.py= 端到端重放（1 页一段的 16 页段 →
+K 段后 order 4；长度交替 → 不建议；6 页段 → 只允许 order 2，不越读；默认掩码关闭
+→ 不建议；misaligned/fragmented extent → 4 KiB SG），以及 =alloc_swap_folio()=
+的 hint 裁剪、跳过 PTE 扫描、无直接回收位和 fallback 计数。

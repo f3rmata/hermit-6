@@ -16,8 +16,11 @@ POLICY_MASKS = {
     'default': 0x1bf,   # SWAPIN|PEBS|SORT|OBSERVE|FLUSH|BATCH|LARGE|MGLRU
     'no-pebs': 0x1bd,   # PEBS footprint vote removed
     'no-batch': 0x19f,  # SG writeout of cold dirty pages removed
+    'medium-on': 0x3bf,  # default + MEDIUM (fit-driven 16-64 KiB swap-in orders)
 }
 DEFAULT_POLICY_MASK = POLICY_MASKS['default']
+# Bits 0..9 exist; 0x400 is the next free bit.
+POLICY_MASK_MAX = 0x3ff
 
 
 def policy_mask(value):
@@ -30,8 +33,9 @@ def policy_mask(value):
     except ValueError:
         raise ValueError(f'unknown policy_features preset or mask {value!r}; '
                          f'known presets: {", ".join(POLICY_MASKS)}') from None
-    if mask < 0 or mask > 0x1ff:
-        raise ValueError(f'policy_features mask {value!r} is outside 0..0x1ff')
+    if mask < 0 or mask > POLICY_MASK_MAX:
+        raise ValueError(f'policy_features mask {value!r} is outside '
+                         f'0..{POLICY_MASK_MAX:#x}')
     return 'f%x' % mask, mask
 
 

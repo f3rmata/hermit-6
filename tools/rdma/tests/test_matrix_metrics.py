@@ -134,6 +134,10 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual(metrics.policy_masks(['default']), [('default', 0x1bf)])
         self.assertEqual(metrics.policy_masks(['no-pebs']), [('no-pebs', 0x1bd)])
         self.assertEqual(metrics.policy_masks(['no-batch']), [('no-batch', 0x19f)])
+        # Phase B adds a bit instead of clearing one, so it is a separate
+        # preset: 0x1bf | MEDIUM. Its label cannot collide with a period name.
+        self.assertEqual(metrics.policy_masks(['medium-on']), [('medium-on', 0x3bf)])
+        self.assertEqual(0x3bf, metrics.DEFAULT_POLICY_MASK | 0x200)
         # Ablations only clear bits of the default mask.
         for _, mask in metrics.policy_masks(['default', 'no-pebs', 'no-batch']):
             self.assertEqual(mask & ~metrics.DEFAULT_POLICY_MASK, 0)
@@ -146,7 +150,10 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual(metrics.policy_masks(['default,no-pebs']),
                          [('default', 0x1bf), ('no-pebs', 0x1bd)])
         self.assertEqual(metrics.policy_masks(['default', 'default']), [('default', 0x1bf)])
-        for bad in (['bogus'], ['0x400'], ['-1'], []):
+        # Bits 0..9 exist: 0x200 is MEDIUM alone and 0x3bf is default|MEDIUM.
+        self.assertEqual(metrics.policy_masks(['0x3bf']), [('f3bf', 0x3bf)])
+        self.assertEqual(metrics.policy_masks(['512']), [('f200', 0x200)])
+        for bad in (['bogus'], ['0x400'], ['1024'], ['-1'], []):
             with self.subTest(value=bad), self.assertRaises(ValueError):
                 metrics.policy_masks(bad)
 

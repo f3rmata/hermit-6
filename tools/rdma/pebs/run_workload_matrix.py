@@ -413,8 +413,9 @@ def main():
     ap.add_argument('--gapbs-scale', type=int, default=24, help='Kronecker graph scale (2^scale vertices)')
     ap.add_argument('--policy-features', nargs='+', default=None,
                     help='policy_features ablations for policy cells: preset names (default, no-pebs, '
-                         'no-batch), raw masks (0x1bd) or comma-separated lists; omitted preserves the '
-                         'kernel mask and keeps the historical off/static/policy cells')
+                         'no-batch, medium-on), raw masks (0x1bd) or comma-separated lists; omitted '
+                         'preserves the kernel mask and keeps the historical '
+                         'off/static/policy cells')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
     if min(args.periods+[args.store_period,args.repeats,args.timeout]) < 1:

@@ -345,6 +345,30 @@ configure_swapin_cost() {
     [ "\$enabled" = 1 ] && [ "\$keys" -eq 20 ] && [ "\$prefetch" -eq 3 ]
 }
 
+# Phase B fit-driven medium orders: the ablation bit is off in the default mask,
+# both tunables exist, and policy_stats carries the appended fields. The DRAM
+# backend is order-0 only, so the bit is left off and no medium read is expected.
+configure_policy_medium() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    features=/sys/kernel/debug/hermit/policy_features
+    ceiling=/sys/kernel/debug/hermit/policy_medium_max_order
+    repeat=/sys/kernel/debug/hermit/policy_medium_stable
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$features" ] ||
+       [ ! -r "\$ceiling" ] || [ ! -r "\$repeat" ]; then
+        echo "POLICY_MEDIUM: status=unavailable"
+        return 0
+    fi
+    mask=\$(cat "\$features")
+    suggested=\$(awk '\$1 == "medium_suggested" { print \$2 }' "\$stats")
+    orders=\$(grep -c '^medium_used_order[0-9][0-9]* ' "\$stats")
+    fallbacks=\$(grep -c '^medium_fallback_' "\$stats")
+    echo "POLICY_MEDIUM: status=checked features=\$mask suggested=\$suggested order_rows=\$orders fallback_rows=\$fallbacks max_order=\$(cat "\$ceiling") stable=\$(cat "\$repeat")"
+    [ "\$orders" -eq 8 ] && [ "\$fallbacks" -eq 2 ] &&
+        [ "\$(cat "\$ceiling")" -eq 4 ] && [ "\$(cat "\$repeat")" -eq 3 ] &&
+        [ \$((mask & 0x200)) -eq 0 ]
+}
+
 configure_thp() {
     [ "$THP_SIZE_KB" -gt 0 ] || return 0
 
@@ -402,6 +426,7 @@ run_step swapon_ramdisk swapon /dev/ram0
 run_step load_rswap_client insmod /rswap-client.ko rmsize=$RSWAP_MEM_GB $RSWAP_MODULE_ARGS
 run_step configure_hermit configure_hermit
 run_step configure_swapin_cost configure_swapin_cost
+run_step configure_policy_medium configure_policy_medium
 run_step verify_remote_order_mask verify_remote_order_mask
 run_step configure_thp configure_thp
 run_step reset_hermit_stats /bin/hermit_swap_stats reset boot
@@ -594,7 +619,7 @@ run_qemu() {
 
 extract_summary() {
     if [ -f "$SERIAL_LOG" ]; then
-        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
+        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|POLICY_MEDIUM|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
     fi
 }
 

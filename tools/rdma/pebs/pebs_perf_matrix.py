@@ -287,7 +287,7 @@ def main():
     ap.add_argument('--thp',choices=['preserve'],default='preserve',help='Compatibility option; allocation is preserved unless --pages is supplied')
     ap.add_argument('--pages', nargs='+', type=int, choices=PAGE_SIZES,
                     help='allocation ceilings in KiB, plus a 4KiB/off reference; smaller sizes stay eligible; omitted preserves THP')
-    ap.add_argument('--policy-features',nargs='+',default=None,help='policy_features ablations for policy cells: preset names (default, no-pebs, no-batch), raw masks (0x1bd) or comma-separated lists; each preset becomes a labelled policy case; omitted preserves the kernel mask and is restored on exit')
+    ap.add_argument('--policy-features',nargs='+',default=None,help='policy_features ablations for policy cells: preset names (default, no-pebs, no-batch, medium-on), raw masks (0x1bd) or comma-separated lists; each preset becomes a labelled policy case; omitted preserves the kernel mask and is restored on exit')
     ap.add_argument('--dry-run', action='store_true', help='print matrix without sudo or host changes')
     ap.add_argument('--port',type=int,default=11329);ap.add_argument('--require-fixed',action='store_true')
     ap.add_argument('--memory-mb',type=int,default=640)

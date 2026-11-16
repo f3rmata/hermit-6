@@ -187,8 +187,9 @@ def test_folio_selection():
     start = source.index('static inline unsigned long thp_swap_suitable_orders(')
     end = source.index('#else /* !CONFIG_TRANSPARENT_HUGEPAGE */', start)
     functions = source[start:end]
-    start = source.index('static bool hermit_swapin_large_allowed(')
-    end = source.index('\n}\n', start) + 3
+    start = source.index('static unsigned long hermit_swapin_orders(')
+    end = source.index('\n#endif\n\n#ifdef CONFIG_HERMIT\nstatic int hermit_direct_swapin(',
+                        start)
     functions += '#define CONFIG_TRANSPARENT_HUGEPAGE 1\n' + source[start:end] + '\n'
     page_io = (root / 'linux-stable/mm/page_io.c').read_text()
     start = page_io.index('int hermit_swapout_order(')
@@ -211,6 +212,9 @@ def test_folio_selection():
 #define TVA_PAGEFAULT 0
 #define MTHP_STAT_SWPIN_FALLBACK_CHARGE 0
 #define MTHP_STAT_SWPIN_FALLBACK 1
+#define __GFP_DIRECT_RECLAIM 0x400000u
+#define __GFP_NORETRY 0x4000u
+#define __GFP_NOWARN 0x200u
 typedef unsigned long pgoff_t;
 typedef unsigned long swp_entry_t;
 typedef unsigned int gfp_t;
@@ -223,11 +227,18 @@ struct vm_fault {
     unsigned long address, hermit_fault_pc;
     pte_t orig_pte;
     void *pmd;
+    int hermit_folio_order;
 };
 struct folio { unsigned int order; };
 static unsigned long wr_mask, enabled_orders, alloc_fail, charge_fail;
 static unsigned int extent, valid_order, allocs, frees;
 static bool uffd, zswap, map_fail;
+static unsigned int pte_maps, gfp_orders;
+static gfp_t last_gfp;
+static unsigned int medium_used[10], medium_alloc_fallbacks;
+static unsigned int medium_extent_fallbacks, policy_calls;
+static int policy_order = -1;
+static bool policy_medium;
 static pte_t ptes[512];
 static struct folio result;
 static unsigned int folio_order(struct folio *f) { return f->order; }
@@ -235,6 +246,20 @@ static int fls_long(unsigned long x) { return x ? 64 - __builtin_clzl(x) : 0; }
 static int highest_order(unsigned long x) { return fls_long(x) - 1; }
 static int next_order(unsigned long *x, int order)
 { *x &= ~BIT(order); return highest_order(*x); }
+/* Stand-in for hermit_policy_swapin_order(): @policy_order/@policy_medium are
+ * set by each test and the mask is recorded so the caller can be checked. */
+static unsigned long policy_orders;
+static int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
+                                      bool *medium)
+{
+    (void)vmf; policy_calls++; policy_orders = orders;
+    *medium = policy_medium;
+    return policy_order;
+}
+static void hermit_policy_medium_used(unsigned int order)
+{ medium_used[order]++; }
+static void hermit_policy_medium_fallback(bool alloc)
+{ if (alloc) medium_alloc_fallbacks++; else medium_extent_fallbacks++; }
 static bool userfaultfd_armed(struct vm_area_struct *vma) { (void)vma; return uffd; }
 static bool zswap_never_enabled(void) { return !zswap; }
 static swp_entry_t pte_to_swp_entry(pte_t pte) { return pte; }
@@ -252,6 +277,7 @@ static pte_t *pte_offset_map_lock(struct mm_struct *mm, void *pmd,
 {
     static spinlock_t lock;
     (void)mm; (void)pmd; (void)addr; *ptl = &lock;
+    pte_maps++;
     return map_fail ? NULL : ptes;
 }
 static unsigned int pte_index(unsigned long addr) { return (addr >> 12) & 511; }
@@ -262,11 +288,13 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *pte, unsigned int nr)
     (void)vmf; return nr <= (1U << valid_order);
 }
 static void pte_unmap_unlock(pte_t *pte, spinlock_t *ptl) { (void)pte; (void)ptl; }
-static gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma) { (void)vma; return 0; }
+static gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
+{ (void)vma; return __GFP_DIRECT_RECLAIM | __GFP_NOWARN; }
 static struct folio *vma_alloc_folio(gfp_t gfp, unsigned int order,
     struct vm_area_struct *vma, unsigned long addr)
 {
-    (void)gfp; (void)vma; assert(!(addr % (PAGE_SIZE << order)));
+    (void)vma; assert(!(addr % (PAGE_SIZE << order)));
+    last_gfp = gfp; gfp_orders++;
     allocs++; result.order = order; return alloc_fail & BIT(order) ? NULL : &result;
 }
 static int mem_cgroup_swapin_charge_folio(struct folio *f, struct mm_struct *mm,
@@ -286,6 +314,96 @@ static void check(unsigned int expected)
         .orig_pte = 1024 + 7, .hermit_fault_pc = 0x1000 };
     struct folio *f = alloc_swap_folio(&vmf);
     assert(f && f->order == expected);
+}
+
+/* Phase B: a validated MEDIUM order reaches alloc_swap_folio() in
+ * vmf->hermit_folio_order. It restricts the candidates, skips the PTE scan that
+ * do_swap_page() already did, and must not ask for synchronous compaction. */
+static void medium_alloc_tests(void)
+{
+    struct mm_struct mm;
+    struct vm_area_struct vma = { .vm_mm = &mm };
+    struct vm_fault vmf = { .vma = &vma, .address = 0x2000000 + 5 * PAGE_SIZE,
+        .orig_pte = 1024 + 5, .hermit_fault_pc = 0x1000 };
+    struct folio *f;
+
+    wr_mask = 0x3fd; enabled_orders = 0x3fc; extent = valid_order = 9;
+    alloc_fail = charge_fail = 0; uffd = zswap = map_fail = false;
+    /* The hint caps the order even though order 9 is legal, and the range is
+     * not scanned again. */
+    pte_maps = 0; medium_used[2] = 0;
+    vmf.hermit_folio_order = 2;
+    f = alloc_swap_folio(&vmf);
+    assert(f && f->order == 2 && pte_maps == 0 && medium_used[2] == 1);
+    assert((last_gfp & __GFP_NORETRY) && !(last_gfp & __GFP_DIRECT_RECLAIM));
+    /* Without a hint the production scan runs and no medium counter moves. */
+    vmf.hermit_folio_order = 0; pte_maps = 0; medium_used[2] = 0;
+    f = alloc_swap_folio(&vmf);
+    assert(f && f->order == 9 && pte_maps == 1 && !medium_used[2]);
+    assert(!(last_gfp & __GFP_NORETRY) && (last_gfp & __GFP_DIRECT_RECLAIM));
+    /* A failed charge at the hinted order walks down to the next one. */
+    vmf.hermit_folio_order = 4; medium_used[3] = 0;
+    charge_fail = BIT(4);
+    f = alloc_swap_folio(&vmf);
+    assert(f->order == 3 && medium_used[3] == 1);
+    charge_fail = 0; medium_alloc_fallbacks = 0;
+    /* Every candidate order fails: one alloc fallback, base page. */
+    alloc_fail = BIT(2) | BIT(3) | BIT(4);
+    f = alloc_swap_folio(&vmf);
+    assert(f->order == 0 && medium_alloc_fallbacks == 1);
+    alloc_fail = 0;
+    vmf.hermit_folio_order = 0;
+}
+
+/* The path decision: LARGE keeps phase-A behaviour, MEDIUM is validated here
+ * so that a misaligned or fragmented extent keeps the 4 KiB SG batches. */
+static void medium_decision_tests(void)
+{
+    struct mm_struct mm;
+    struct vm_area_struct vma = { .vm_mm = &mm };
+    struct vm_fault vmf = { .vma = &vma, .address = 0x2000000 + 3 * PAGE_SIZE,
+        .orig_pte = 1024 + 3, .hermit_fault_pc = 0x1000 };
+
+    wr_mask = 0x3fd; enabled_orders = 0x3fc; extent = valid_order = 9;
+    alloc_fail = charge_fail = 0; uffd = zswap = map_fail = false;
+    /* No suggestion: the 4 KiB SG batches stay. */
+    policy_order = -1; policy_medium = false; policy_calls = 0;
+    assert(!hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(policy_calls == 1 && policy_orders == 0x3fc);
+    /* LARGE: alloc_swap_folio() validates, so no order is fixed here. */
+    policy_order = 9; pte_maps = 0;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(pte_maps == 0);
+    /* MEDIUM: the aligned range is checked before any folio is allocated. */
+    policy_order = 4; policy_medium = true; medium_extent_fallbacks = 0;
+    pte_maps = 0;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 4);
+    assert(!medium_extent_fallbacks && pte_maps == 1);
+    /* A fragmented extent keeps the highest legal order below the hint. */
+    valid_order = 2;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 2);
+    /* A ceiling above the legal mask never validates an illegal order. */
+    valid_order = 9; enabled_orders = BIT(2) | BIT(3) | BIT(4);
+    policy_order = 6;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 4);
+    enabled_orders = 0x3fc;
+    /* No legal order >= 2 at all: counted, and the SG batches stay. */
+    valid_order = 1;
+    assert(!hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(medium_extent_fallbacks == 1);
+    valid_order = 9;
+    /* A PTE map failure must keep the SG path too. */
+    map_fail = true;
+    assert(!hermit_swapin_folio(&vmf) && medium_extent_fallbacks == 2);
+    map_fail = false;
+    /* A 4 KiB ceiling, uffd and zswap never consult the policy. */
+    enabled_orders = BIT(0); policy_calls = 0;
+    assert(!hermit_swapin_folio(&vmf) && policy_calls == 0);
+    enabled_orders = 0x3fc; uffd = true; policy_calls = 0;
+    assert(!hermit_swapin_folio(&vmf) && policy_calls == 0); uffd = false;
+    zswap = true; assert(!hermit_swapin_folio(&vmf) && policy_calls == 0);
+    zswap = false;
+    policy_order = -1; policy_medium = false;
 }
 int main(void)
 {
@@ -310,13 +428,13 @@ int main(void)
         struct mm_struct mm;
         struct vm_area_struct vma = { .vm_mm = &mm };
         struct vm_fault vmf = { .vma = &vma, .address = 0x2000000 };
-        enabled_orders = 0x3fc; assert(hermit_swapin_large_allowed(&vmf));
-        enabled_orders = 0;     assert(!hermit_swapin_large_allowed(&vmf));
-        enabled_orders = BIT(0); assert(!hermit_swapin_large_allowed(&vmf));
-        enabled_orders = BIT(4); assert(hermit_swapin_large_allowed(&vmf));
+        enabled_orders = 0x3fc; assert(hermit_swapin_orders(&vmf) & BIT(4));
+        enabled_orders = 0;     assert(!hermit_swapin_orders(&vmf));
+        enabled_orders = BIT(0); assert(!(hermit_swapin_orders(&vmf) & ~BIT(0)));
+        enabled_orders = BIT(4); assert(hermit_swapin_orders(&vmf) == BIT(4));
         enabled_orders = 0x3fc;
-        uffd = true;  assert(!hermit_swapin_large_allowed(&vmf)); uffd = false;
-        zswap = true; assert(!hermit_swapin_large_allowed(&vmf)); zswap = false;
+        uffd = true;  assert(!hermit_swapin_orders(&vmf)); uffd = false;
+        zswap = true; assert(!hermit_swapin_orders(&vmf)); zswap = false;
     }
     uffd = true; check(0); uffd = false;
     zswap = true; check(0); zswap = false;
@@ -327,6 +445,8 @@ int main(void)
     wr_mask |= BIT(9); assert(hermit_swapout_order(&f) == 9);
     f.order = 0; assert(hermit_swapout_order(&f) == 0);
     f.order = 4; wr_mask = BIT(9); assert(hermit_swapout_order(&f) == 0);
+    medium_alloc_tests();
+    medium_decision_tests();
     puts("Swap-in allocation and max-granularity swap-out tests: PASS");
 }
 '''
@@ -646,6 +766,10 @@ typedef struct { u64 counter; } atomic64_t;
 #define HERMIT_POLICY_FLUSH 16
 #define HERMIT_POLICY_RESERVE 64
 #define HERMIT_POLICY_MGLRU 256
+#define HERMIT_POLICY_LARGE 128
+#define HERMIT_POLICY_MEDIUM 512
+#define PMD_ORDER 9
+#define BIT(n) (1UL << (n))
 #define HERMIT_POLICY_DEFAULT 0x1bf
 #define HERMIT_PEBS_MODE_POLICY 1
 #define GFP_NOWAIT 0
@@ -658,6 +782,8 @@ typedef struct { u64 counter; } atomic64_t;
 #define spin_lock(p) (locks++, assert(!(*(p))++))
 #define spin_unlock(p) assert((*(p))-- == 1)
 static unsigned int locks;
+static int policy_ilog2(unsigned long v) { return v ? 63 - __builtin_clzl(v) : 0; }
+#define ilog2(v) policy_ilog2((unsigned long)(v))
 struct hermit_policy_state;
 struct mm_struct { struct hermit_policy_state *hermit_policy; atomic64_t hermit_vma_generation; bool hermit_pebs_enabled; };
 struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end; };
@@ -851,6 +977,185 @@ static void fit_tests(void)
     current = saved;
 }
 
+/* Replay one segment of @len pages the way do_swap_page() does after Phase B:
+ * ask the policy for a folio order first, and only fall back to the 4 KiB
+ * predictor when it has no suggestion. Each read counts as one fault. */
+struct medium_walk {
+    unsigned int max_order, suggestions, reads;
+};
+
+static void replay_medium(struct vm_area_struct *vma, unsigned long base,
+                          unsigned int len, unsigned long pc, struct medium_walk *walk)
+{
+    unsigned int page = 0, read_to = 0;
+
+    while (page < len) {
+        unsigned long a = base + page * PAGE_SIZE;
+        struct vm_fault vmf = { .vma = vma, .address = a, .hermit_fault_pc = pc };
+        bool medium = false;
+        int order;
+
+        clock_ns += 1000;
+        if (page < read_to) {           /* swapcache hit on a read-ahead page */
+            hermit_policy_installed(&vmf, 9000 + page, a, 1);
+            page++;
+            continue;
+        }
+        order = hermit_policy_swapin_order(&vmf, 0x3fc, &medium);
+        if (order >= 0) {
+            unsigned int nr = 1U << order;
+
+            /* A MEDIUM folio must never read past the learned segment. */
+            assert(!medium || page + nr <= len);
+            if (medium) {
+                walk->suggestions++;
+                if ((unsigned int)order > walk->max_order)
+                    walk->max_order = order;
+            }
+            walk->reads++;
+            hermit_policy_installed(&vmf, 9000 + page, a, nr);
+            page += nr;
+            read_to = page;
+        } else {
+            unsigned int nr = hermit_policy_predict(&vmf);
+
+            vmf.hermit_batch_pages = nr;
+            walk->reads++;
+            read_to = page + nr;
+            hermit_policy_installed(&vmf, 9000 + page, a, 1);
+            page++;
+        }
+    }
+}
+
+static void medium_tests(void)
+{
+    const unsigned long base = 0x60000000UL, stride = 2UL << 20, pc = 0x403000;
+    struct mm_struct mm = { .hermit_vma_generation = { 1 } };
+    struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = base,
+                                 .vm_end = base + 64 * stride };
+    struct task_struct *saved = current;
+    unsigned int i, order4 = 0;
+    long suggested;
+
+    current = &threads[1];
+    fail_alloc = false; mglru = false; policy_swapin_max = 64;
+    policy_features = HERMIT_POLICY_DEFAULT;
+    policy_medium_max_order = 4; policy_medium_stable = 3;
+    /* The new bit is off by default: the 0x1bf baseline is unchanged. */
+    assert(!(HERMIT_POLICY_DEFAULT & HERMIT_POLICY_MEDIUM));
+    /* No suggestion without the bit, without a fault PC, or when the VMA
+     * cannot hold a >4 KiB folio at all. */
+    {
+        struct vm_fault vmf = { .vma = &vma, .address = base,
+                                .hermit_fault_pc = pc };
+        bool medium = true;
+
+        assert(hermit_policy_swapin_order(&vmf, 0x3fc, &medium) == -1);
+        assert(!medium);
+        policy_features |= HERMIT_POLICY_MEDIUM;
+        assert(hermit_policy_swapin_order(&vmf, BIT(0), &medium) == -1);
+        vmf.hermit_fault_pc = 0;
+        assert(hermit_policy_swapin_order(&vmf, 0x3fc, &medium) == -1);
+    }
+    /* Length and alignment arithmetic: only a stable, repeating segment that
+     * still has room for an aligned order is read as one folio. */
+    {
+        struct policy_stream s = {};
+        unsigned long last = base;
+
+        s.fit = 16; s.fit_stable = 3; s.last = last;
+        /* A new segment starts at page 0: the whole 64 KiB. */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 4);
+        /* A continuation is at page sequential + 1 and must be aligned to the
+         * order, because the folio is allocated at ALIGN_DOWN(fault, 1<<order). */
+        s.sequential = 0;
+        assert(policy_medium_order(&s, last + PAGE_SIZE) == -1);
+        s.sequential = 3;               /* position 4: order 2 */
+        assert(policy_medium_order(&s, last + PAGE_SIZE) == 2);
+        s.sequential = 7;               /* position 8: order 3 */
+        assert(policy_medium_order(&s, last + PAGE_SIZE) == 3);
+        s.sequential = 11;              /* position 12: four pages left */
+        assert(policy_medium_order(&s, last + PAGE_SIZE) == 2);
+        s.sequential = 12;              /* position 13: three pages left */
+        assert(policy_medium_order(&s, last + PAGE_SIZE) == -1);
+        s.sequential = 15;              /* the run already reached the length */
+        assert(policy_medium_order(&s, last + PAGE_SIZE) == -1);
+        s.fit_stable = 2;               /* not stable yet */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == -1);
+        s.fit_stable = 3; s.fit = 6;    /* rounded down to four pages */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 2);
+        s.fit = 3;                      /* shorter than the smallest order */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == -1);
+        s.fit = 16; policy_medium_max_order = 2;
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 2);
+        policy_medium_max_order = 6;
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 4);
+        policy_medium_max_order = 4;
+    }
+    /* Repeated 16-page segments: the first segments only teach the length (fit
+     * comes from the 4 KiB batches and is recorded at the next run break), then
+     * one order-4 folio per segment. */
+    suggested = medium_suggested.counter;
+    for (i = 0; i < 5; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + i * stride, 16, pc, &walk);
+        if (i < 4) {
+            assert(walk.suggestions == 0);
+        } else {
+            assert(walk.suggestions == 1 && walk.max_order == 4);
+            assert(walk.reads == 1);
+            order4 = walk.max_order;
+        }
+    }
+    assert(order4 == 4);
+    assert(medium_suggested.counter == suggested + 1);
+    /* The next segment keeps the order: the learned length is stable. */
+    {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + 5 * stride, 16, pc, &walk);
+        assert(walk.suggestions == 1 && walk.max_order == 4 && walk.reads == 1);
+    }
+    /* Mixed lengths never look stable, so no order is suggested: each stream
+     * below starts empty, which is the ablation-relevant guarantee. */
+    for (i = 0; i < 6; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (8 + i) * stride, i % 2 ? 32 : 16,
+                      pc + PAGE_SIZE, &walk);
+        assert(walk.suggestions == 0);
+    }
+    /* A six-page segment allows only what fits: order 2, never order 3. */
+    for (i = 0; i < 6; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (16 + i) * stride, 6, pc + 2 * PAGE_SIZE,
+                      &walk);
+        assert(walk.max_order <= 2);
+        if (i < 4) {
+            assert(walk.suggestions == 0);
+        } else {
+            assert(walk.suggestions > 0 && walk.max_order == 2);
+            assert(walk.reads == 2);    /* one order-2 folio and one batch */
+        }
+    }
+    /* Ablation: with the bit off, a stable stream keeps the 4 KiB path. */
+    policy_features = HERMIT_POLICY_DEFAULT;
+    for (i = 0; i < 7; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (24 + i) * stride, 16, pc + 3 * PAGE_SIZE,
+                      &walk);
+        assert(walk.suggestions == 0);
+    }
+    policy_features = HERMIT_POLICY_DEFAULT | HERMIT_POLICY_MEDIUM;
+    hermit_policy_mm_exit(&mm);
+    assert(live == 0);
+    current = saved;
+}
+
 int main(void)
 {
     struct mm_struct mm = { .hermit_vma_generation = { 1 } };
@@ -983,6 +1288,9 @@ int main(void)
     fit_tests();
     assert(live == 0);
     puts("Run-length fit tests: PASS");
+    medium_tests();
+    assert(live == 0);
+    puts("Fit-driven medium-order tests: PASS");
 }
 '''
     exit_start = source.index('void hermit_policy_mm_exit(')
@@ -992,8 +1300,9 @@ int main(void)
     # The first slice now ends where this one begins, so hermit_policy_sample()
     # is compiled too.
     installed_start = end
-    # Through hermit_policy_predict(), so run-length feedback is exercised end to end.
-    installed_end = source.index('bool hermit_policy_large(', installed_start)
+    # Through hermit_policy_predict() and the Phase B order suggestion, so
+    # run-length feedback and fit stability are exercised end to end.
+    installed_end = source.index('/* Record one page read speculatively', installed_start)
     header = (root / 'linux-stable/include/linux/hermit_policy.h').read_text()
     hint_struct = header[header.index('struct hermit_reclaim_hint {'):header.index('/* debugfs')]
     with tempfile.TemporaryDirectory(prefix='hermit-observe-test-') as tmp:
