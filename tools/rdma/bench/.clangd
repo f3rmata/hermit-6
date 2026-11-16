@@ -1,0 +1,4 @@
+# Userspace benchmark, not a kernel source file: do not inherit the kernel
+# compilation database or its freestanding flags from the repo-root .clangd.
+CompileFlags:
+  CompilationDatabase: None

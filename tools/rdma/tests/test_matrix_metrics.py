@@ -1,8 +1,12 @@
 """Offline fixtures for the two-table WR ABI and the base-page matrix."""
+# The drivers are imported from their own directory, not from an installed
+# package, so static resolvers cannot see them.
+# pyright: reportMissingImports=false
 from pathlib import Path
 import csv
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pebs'))
@@ -123,6 +127,65 @@ class MatrixMetricsTests(unittest.TestCase):
             row=next(r for r in paired if r['repeat']=='2' and r['baseline']=='4KiB-only')
             self.assertEqual(row['baseline_status'], 'missing')
             self.assertEqual(row['valid_pair'], 'False')
+
+
+class PolicyPresetTests(unittest.TestCase):
+    def test_preset_names_map_to_the_documented_masks(self):
+        self.assertEqual(metrics.policy_masks(['default']), [('default', 0x1bf)])
+        self.assertEqual(metrics.policy_masks(['no-pebs']), [('no-pebs', 0x1bd)])
+        self.assertEqual(metrics.policy_masks(['no-batch']), [('no-batch', 0x19f)])
+        # Ablations only clear bits of the default mask.
+        for _, mask in metrics.policy_masks(['default', 'no-pebs', 'no-batch']):
+            self.assertEqual(mask & ~metrics.DEFAULT_POLICY_MASK, 0)
+        self.assertEqual(0x1bf & ~0x2, 0x1bd)
+        self.assertEqual(0x1bf & ~0x20, 0x19f)
+
+    def test_raw_and_comma_separated_masks_are_accepted(self):
+        self.assertEqual(metrics.policy_masks(['0x1bd']), [('f1bd', 0x1bd)])
+        self.assertEqual(metrics.policy_masks(['445']), [('f1bd', 0x1bd)])
+        self.assertEqual(metrics.policy_masks(['default,no-pebs']),
+                         [('default', 0x1bf), ('no-pebs', 0x1bd)])
+        self.assertEqual(metrics.policy_masks(['default', 'default']), [('default', 0x1bf)])
+        for bad in (['bogus'], ['0x400'], ['-1'], []):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                metrics.policy_masks(bad)
+
+    def test_default_suffix_keeps_historical_case_names(self):
+        self.assertEqual(metrics.policy_suffix('default'), '')
+        self.assertEqual(metrics.policy_suffix(None), '')
+        self.assertEqual(metrics.policy_suffix('no-pebs'), '-no-pebs')
+
+    def test_each_preset_is_its_own_labelled_cell_sharing_off_and_static(self):
+        presets = metrics.policy_masks(['default', 'no-pebs', 'no-batch'])
+        cases = memcached.matrix_cases('', presets=presets)
+        plan = memcached.matrix_plan([64], 1, cases)
+        labels = {row['case']: row['policy_features'] for row in plan}
+        self.assertEqual(labels['policy-medium'], 0x1bf)
+        self.assertEqual(labels['policy-medium-no-pebs'], 0x1bd)
+        self.assertEqual(labels['policy-medium-no-batch'], 0x19f)
+        self.assertIsNone(labels['off'])
+        self.assertIsNone(labels['static-medium'])
+        # One shared off/static set per block, plus the separate 4 KiB-only off.
+        self.assertEqual(sum(1 for r in plan if r['case'] == 'off'), 2)
+        self.assertEqual(sum(1 for r in plan if r['case'].startswith('static-')), 3)
+        self.assertEqual(sum(1 for r in plan if r['case'].startswith('policy-')), 9)
+        self.assertEqual({r['max_page_kb'] for r in plan if r['case'] == 'off'}, {4, 64})
+
+    def test_workload_matrix_labels_policy_cells_per_preset(self):
+        base = dict(periods=[1999], pages=[64], repeats=1, seed=1,
+                    suites=['redis'], store_period=1)
+        args = SimpleNamespace(**base, policy_features=['default', 'no-pebs', 'no-batch'])
+        rows = workloads.plan(args)
+        labels = {row['case']: row['policy_features'] for row in rows}
+        self.assertEqual(labels['policy-1999'], 0x1bf)
+        self.assertEqual(labels['policy-1999-no-pebs'], 0x1bd)
+        self.assertEqual(labels['policy-1999-no-batch'], 0x19f)
+        self.assertEqual(labels['off'], None)
+        self.assertEqual(labels['static-1999'], None)
+        # Historical behaviour: without --policy-features no mask is written.
+        rows = workloads.plan(SimpleNamespace(**base, policy_features=None))
+        self.assertEqual({r['case'] for r in rows}, {'off', 'static-1999', 'policy-1999'})
+        self.assertTrue(all(r['policy_features'] is None for r in rows))
 
 
 if __name__ == '__main__':

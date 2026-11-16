@@ -304,3 +304,138 @@ SQLite 检查确定性查询/更新结果和 quick_check；GAPBS 要求验证 PA
 服务器需先构建完整内核以更新 Module.symvers，再用同一内核构建 rswap；backend ABI 已变化，旧模块不可混用。
 
 未运行 QEMU、回归矩阵、服务器工作负载或性能实验。实际 swap 次数、吞吐和延迟收益以服务器配对结果为准。
+
+* 2026-11-16 消融预设、换入成本计数与粒度微基准
+
+本阶段只增加实验工具与观测，不改变任何策略行为：`policy_features` 的默认值仍是
+`0x1bf`，新的成本计数默认关闭，微基准只在服务器上运行。
+
+** policy_features 消融预设
+
+两个矩阵入口都新增 `--policy-features`，用预设名、原始掩码或两者混合（逗号或空格分隔）
+在同一次矩阵内并列多个策略消融：
+
+| 预设名 | 掩码 | 相对默认关闭的机制 |
+|--------+------+---------------------|
+| =default= | =0x1bf= | 无（SWAPIN/PEBS/SORT/OBSERVE/FLUSH/BATCH/LARGE/MGLRU 全开） |
+| =no-pebs= | =0x1bd= | bit 1 PEBS 足迹投票（批次延长） |
+| =no-batch= | =0x19f= | bit 5 冷脏页 SG 合并换出 |
+
+预设只清除默认掩码中的位，因此每个消融单元与同一块的 =off=/=static= 单元共享 baseline；
+原始掩码（例如 =0x1a1=）也接受，标签使用 =f1a1= 形式。
+
+- =run_workload_matrix.py=：每个周期、每个预设生成一个 policy 单元，
+  case 名为 =policy-<period>=（=default=）或 =policy-<period>-<preset>=。
+  单元的 =policy_features= 写入 =summary.csv=；=plan.json= 记录 =policy_presets=。
+- =pebs_perf_matrix.py=：同理生成 =policy-adaptive[-preset]=、
+  =policy-low|medium|high[-preset]=；=manifest.json= 记录 =policy_presets= 与逐单元
+  =plan[*].policy_features=，单元 =config.json= 的 =controls.policy_features= 是实测值。
+
+运行示例（先 =--dry-run= 检查单元数）：
+
+#+begin_src sh
+python3 tools/rdma/pebs/run_workload_matrix.py --dry-run \
+  --suites anon-1t-full --pages 64 2048 --periods 1999 --repeats 1 \
+  --policy-features default no-pebs no-batch
+#+end_src
+
+规则与限制：
+
+- 不传 =--policy-features= 时保持历史行为：不写 `policy_features`，只在快照中记录其值，
+  所以旧命令行和旧结果口径不变。
+- 传入后该控制项由矩阵拥有：每个 policy 单元写入对应掩码并回读校验，被外部改动仍会
+  报配置漂移；退出时恢复原值（与采样控制项同样的恢复/校验流程）。
+- =off=/=static= 单元不写掩码；=static= 的采样模式为 =pebs_mode=0=，策略开关不影响它。
+- 消融单元仍然要求 =bypass_swapcache=Y=、backend order 覆盖所选上限，配对规则
+  (同一块内 =off= 与该块的 static/policy) 不变。
+- 标签是记录用途，不是证据：判断某个机制是否真的被消融，要看 =policy_stats= 差分
+  （例如关闭 BATCH 后 =mglru_candidates= 仍增长，但 batch read WR 不再出现）。
+
+** 换入成本计数（debugfs `swapin_cost_stats`）
+
+新增两个 debugfs 文件，默认不影响生产运行：
+
+| 文件 | 权限 | 含义 |
+|------+------+------|
+| =swapin_cost_stats= | 0400 | 逐 order 的换入成本与预取命中计数 |
+| =swapin_cost_enable= | 0600 | =0=（默认）/ =1=，static key 开关 |
+
+=swapin_cost_stats= 的字段（=name value=，顺序稳定，只追加）：
+
+#+begin_example
+enabled 1
+order0_faults 1234
+order0_ns 4567890
+...
+order9_faults 0
+order9_ns 0
+prefetched_4k 512
+prefetch_hit_faults 300
+prefetch_hit_ns 987654
+#+end_example
+
+语义：
+
+- =orderN_faults= / =orderN_ns=：=do_swap_page()= 入口到 PTE 安装之间的次数与总纳秒数，
+  按被安装 folio 的 order 记账。区间包含 backend 读、swapcache 处理和等待，因此是
+  "一次缺页的总成本"，不是 RDMA 读延迟（后者仍在 =hermit_stats_report()= 的
+  =RDMA read latency=）。时间戳复用缺页入口已有的 =ktime_get_mono_fast_ns()=，
+  不新增入口时钟。
+- =prefetched_4k=：=hermit_swapin_pages()= 为**其它地址**预读的页数（不含需求页），
+  包括之后变陈旧或读失败的页。
+- =prefetch_hit_faults= / =prefetch_hit_ns=：需求缺页在 swapcache 中直接找到
+  "策略预读过"的页的次数及其缺页成本。命中一次即消耗该记录，避免同一 entry 被重复计数；
+  记录 TTL 为 1 s，per-mm 直接映射 256 槽，槽冲突只会漏计一次命中，不影响任何策略输入。
+- =enabled= 是采样时刻的开关值；syscall 471 (=reset_swap_stats=) 同时清零这些计数。
+
+开销与边界：
+
+- 关闭时（默认）每次缺页只多一次已被 patch 成 nop 的 jump label 判断，不调用
+  =ktime_get_*=；开启后每次 swap 缺页增加一次 =ktime_get_mono_fast_ns()= 与两次
+  atomic64 加法，每个预读页额外一次 per-mm 策略锁。长时间生产运行不要默认开启。
+- 统计覆盖所有 swap 缺页（Hermit 直读与原生路径都算），不受 =policy_features= 影响；
+  但 =prefetch_*= 只在策略换入路径（=SWAPIN= 位 + =hermit_policy_active()=）有值。
+- 按 folio order 记账，不是传输 order：order-0 folio 的 SG 批次仍计入 order 0。
+- MGLRU 下预取命中来自 swapcache，与 =policy_stats= 的 =refault_4k= 是不同口径。
+
+** 粒度微基准（tools/rdma/bench/swapin_granularity.c）
+
+单线程微基准：映射 =SIZE_GIB= 匿名内存并写入校验模式，由驱动用 =memory.max=
+（或 =--madv-pageout=）把它换出，然后在随机 2 MiB 对齐起点上依次触碰
+=S∈{1,4,16,32,64,128}= 页的连续段。每次 trial 报告墙钟时间、GiB/s、
+=getrusage()= 的 minor/major 缺页增量和数据校验，并读取 =swapin_cost_stats=。
+
+#+begin_src sh
+sudo tools/rdma/bench/run_swapin_granularity.sh \
+  --pages "4 64 2048" --policy-features "off default no-pebs no-batch" \
+  --segments "1 4 16 32 64 128" --trials 5 --size-gib 8
+#+end_src
+
+- 每个 (页大小上限, 模式) 单元先在 cgroup 内填充，降低 =memory.max= 后等待
+  store 计数静默，再发 =SIGUSR1= 开始 trial；=DONE= 后驱动拍快照再 =SIGUSR2= 退出。
+- 驱动逐单元切换 PEBS 会话：先 =hermit_pebs_stop=，=off= 单元不启用采样，
+  policy 单元用 =enable_pebs_pid.py= 把本进程加入策略；=policy_features= 与
+  =swapin_cost_enable= 在退出时恢复。
+- 输出 =swapin-granularity.csv=（每次 trial：=page_kb,mode,policy_features,
+  segment_pages,trial,start_page,bytes,sec,gib_per_sec,minflt,majflt,checksum_errors=）
+  与 =swapin-cost.csv=（每单元 23 个 =swapin_cost_stats= 差分列）。每单元要求
+  =pswpin= 与 backend load 都有增长、每段都产生缺页且校验零错误，否则判定该单元无效。
+- 服务器上这是"策略换入粒度代价"的对照工具：off 的曲线是 4 KiB/大 folio 基线，
+  =0x1bf= 的曲线给出 1→2→4→…→64 页 ramp 的单次缺页成本，=no-pebs=/=no-batch=
+  用来判断哪个机制在 16–128 KiB 档位改变了斜率。不要用本地 DRAM/QEMU 结果代替。
+- 本机只做了编译和 =--populate-only= / 无 swap 的协议检查，未在服务器运行。
+
+** GAPBS 带宽口径修正
+
+=run_gapbs_page_sweep.sh= 原来把整个应用阶段（trial + 每次 trial 后的
+verification）的 backend load 字节数除以 *trial 计时之和*，分母缺了 verification，
+带宽因此虚高。现在两侧都用"字节被计数的同一区间"：
+
+- =load_phase_sec=：=order-before-swapin= 快照到 =order-after-swapin= 快照的墙钟时间，
+  与 =total_load_bytes= 同一区间；=load_phase_gib_per_sec= 用它做分母。
+- =store_phase_sec=：=order-before= 快照到 store 计数最后一次变化的墙钟时间；
+  =store_phase_gib_per_sec= 同样与 =total_store_bytes= 配对（不含收尾静默期）。
+- 旧列名 =protocol_gib_per_sec= / =load_protocol_gib_per_sec= 改为
+  =store_phase_*=/=load_phase_*=；历史结果目录不改。
+- =sweep_common.sh= 新增 =elapsed_seconds=，=tests/test_sweep_common.py= 固定
+  "分母必须是快照区间"这一约定；应用吞吐仍用 =trials_per_sec= 和 =trial_sec_total=。

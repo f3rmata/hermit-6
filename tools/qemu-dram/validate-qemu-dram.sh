@@ -325,6 +325,26 @@ verify_remote_order_mask() {
         [ \$((observed_effective)) -eq 1 ]
 }
 
+# Per-order swap-in cost instrumentation: prove both debugfs nodes exist, that
+# the static-key toggle round-trips, and that the table has the documented rows.
+configure_swapin_cost() {
+    stats=/sys/kernel/debug/hermit/swapin_cost_stats
+    enable=/sys/kernel/debug/hermit/swapin_cost_enable
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$enable" ]; then
+        echo "SWAPIN_COST: status=unavailable"
+        return 0
+    fi
+    printf '%s' 0 > "\$enable" || return 1
+    [ "\$(cat "\$enable")" -eq 0 ] || return 1
+    keys=\$(grep -c '^order[0-9]*_faults \|^order[0-9]*_ns ' "\$stats")
+    prefetch=\$(grep -c '^prefetch' "\$stats")
+    printf '%s' 1 > "\$enable" || return 1
+    enabled=\$(awk '\$1 == "enabled" { print \$2 }' "\$stats")
+    echo "SWAPIN_COST: status=checked enabled=\$enabled order_rows=\$keys prefetch_rows=\$prefetch"
+    [ "\$enabled" = 1 ] && [ "\$keys" -eq 20 ] && [ "\$prefetch" -eq 3 ]
+}
+
 configure_thp() {
     [ "$THP_SIZE_KB" -gt 0 ] || return 0
 
@@ -381,6 +401,7 @@ run_step swapon_ramdisk swapon /dev/ram0
 
 run_step load_rswap_client insmod /rswap-client.ko rmsize=$RSWAP_MEM_GB $RSWAP_MODULE_ARGS
 run_step configure_hermit configure_hermit
+run_step configure_swapin_cost configure_swapin_cost
 run_step verify_remote_order_mask verify_remote_order_mask
 run_step configure_thp configure_thp
 run_step reset_hermit_stats /bin/hermit_swap_stats reset boot
@@ -471,6 +492,17 @@ fi
 PSWPIN_AFTER=\$(read_vmstat_counter pswpin)
 PSWPOUT_AFTER=\$(read_vmstat_counter pswpout)
 RAMDISK_WRITE_SECTORS_AFTER=\$(read_ramdisk_write_sectors)
+SWAPIN_COST_FAULTS=0
+SWAPIN_COST_NS=0
+if [ -r /sys/kernel/debug/hermit/swapin_cost_stats ]; then
+    SWAPIN_COST_FAULTS=\$(awk '\$1 ~ /^order[0-9]+_faults\$/ { s += \$2 } END { print s + 0 }' \
+        /sys/kernel/debug/hermit/swapin_cost_stats)
+    SWAPIN_COST_NS=\$(awk '\$1 ~ /^order[0-9]+_ns\$/ { s += \$2 } END { print s + 0 }' \
+        /sys/kernel/debug/hermit/swapin_cost_stats)
+    SWAPIN_COST_HITS=\$(awk '\$1 == "prefetch_hit_faults" { print \$2 }' \
+        /sys/kernel/debug/hermit/swapin_cost_stats)
+    echo "SWAPIN_COST: label=after_reload faults=\$SWAPIN_COST_FAULTS total_ns=\$SWAPIN_COST_NS prefetch_hits=\$SWAPIN_COST_HITS"
+fi
 echo "VALIDATION_SNAPSHOT: label=after_reload stores=\$RSWAP_STORES_AFTER loads=\$RSWAP_LOADS_AFTER errors=\$RSWAP_ERRORS_AFTER pswpin=\$PSWPIN_AFTER pswpout=\$PSWPOUT_AFTER memhog_rc=\$MEMHOG_RC"
 
 boot_end_ms=\$(now_ms)
@@ -497,6 +529,16 @@ if ! emit_validation_check memhog_rc_eq_0 "\$MEMHOG_RC" eq 0; then
 fi
 if ! emit_validation_check local_swap_write_sectors_unchanged "\$RAMDISK_WRITE_SECTORS_AFTER" eq "\$RAMDISK_WRITE_SECTORS_BOOT"; then
     VALIDATION_PASS=0
+fi
+if [ -r /sys/kernel/debug/hermit/swapin_cost_stats ]; then
+    # The cost table is enabled for this run: the reload must have recorded
+    # swap-in faults and non-zero fault time at the folio orders it installed.
+    if ! emit_validation_check swapin_cost_faults_gt_0 "\$SWAPIN_COST_FAULTS" gt 0; then
+        VALIDATION_PASS=0
+    fi
+    if ! emit_validation_check swapin_cost_ns_gt_0 "\$SWAPIN_COST_NS" gt 0; then
+        VALIDATION_PASS=0
+    fi
 fi
 if [ "$THP_SIZE_KB" -gt 0 ]; then
     if ! emit_validation_check large_stores_before_gt_0 "\${LARGE_STORES_BEFORE:-0}" gt 0; then
@@ -552,7 +594,7 @@ run_qemu() {
 
 extract_summary() {
     if [ -f "$SERIAL_LOG" ]; then
-        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
+        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
     fi
 }
 

@@ -8,6 +8,57 @@ POLICY_FIELDS = ('observed_4k', 'cold_observations', 'invalid_epochs', 'late_sam
                  'predicted_4k', 'refault_4k', 'ranked_candidates')
 PAGE_SIZES = (4, 16, 32, 64, 128, 256, 512, 1024, 2048)
 
+# Named policy_features ablations. Each preset only clears bits from the
+# default mask, so one matrix can compare the full policy against a single
+# disabled mechanism and still pair every policy cell with that block's
+# off/static cells. Values follow HERMIT_POLICY_* in include/linux/hermit_policy.h.
+POLICY_MASKS = {
+    'default': 0x1bf,   # SWAPIN|PEBS|SORT|OBSERVE|FLUSH|BATCH|LARGE|MGLRU
+    'no-pebs': 0x1bd,   # PEBS footprint vote removed
+    'no-batch': 0x19f,  # SG writeout of cold dirty pages removed
+}
+DEFAULT_POLICY_MASK = POLICY_MASKS['default']
+
+
+def policy_mask(value):
+    """Resolve a preset name, decimal mask or 0x mask to (label, mask)."""
+    text = str(value).strip()
+    if text in POLICY_MASKS:
+        return text, POLICY_MASKS[text]
+    try:
+        mask = int(text, 0)
+    except ValueError:
+        raise ValueError(f'unknown policy_features preset or mask {value!r}; '
+                         f'known presets: {", ".join(POLICY_MASKS)}') from None
+    if mask < 0 or mask > 0x1ff:
+        raise ValueError(f'policy_features mask {value!r} is outside 0..0x1ff')
+    return 'f%x' % mask, mask
+
+
+def policy_masks(values):
+    """Ordered unique [(label, mask)] from --policy-features values.
+
+    Accepts preset names, raw masks, and comma-separated combinations, so
+    ``--policy-features default no-pebs`` and ``--policy-features default,no-pebs``
+    are equivalent.
+    """
+    result = []
+    for value in values or ():
+        for item in str(value).split(','):
+            if not item.strip():
+                continue
+            entry = policy_mask(item)
+            if entry not in result:
+                result.append(entry)
+    if not result:
+        raise ValueError('no policy_features preset selected')
+    return result
+
+
+def policy_suffix(label):
+    """Case-label suffix; the default mask keeps the historical case names."""
+    return '' if label in (None, 'default') else '-' + label
+
 
 def counter_delta(before, after):
     if before.keys() != after.keys():

@@ -42,6 +42,63 @@ order_total_stores() {
   snapshot_order_stats | awk 'NR > 1 { total += $3 } END { printf "%d", total }'
 }
 
+# Seconds between two `date +%s%N` samples. Protocol bandwidth must pair a
+# counter delta with the interval the counters were sampled in; a protocol
+# timer (for example the sum of application trial times) excludes work that the
+# counter delta includes, such as graph re-verification between trials.
+elapsed_seconds() {
+  local start=$1 end=$2
+  [[ "$start" =~ ^[0-9]+$ ]] && [[ "$end" =~ ^[0-9]+$ ]] || return 1
+  [ "$end" -ge "$start" ] || return 1
+  awk -v a="$start" -v b="$end" 'BEGIN { printf "%.6f", (b - a) / 1000000000 }'
+}
+
+# policy_features ablations shared with the Python matrix runners
+# (tools/rdma/pebs/matrix_metrics.py POLICY_MASKS). Presets only clear bits of
+# the default mask; any other value is passed through as a raw mask.
+policy_mask_of() {
+  case "$1" in
+    default) printf '0x1bf' ;;
+    no-pebs) printf '0x1bd' ;;
+    no-batch) printf '0x19f' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+valid_policy_mask() {
+  [[ "$1" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] || return 1
+  local value
+  value=$(( $1 ))
+  [ "$value" -ge 0 ] && [ "$value" -le 511 ]
+}
+
+# Per-order swap-in cost table (debugfs swapin_cost_stats). Rows are
+# "name value"; keep this order stable, it also defines the CSV columns.
+COST_STATS_FILE=${COST_STATS_FILE:-/sys/kernel/debug/hermit/swapin_cost_stats}
+COST_ENABLE_FILE=${COST_ENABLE_FILE:-/sys/kernel/debug/hermit/swapin_cost_enable}
+
+cost_keys() {
+  local order
+  for order in $(seq 0 9); do
+    printf 'order%s_faults\norder%s_ns\n' "$order" "$order"
+  done
+  printf 'prefetched_4k\nprefetch_hit_faults\nprefetch_hit_ns\n'
+}
+
+cost_stat() {
+  awk -v k="$2" '$1 == k { print $2; found = 1 } END { if (!found) print 0 }' "$1"
+}
+
+cost_delta() {
+  local before after key old new
+  before=$1 after=$2 key=$3
+  old=$(cost_stat "$before" "$key") || return 1
+  new=$(cost_stat "$after" "$key") || return 1
+  [[ "$old" =~ ^[0-9]+$ ]] && [[ "$new" =~ ^[0-9]+$ ]] || return 1
+  [ "$new" -ge "$old" ] || return 1
+  printf '%s' "$(( new - old ))"
+}
+
 memory_event() {
   local key=$1
   awk -v key="$key" '$1 == key { print $2; found=1 } END { if (!found) print 0 }' \

@@ -518,6 +518,14 @@ static u64 ktime_get_ns(void) { return 1; }
 #define hermit_backend_account(a, b, c, d) ((void)0)
 static void hermit_latency_add(int kind, u64 ns) { (void)kind; (void)ns; }
 #define HMT_LAT_BACKEND_READ 0
+/* Swap-in cost instrumentation hooks, off unless a test enables them. */
+static bool cost_enabled;
+static unsigned long prefetched_entries[64];
+static unsigned int prefetched_calls, prefetched_total;
+static bool hermit_swapin_cost_enabled(void) { return cost_enabled; }
+static void hermit_policy_prefetched(struct mm_struct *mm, unsigned long entry)
+{ (void)mm; if (prefetched_calls < 64) prefetched_entries[prefetched_calls] = entry; prefetched_calls++; }
+static void hermit_swapin_cost_prefetched(unsigned int nr) { prefetched_total += nr; }
 static int hermit_backend_submit_batch(struct hermit_batch *b)
 {
     assert(b->nr >= 1 && b->nr <= HERMIT_BATCH_MAX);
@@ -545,6 +553,7 @@ static struct folio *run(unsigned int nr_ptes, unsigned int predict, unsigned in
     vmf.orig_pte = ptes[fault];
     submits = polls = outstanding = max_outstanding = lock_calls = 0;
     predicted = predict;
+    prefetched_calls = prefetched_total = 0;
     return hermit_swapin_pages((swp_entry_t){ 1000 + fault }, 0, &vmf);
 }
 int main(void)
@@ -581,6 +590,14 @@ int main(void)
     /* No memory for the work area: demand page still read alone. */
     fail_kmalloc = true; d = run(512, 64, 0); fail_kmalloc = false;
     assert(d->uptodate && submits == 1);
+    /* Cost instrumentation is inert until debugfs enables it. */
+    assert(!prefetched_calls && !prefetched_total);
+    cost_enabled = true; run(512, 16, 0);
+    /* Only the pages read for other addresses are recorded, and every
+     * speculative page is counted even if it is later found stale. */
+    assert(prefetched_calls == 15 && prefetched_total == 15);
+    assert(prefetched_entries[0] == 1001 && prefetched_entries[14] == 1015);
+    cost_enabled = false;
     puts("4 KiB batched swap-in tests: PASS");
 }
 '''
@@ -1046,6 +1063,143 @@ int main(void)
                         '-fsanitize=address,undefined', '-g', str(cfile), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
+def test_swapin_cost():
+    """Per-order swap-in cost counters and the prefetch-hit set."""
+    root = Path(__file__).resolve().parents[3]
+    stats = (root / 'linux-stable/mm/hermit_stats.c').read_text()
+    policy = (root / 'linux-stable/mm/hermit_policy.c').read_text()
+    counters = stats[stats.index('struct hermit_time_stat {'):
+                     stats.index('static const char * const hermit_counter_names')]
+    reset = stats[stats.index('void hermit_stats_reset(void)'):
+                  stats.index('void hermit_stats_report(void)')]
+    prefetch = policy[policy.index('/* Record one page read speculatively'):
+                      policy.index('struct hint_walk {')]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef uint64_t u64;
+#define HERMIT_COST_ORDERS 10
+#define HMT_STAT_NR 1
+#define HMT_LAT_NR 1
+#define POLICY_TTL 1000ULL
+#define POLICY_PREFETCH_BITS 8
+#define POLICY_PREFETCH_SLOTS (1U << POLICY_PREFETCH_BITS)
+typedef struct { long long counter; } atomic64_t;
+typedef struct { long counter; } atomic_long_t;
+#define atomic64_add(v, p) ((p)->counter += (long long)(v))
+#define atomic64_inc(p) ((p)->counter++)
+#define atomic64_read(p) ((p)->counter)
+#define atomic64_set(p, v) ((p)->counter = (long long)(v))
+#define atomic_long_set(p, v) ((p)->counter = (long)(v))
+static atomic_long_t hermit_counters[HMT_STAT_NR];
+#define DEFINE_STATIC_KEY_FALSE(name) static int name##_defined __attribute__((unused))
+/* The lock is a real counter so the tests can prove the set is entered once. */
+typedef int spinlock_t;
+static unsigned int lock_depth;
+#define spin_lock_irqsave(p, flags) do { assert(!(*(p))++); flags = 0; lock_depth++; } while (0)
+#define spin_unlock_irqrestore(p, flags) do { assert((*(p))-- == 1); (void)(flags); lock_depth--; } while (0)
+static unsigned long policy_hash(unsigned long v, unsigned int bits)
+{ return ((v * 0x61c8864680b583ebUL) >> (64 - bits)) & ((1U << bits) - 1); }
+#define hash_long(v, bits) policy_hash((v), (bits))
+static u64 clock_ns = 5000;
+static u64 ktime_get_ns(void) { return clock_ns; }
+struct hermit_policy_state {
+    spinlock_t lock;
+    unsigned int nr, refault;
+    u64 id;
+    struct {
+        unsigned long entry;
+        u64 time;
+    } prefetch[POLICY_PREFETCH_SLOTS];
+};
+struct mm_struct { struct hermit_policy_state *hermit_policy; };
+#define READ_ONCE(x) (x)
+'''
+    # Declared after the extracted struct: hermit_stats_reset() resets it.
+    mid = r'''
+static struct hermit_time_stat hermit_latencies[HMT_LAT_NR];
+'''
+    tests = r'''
+static struct hermit_policy_state state;
+static struct mm_struct mm;
+
+int main(void)
+{
+    unsigned int i;
+
+    /* Per-order counters: out-of-range orders are ignored, reset clears. */
+    hermit_swapin_cost_add(0, 1000);
+    hermit_swapin_cost_add(0, 500);
+    hermit_swapin_cost_add(4, 7000);
+    hermit_swapin_cost_add(9, 1);
+    hermit_swapin_cost_add(HERMIT_COST_ORDERS, 42);
+    assert(atomic64_read(&hermit_swapin_cost[0].count) == 2);
+    assert(atomic64_read(&hermit_swapin_cost[0].total_ns) == 1500);
+    assert(atomic64_read(&hermit_swapin_cost[4].count) == 1);
+    assert(atomic64_read(&hermit_swapin_cost[4].total_ns) == 7000);
+    assert(atomic64_read(&hermit_swapin_cost[9].count) == 1);
+    for (i = 1; i < HERMIT_COST_ORDERS; i++)
+        if (i != 4 && i != 9)
+            assert(atomic64_read(&hermit_swapin_cost[i].count) == 0);
+    hermit_swapin_cost_prefetched(7);
+    hermit_swapin_cost_hit(200);
+    hermit_swapin_cost_hit(300);
+    assert(atomic64_read(&hermit_prefetched_pages) == 7);
+    assert(atomic64_read(&hermit_prefetch_hits) == 2);
+    assert(atomic64_read(&hermit_prefetch_hit_ns) == 500);
+    hermit_stats_reset();
+    assert(atomic64_read(&hermit_swapin_cost[0].count) == 0);
+    assert(atomic64_read(&hermit_swapin_cost[4].total_ns) == 0);
+    assert(atomic64_read(&hermit_prefetched_pages) == 0);
+    assert(atomic64_read(&hermit_prefetch_hits) == 0);
+    assert(atomic64_read(&hermit_prefetch_hit_ns) == 0);
+
+    /* Prefetch set: a recorded entry is consumed by exactly one hit. */
+    memset(&state, 0, sizeof(state));
+    mm.hermit_policy = &state;
+    hermit_policy_prefetched(&mm, 0x1234);
+    assert(lock_depth == 0);
+    assert(hermit_policy_prefetch_hit(&mm, 0x1234));
+    assert(!hermit_policy_prefetch_hit(&mm, 0x1234));
+    /* An unrelated entry is never a hit. */
+    hermit_policy_prefetched(&mm, 0x2000);
+    assert(!hermit_policy_prefetch_hit(&mm, 0x2001));
+    assert(hermit_policy_prefetch_hit(&mm, 0x2000));
+    /* Expired entries are ignored. */
+    hermit_policy_prefetched(&mm, 0x3000);
+    clock_ns += POLICY_TTL;
+    assert(!hermit_policy_prefetch_hit(&mm, 0x3000));
+    /* Direct-mapped collisions keep the newest entry only, and a miss for the
+     * evicted one is harmless: it is a lost hit count, never a policy input. */
+    clock_ns += POLICY_TTL;
+    hermit_policy_prefetched(&mm, 0x4100);
+    hermit_policy_prefetched(&mm, 0x4100 + (1UL << (64 - POLICY_PREFETCH_BITS)) * 0);
+    assert(hermit_policy_prefetch_hit(&mm, 0x4100));
+    assert(lock_depth == 0);
+    /* No per-mm state: the instrumentation is a no-op. */
+    mm.hermit_policy = NULL;
+    hermit_policy_prefetched(&mm, 0x5555);
+    assert(!hermit_policy_prefetch_hit(&mm, 0x5555));
+    /* The unrelated counter arrays stay untouched by the cost table. */
+    assert(hermit_counters[0].counter == 0);
+    assert(hermit_latencies[0].count.counter == 0);
+    puts("swap-in cost instrumentation tests: PASS");
+
+    return 0;
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='hermit-cost-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + counters + mid + reset + prefetch + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                        '-Wno-unused-parameter', '-fsanitize=address,undefined', '-g',
+                        str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
 
 if __name__ == '__main__':
     test_rdma_submission()
@@ -1055,3 +1209,4 @@ if __name__ == '__main__':
     test_swapin_pages()
     test_cold_observe()
     test_shadow_refault()
+    test_swapin_cost()

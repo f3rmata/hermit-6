@@ -205,9 +205,11 @@ port = sys.argv[sys.argv.index('--port') + 1]
                     p = subprocess.Popen([str(binary), '4', advice, '2048', 'chunk64k',
                                           'sequential', 'high', '1', '1'], stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True)
+                    assert p.stdout is not None and p.stderr is not None
+                    stdout, stderr = p.stdout, p.stderr
                     def response(prefix):
-                        self.assertTrue(select.select([p.stdout], [], [], 10)[0], 'worker timed out')
-                        line = p.stdout.readline()
+                        self.assertTrue(select.select([stdout], [], [], 10)[0], 'worker timed out')
+                        line = stdout.readline()
                         self.assertTrue(line.startswith(prefix), line)
                         return dict(word.split('=', 1) for word in line.split()[1:])
                     try:
@@ -226,6 +228,112 @@ port = sys.argv[sys.argv.index('--port') + 1]
                         if p.poll() is None:
                             p.kill(); p.wait()
                         p.stdout.close(); p.stderr.close()
+
+    def test_bandwidth_uses_the_interval_its_bytes_were_sampled_in(self):
+        # Protocol counters are snapshotted around a phase, so the pairing
+        # interval is wall time between the snapshots. GAPBS verification
+        # runs inside that window but outside the trial timer.
+        self.assertEqual(shell('elapsed_seconds 1000000000 3500000000').stdout.strip(),
+                         '2.500000')
+        self.assertEqual(shell('elapsed_seconds 500 500').stdout.strip(), '0.000000')
+        for values in ('4000 3000', '4000 x'):
+            with self.subTest(values=values):
+                self.assertNotEqual(shell('elapsed_seconds '+values, check=False).returncode, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = (Path(directory)/name for name in ('before', 'after'))
+            # 2 MiB loaded, counted over a 4 s phase including verification.
+            before.write_text(HEADER+'0 4096 0 0 0 0\n')
+            after.write_text(HEADER+'0 4096 0 512 0 0\n')
+            seconds = shell('elapsed_seconds 2000000000 6000000000').stdout.strip()
+            result = shell('summarize_loads "$1" "$2" "$3"; printf "%s|%s\n" \
+                "$total_load_bytes" "$load_protocol_gib_per_sec"', before, after, seconds)
+            # 512 pages * 4096 B / 4 s = 0.000488 GiB/s, not /trial-time.
+            self.assertEqual(result.stdout.strip(), '2097152|0.000488')
+
+    def test_gapbs_reports_phase_bandwidth_not_trial_bandwidth(self):
+        source = (COMMON.parent/'run_gapbs_page_sweep.sh').read_text()
+        self.assertIn('load_start_ns=$(date +%s%N)', source)
+        self.assertIn('load_end_ns=$(date +%s%N)', source)
+        self.assertIn('load_phase_sec=$(elapsed_seconds "$load_start_ns" "$load_end_ns")', source)
+        self.assertIn('summarize_loads "$load_before" "$load_after" "$load_phase_sec"', source)
+        self.assertIn('store_phase_sec=$(elapsed_seconds "$store_start_ns" "$last_change_ns")', source)
+        self.assertNotIn('summarize_loads "$load_before" "$load_after" "$trial_sec"', source)
+        header = next(line for line in source.splitlines() if line.startswith("printf 'page_kb,"))
+        self.assertIn('store_phase_sec,store_phase_gib_per_sec', header)
+        self.assertIn('load_phase_sec,load_phase_gib_per_sec', header)
+        self.assertNotIn('load_protocol_gib_per_sec', header)
+
+
+    def test_cost_table_helpers_diff_stable_columns(self):
+        keys = ' '.join(shell('cost_keys').stdout.split())
+        self.assertEqual(keys.split(),
+                         ['order0_faults', 'order0_ns', 'order1_faults', 'order1_ns',
+                          'order2_faults', 'order2_ns', 'order3_faults', 'order3_ns',
+                          'order4_faults', 'order4_ns', 'order5_faults', 'order5_ns',
+                          'order6_faults', 'order6_ns', 'order7_faults', 'order7_ns',
+                          'order8_faults', 'order8_ns', 'order9_faults', 'order9_ns',
+                          'prefetched_4k', 'prefetch_hit_faults', 'prefetch_hit_ns'])
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = (Path(directory)/name for name in ('before', 'after'))
+            before.write_text('enabled 1\norder0_faults 10\norder0_ns 1000\nprefetch_hit_faults 2\n')
+            after.write_text('enabled 1\norder0_faults 14\norder0_ns 5000\nprefetch_hit_faults 5\n')
+            self.assertEqual(shell('cost_delta "$1" "$2" order0_faults; echo; \
+                cost_delta "$1" "$2" order0_ns; echo; \
+                cost_delta "$1" "$2" prefetch_hit_faults; echo; \
+                cost_delta "$1" "$2" order9_ns', before, after).stdout.split(),
+                ['4', '4000', '3', '0'])
+            # A reset counter must not be reported as a negative delta.
+            before.write_text('order0_faults 20\n')
+            after.write_text('order0_faults 3\n')
+            self.assertNotEqual(shell('cost_delta "$1" "$2" order0_faults', before, after,
+                                      check=False).returncode, 0)
+
+    def test_policy_mask_names_match_the_python_presets(self):
+        expected = {'default': '0x1bf', 'no-pebs': '0x1bd', 'no-batch': '0x19f'}
+        for name, mask in expected.items():
+            with self.subTest(preset=name):
+                self.assertEqual(shell('policy_mask_of '+name).stdout.strip(), mask)
+                self.assertEqual(shell('valid_policy_mask '+mask).returncode, 0)
+        self.assertEqual(shell('policy_mask_of 0x1ae').stdout.strip(), '0x1ae')
+        for bad in ('0x200', '1024', 'zz', ''):
+            with self.subTest(mask=bad):
+                self.assertNotEqual(shell('valid_policy_mask "$1"', bad, check=False).returncode, 0)
+
+
+    def test_granularity_runner_parses_the_trial_protocol(self):
+        runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
+        source = runner.read_text()
+
+        def definition(name):
+            start = source.index(name+'() {')
+            return source[start:source.index('\n}\n', start)+3]
+
+        log = ('POPULATE pages=4 size_bytes=16384 sec=0.1\n'
+               'READY pid=9 pages=4 size_bytes=16384\nRUN\n'
+               'TRIAL seg=1 trial=1 start_page=512 bytes=4096 sec=0.001 gib_per_sec=3.8 '
+               'minflt=2 majflt=1 checksum_errors=0\n'
+               'TRIAL seg=1 trial=2 start_page=768 bytes=4096 sec=0.003 gib_per_sec=1.3 '
+               'minflt=1 majflt=1 checksum_errors=0\n'
+               'TRIAL seg=4 trial=1 start_page=1024 bytes=16384 sec=0.004 gib_per_sec=3.8 '
+               'minflt=0 majflt=4 checksum_errors=0\n'
+               'DONE sec=0.008 trials=3 pages=6 checksum_errors=0\n')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'bench.log'
+            path.write_text(log)
+            result = shell(definition('emit_trials') + definition('trial_summary') + '''
+                emit_trials "$1" 64 policy 0x1bf
+                trial_summary 1 "$1"
+                trial_summary 4 "$1"
+                trial_summary 16 "$1"
+            ''', path)
+            lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], '64,policy,0x1bf,1,1,512,4096,0.001,3.8,2,1,0')
+        self.assertEqual(lines[1], '64,policy,0x1bf,1,2,768,4096,0.003,1.3,1,1,0')
+        self.assertEqual(lines[2], '64,policy,0x1bf,4,1,1024,16384,0.004,3.8,0,4,0')
+        # trial_summary prints faults,checksum_errors,seconds,bytes per segment.
+        self.assertEqual(lines[3], '5,0,0.004000,8192')
+        self.assertEqual(lines[4], '4,0,0.004000,16384')
+        self.assertEqual(lines[5], '0,0,0.000000,0')
 
 
 if __name__ == '__main__':

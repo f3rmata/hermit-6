@@ -6,7 +6,8 @@
 import argparse, ctypes, csv, fcntl, json, os, pwd, random, re, signal, socket, subprocess, time, hashlib, shutil, resource, itertools
 from pathlib import Path
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, PAGE_SIZES, counter_delta, wr_delta,
-                            policy_delta, policy_activity, page_ceiling_settings, read_optional, write_comparisons)
+                            policy_delta, policy_activity, policy_masks, policy_suffix,
+                            page_ceiling_settings, read_optional, write_comparisons)
 D = Path('/sys/kernel/debug/hermit')
 LIBC = ctypes.CDLL(None, use_errno=True)
 LIBC.syscall.restype = ctypes.c_long
@@ -96,12 +97,24 @@ def thp_settings():
     return {str(p): re.search(r'\[([^]]+)\]', read(p))[1] for p in root.rglob('enabled')}
 
 
-def matrix_cases(selected, fixed=True):
-    cases = [('off', None, None), ('off-original-mask', None, None),
-             ('off-same-pages', None, None), ('static-adaptive', 0, None), ('policy-adaptive', 1, None)]
-    if fixed:
-        for label, period in [('low', 19997), ('medium', 1999), ('high', 199)]:
-            cases.extend((f'{name}-{label}', mode, period) for mode, name in enumerate(('static', 'policy')))
+def matrix_cases(selected, fixed=True, presets=None):
+    """Cells of one matrix block.
+
+    @presets is [(label, mask)] from matrix_metrics.policy_masks(); None keeps
+    the historical single policy cell that preserves the kernel's mask. Each
+    preset adds its own labelled policy cases so the block's off/static cells
+    are shared by every ablation.
+    """
+    cases = [('off', None, None, None), ('off-original-mask', None, None, None),
+             ('off-same-pages', None, None, None), ('static-adaptive', 0, None, None)]
+    periods = [('low', 19997), ('medium', 1999), ('high', 199)] if fixed else []
+    for label, period in periods:
+        cases.append((f'static-{label}', 0, period, None))
+    for suffix_name, mask in (presets or [(None, None)]):
+        suffix = policy_suffix(suffix_name)
+        cases.append((f'policy-adaptive{suffix}', 1, None, mask))
+        for label, period in periods:
+            cases.append((f'policy-{label}{suffix}', 1, period, mask))
     names = selected.split(',') if selected else ['off', *(c[0] for c in cases if c[2] is not None)]
     if len(names) != len(set(names)) or set(names) - {c[0] for c in cases}:
         raise ValueError('unknown or duplicate case')
@@ -114,13 +127,14 @@ def matrix_plan(pages, repeats, cases):
     if pages and 4 not in pages:
         ceilings = [4, *pages]
     for repeat, ceiling in itertools.product(range(1, repeats + 1), ceilings):
-        order = cases.copy() if not pages or ceiling in pages else [('off', None, None)]
+        order = cases.copy() if not pages or ceiling in pages else [('off', None, None, None)]
         if pages and ceiling == 4 and not any(c[0] == 'off' for c in order):
-            order.insert(0, ('off', None, None))
+            order.insert(0, ('off', None, None, None))
         random.Random(20261006 + repeat + (ceiling or 0)).shuffle(order)
         rows.extend(dict(repeat=repeat, max_page_kb=ceiling, case=label, mode=mode,
                          baseline_role='4KiB-only' if ceiling == 4 and label == 'off' else '',
-                         load_period=period) for label, mode, period in order)
+                         load_period=period, policy_features=mask)
+                    for label, mode, period, mask in order)
     return rows
 
 
@@ -273,6 +287,7 @@ def main():
     ap.add_argument('--thp',choices=['preserve'],default='preserve',help='Compatibility option; allocation is preserved unless --pages is supplied')
     ap.add_argument('--pages', nargs='+', type=int, choices=PAGE_SIZES,
                     help='allocation ceilings in KiB, plus a 4KiB/off reference; smaller sizes stay eligible; omitted preserves THP')
+    ap.add_argument('--policy-features',nargs='+',default=None,help='policy_features ablations for policy cells: preset names (default, no-pebs, no-batch), raw masks (0x1bd) or comma-separated lists; each preset becomes a labelled policy case; omitted preserves the kernel mask and is restored on exit')
     ap.add_argument('--dry-run', action='store_true', help='print matrix without sudo or host changes')
     ap.add_argument('--port',type=int,default=11329);ap.add_argument('--require-fixed',action='store_true')
     ap.add_argument('--memory-mb',type=int,default=640)
@@ -284,15 +299,19 @@ def main():
 
     ap.add_argument('--cases',default='',help='Comma separated subset; default off plus six fixed-period cases; all cases preserve the backend mask')
     ap.add_argument('--diagnostic',action='store_true',help='Allow zero samples but explicitly mark sampling ineffective')
-    ap.add_argument('--policy-features',type=lambda v:int(v,0),help='policy_features bitmask for all policy cells (ablation); restored on exit')
     args=ap.parse_args()
     if min(args.repeats,args.duration,args.warmup,args.memory_mb,args.records,args.connections)<=0 or args.qps<0: ap.error('parameters must be positive')
     if args.pages and len(set(args.pages)) != len(args.pages): ap.error('duplicate page ceilings')
-    try: cases = matrix_cases(args.cases)
+    presets=None
+    if args.policy_features:
+        try: presets=policy_masks(args.policy_features)
+        except ValueError as exc: ap.error(str(exc))
+    try: cases = matrix_cases(args.cases, presets=presets)
     except ValueError as exc: ap.error(str(exc))
     if args.dry_run:
         plan = matrix_plan(args.pages, args.repeats, cases)
         print(json.dumps(dict(samples=len(plan), baseline_case='off', plan=plan,
+                              policy_presets=presets,
                               page_policy='max-allocation-v1' if args.pages else 'preserve-system',
                               writes=False, workload_execution=False), indent=2))
         return
@@ -313,7 +332,7 @@ def main():
     if not fixed and any(c[2] is not None for c in cases): ap.error('fixed-period cases require fixed sampling controls')
     if fixed: controls+=['pebs_adaptive','pebs_load_period','pebs_store_period']
     controls+=[f for f in ('policy_features','policy_cold_us','policy_cold_epochs','policy_swapin_max') if (D/f).exists()]
-    if args.policy_features is not None and 'policy_features' not in controls:
+    if args.policy_features and 'policy_features' not in controls:
         ap.error('running kernel has no policy_features control')
     saved={f:read(D/f).strip() for f in controls}
     thp_control=Path('/sys/kernel/mm/transparent_hugepage/enabled')
@@ -371,6 +390,7 @@ def main():
     (out/'backend-symbols.txt').write_text('\n'.join(l for l in read('/proc/kallsyms').splitlines() if 'rswap_rdma' in l))
     manifest['cases']=cases
     manifest['plan']=matrix_plan(args.pages, args.repeats, cases)
+    manifest['policy_presets']=presets
     manifest['sampling_cost_reference']=next((name for name in ('off','off-same-pages','off-original-mask')
                                               if any(c[0]==name for c in cases)),None)
     manifest['sampler_cpus']=sampler_ids
@@ -407,10 +427,10 @@ def main():
         for key,value in {'bypass_swapcache':'Y','speculative_io':'Y','lazy_poll':'N','apt_reclaim':'Y'}.items():write(D/key,value)
         write(D/'reclaim_mode',1);write(D/'reclaim_headroom_pages',16384);write(D/'sthd_cnt',4)
         if 'reclaim_stop_headroom_pages' in saved: write(D/'reclaim_stop_headroom_pages',0)
-        if args.policy_features is not None: write(D/'policy_features',hex(args.policy_features))
         for cell in manifest['plan']:
             repeat, max_page_kb = cell['repeat'], cell['max_page_kb']
             label, mode, period = cell['case'], cell['mode'], cell['load_period']
+            mask = cell['policy_features']
             expected_thp = page_ceiling_settings(max_page_kb, thp_saved) if max_page_kb else thp_saved
             if max_page_kb:
                 write(thp_control, 'never')
@@ -427,6 +447,10 @@ def main():
             if read(D/'remote_order_mask').strip() != saved['remote_order_mask']:
                 raise RuntimeError('External backend mask change detected')
             if mode is not None: write(D/'pebs_mode',mode)
+            if mask is not None:
+                write(D/'policy_features',hex(mask))
+                if int(read(D/'policy_features').strip(),0) != mask:
+                    raise RuntimeError(f'policy_features did not take the requested mask {mask:#x}')
             if fixed:
                 write(D/'pebs_adaptive',int(mode is not None and period is None));write(D/'pebs_load_period',period or 0);write(D/'pebs_store_period',1500003 if period else 0)
             command=['numactl','--membind=0','taskset','-c',server_cpus,str(home/'memcached/memcached'),'-l','127.0.0.1','-p',str(args.port),'-U','0','-m','1024','-c',str(connection_limits['server_max_connections']),'-t',str(len(server_ids))]
@@ -469,7 +493,8 @@ def main():
             if sampler_affinity is not None and sorted(os.sched_getaffinity(sampler_affinity['pid']))!=sampler_ids:
                 raise RuntimeError('Sampler affinity changed during measurement')
             row={'repeat':repeat,'case':label,'max_page_kb':max_page_kb,
-                 'baseline_role':cell['baseline_role'],**latency(read(run/'measure.log'))}
+                 'baseline_role':cell['baseline_role'],'policy_features':None if mask is None else hex(mask),
+                 **latency(read(run/'measure.log'))}
             row['duration_seconds']=float(read(run/'after/time'))-float(read(run/'before/time'))
             dt=float(read(run/'after/time'))-float(read(run/'before/time'))
             for counter in ['sampled','lost','throttled']:
