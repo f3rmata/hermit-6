@@ -1680,7 +1680,7 @@ typedef struct { unsigned long val; } swp_entry_t;
 #define PTE_UFFD (1UL << 58)
 struct page { unsigned long pfn; };
 struct folio { struct page page; unsigned int order; int refs;
-	bool locked, uptodate, ksm, anon, mappedtodisk, writeback; };
+	bool locked, uptodate, ksm, anon, mappedtodisk, writeback, dropped; };
 struct mm_struct { int unused; };
 struct swap_info_struct { unsigned long flags; };
 typedef int rmap_t;
@@ -1738,6 +1738,11 @@ static bool folio_trylock(struct folio *f)
 { if (f->locked) return false; f->locked = true; return true; }
 static void folio_unlock(struct folio *f) { assert(f->locked); f->locked = false; unlocks++; }
 static void folio_put(struct folio *f) { f->refs--; folio_puts++; }
+/* Reclaim may drop the folio from swapcache between the lockless lookup and
+ * the trylock; .dropped models that window.
+ */
+static bool folio_matches_swap_entry(const struct folio *f, swp_entry_t e)
+{ assert(f->locked); (void)e; return !f->dropped; }
 static int folio_ref_count(struct folio *f) { return f->refs; }
 static bool PageHWPoison(struct page *p) { (void)p; return false; }
 static bool PageAnonExclusive(struct page *p) { (void)p; return false; }
@@ -1900,6 +1905,11 @@ int main(void)
 	reset(); fill(4, 1);
 	folios[1].refs = 1; folios[1].locked = true;   /* someone else owns it */
 	assert(run(4, 1) == 0 && skipped_pages == 3 && folio_puts == 1);
+	/* Removed from swapcache after the lookup: unlocked, put, nothing mapped. */
+	reset(); fill(4, 1);
+	folios[1].refs = 1; folios[1].dropped = true;
+	assert(run(4, 1) == 0 && skipped_pages == 3 && swap_frees == 0);
+	assert(folio_puts == 1 && unlocks == 1 && !folios[1].locked);
 
 	/* The policy gate, uffd, the VMA lock and a single-page batch install
 	 * nothing and touch no PTE. */
