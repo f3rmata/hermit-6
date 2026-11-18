@@ -107,6 +107,18 @@ compile_bench() {
   fi
 }
 
+# Stop the global PEBS sampler (syscall 474, hermit_pebs_end). Idempotent: the
+# kernel ignores a stop when no session is running. enable_benchmark_pebs_pid
+# starts a fresh session for the next policy cell.
+stop_pebs_session() {
+  sudo -n python3 -c 'import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+if libc.syscall(ctypes.c_long(474), ctypes.c_long(0)) < 0:
+    sys.exit("hermit_pebs_end failed: " + os.strerror(ctypes.get_errno()))' ||
+    rdma_die "cannot stop the PEBS session"
+}
+
 cleanup_process() {
   if [ -n "$current_pid" ] && kill -0 "$current_pid" 2>/dev/null; then
     kill -TERM "$current_pid" 2>/dev/null || true
@@ -128,6 +140,7 @@ restore_controls() {
 cleanup() {
   local ret=$?
   cleanup_process
+  stop_pebs_session 2>/dev/null || true
   restore_controls
   restore_thp_state
   sudo rmdir "$CGROUP" 2>/dev/null || true
