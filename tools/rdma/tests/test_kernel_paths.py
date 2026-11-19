@@ -1733,7 +1733,7 @@ struct mm_struct { int unused; };
 struct swap_info_struct { unsigned long flags; };
 typedef int rmap_t;
 struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end, vm_flags;
-	unsigned long vm_page_prot; };
+	unsigned long vm_page_prot; void *anon_vma; };
 struct vm_fault { struct vm_area_struct *vma; unsigned int flags;
 	unsigned long address, hermit_fault_pc; unsigned int hermit_batch_pages; };
 
@@ -1826,10 +1826,19 @@ static pte_t pte_mkwrite(pte_t p, struct vm_area_struct *v)
 static pte_t pte_mkyoung(pte_t p) { return (pte_t){ p.v | PTE_YOUNG }; }
 static void flush_icache_pages(struct vm_area_struct *v, struct page *p, unsigned int n)
 { (void)v; (void)p; (void)n; icache++; }
+static unsigned int new_rmaps;
 static void folio_add_anon_rmap_pte(struct folio *f, struct page *p,
 		struct vm_area_struct *v, unsigned long addr, int flags)
 {
-	(void)f; (void)p; (void)v; (void)addr;
+	(void)p; (void)v; (void)addr; assert(f->anon);
+	rmap_exclusive += !!(flags & RMAP_EXCLUSIVE);
+}
+/* A fresh swapcache page becomes anon here, exactly as in do_swap_page(). */
+static void folio_add_new_anon_rmap(struct folio *f, struct vm_area_struct *v,
+		unsigned long addr, int flags)
+{
+	assert(!f->anon && f->locked && v->anon_vma); (void)addr;
+	f->anon = true; new_rmaps++;
 	rmap_exclusive += !!(flags & RMAP_EXCLUSIVE);
 }
 static void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep, pte_t pte,
@@ -1864,7 +1873,7 @@ static void reset(void)
 	memset(folios, 0, sizeof(folios));
 	memset(&si, 0, sizeof(si));
 	vma = (struct vm_area_struct){ .vm_mm = &mm, .vm_start = base,
-		.vm_end = base + PMD_SIZE, .vm_flags = VM_WRITE };
+		.vm_end = base + PMD_SIZE, .vm_flags = VM_WRITE, .anon_vma = &mm };
 	policy_ok = true; policy_called = false; uffd = false; free_swap_result = false;
 	installed_pages = skipped_pages = folio_puts = unlocks = set_calls = frees = 0;
 	swap_frees = anon_delta = swpent_delta = rmap_exclusive = icache = 0;
@@ -1968,7 +1977,15 @@ int main(void)
 	assert(run(4, 1) == 0 && skipped_pages == 3 && folio_puts == 0);
 	reset(); fill(4, 1); folios[1].order = 2;  /* a large folio maps too much */
 	assert(run(4, 1) == 0 && skipped_pages == 3);
-	reset(); fill(4, 1); folios[1].anon = false;
+	/* A freshly read, not-yet-anon page is mapped with a new anon rmap... */
+	reset(); fill(4, 1); for (unsigned int i = 1; i < 4; i++) folios[i].anon = false;
+	new_rmaps = 0;
+	assert(run(4, 1) == 3 && installed_pages == 3 && new_rmaps == 3);
+	assert(folios[1].anon && folios[3].anon);
+	/* ...but only if the VMA already has an anon_vma, and never a file page. */
+	reset(); fill(4, 1); folios[1].anon = false; vma.anon_vma = NULL;
+	assert(run(4, 1) == 0 && skipped_pages == 3);
+	reset(); fill(4, 1); folios[1].anon = false; folios[1].mappedtodisk = true;
 	assert(run(4, 1) == 0 && skipped_pages == 3);
 	reset(); fill(4, 1); folios[1].ksm = true;
 	assert(run(4, 1) == 0 && skipped_pages == 3);
