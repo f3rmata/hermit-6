@@ -6,7 +6,7 @@
 import argparse, ctypes, csv, fcntl, json, os, pwd, random, re, signal, socket, subprocess, time, hashlib, shutil, resource, itertools
 from pathlib import Path
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, PAGE_SIZES, counter_delta, wr_delta,
-                            policy_delta, policy_activity, policy_masks, policy_suffix,
+                            policy_delta, policy_activity, policy_masks, policy_suffix, apply_policy_mask,
                             page_ceiling_settings, read_optional, write_comparisons)
 D = Path('/sys/kernel/debug/hermit')
 LIBC = ctypes.CDLL(None, use_errno=True)
@@ -430,7 +430,6 @@ def main():
         for cell in manifest['plan']:
             repeat, max_page_kb = cell['repeat'], cell['max_page_kb']
             label, mode, period = cell['case'], cell['mode'], cell['load_period']
-            mask = cell['policy_features']
             expected_thp = page_ceiling_settings(max_page_kb, thp_saved) if max_page_kb else thp_saved
             if max_page_kb:
                 write(thp_control, 'never')
@@ -447,10 +446,8 @@ def main():
             if read(D/'remote_order_mask').strip() != saved['remote_order_mask']:
                 raise RuntimeError('External backend mask change detected')
             if mode is not None: write(D/'pebs_mode',mode)
-            if mask is not None:
-                write(D/'policy_features',hex(mask))
-                if int(read(D/'policy_features').strip(),0) != mask:
-                    raise RuntimeError(f'policy_features did not take the requested mask {mask:#x}')
+            mask = apply_policy_mask(D/'policy_features', cell['policy_features'],
+                                     saved.get('policy_features'), write, read)
             if fixed:
                 write(D/'pebs_adaptive',int(mode is not None and period is None));write(D/'pebs_load_period',period or 0);write(D/'pebs_store_period',1500003 if period else 0)
             command=['numactl','--membind=0','taskset','-c',server_cpus,str(home/'memcached/memcached'),'-l','127.0.0.1','-p',str(args.port),'-U','0','-m','1024','-c',str(connection_limits['server_max_connections']),'-t',str(len(server_ids))]
@@ -493,7 +490,7 @@ def main():
             if sampler_affinity is not None and sorted(os.sched_getaffinity(sampler_affinity['pid']))!=sampler_ids:
                 raise RuntimeError('Sampler affinity changed during measurement')
             row={'repeat':repeat,'case':label,'max_page_kb':max_page_kb,
-                 'baseline_role':cell['baseline_role'],'policy_features':None if mask is None else hex(mask),
+                 'baseline_role':cell['baseline_role'],'policy_features':None if mask is None else hex(int(mask, 0)),
                  **latency(read(run/'measure.log'))}
             row['duration_seconds']=float(read(run/'after/time'))-float(read(run/'before/time'))
             dt=float(read(run/'after/time'))-float(read(run/'before/time'))

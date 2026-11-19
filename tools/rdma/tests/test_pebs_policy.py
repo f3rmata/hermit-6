@@ -328,8 +328,7 @@ static void heat_tests(void)
     clock_ns += ms; hermit_pebs_epoch = clock_ns;
     /* No region yet: no samples means unknown, never cold. */
     assert(!hermit_pebs_heat_read(&mm, address(7, 0), 16, heat));
-    hermit_pebs_fault(&mm, address(7, 0), pc_a, clock_ns);
-    assert(!hermit_pebs_heat_read(&mm, address(7, 0), 16, heat));  /* no heat yet */
+    assert(!mm.hermit_pebs);    /* resident mapping, no swap-fault history */
     hermit_policy_features = HERMIT_POLICY_SPLIT;
     for (unsigned int i = 0; i < 8; i++)
         hermit_region_sample(&mm, address(7, 3 + i % 4), clock_ns, false);
@@ -347,11 +346,20 @@ static void heat_tests(void)
     /* Subranges are bounded by the 2 MiB region. */
     assert(!hermit_pebs_heat_read(&mm, address(7, 500), 16, heat));
     assert(!hermit_pebs_heat_read(&mm, address(7, 0), 0, heat));
+    /* Sample-only regions participate in LRU replacement on every hit. */
+    hermit_pebs_region_max = 2;
+    hermit_region_sample(&mm, address(8, 256), clock_ns, false);
+    hermit_region_sample(&mm, address(7, 384), clock_ns, true);
+    hermit_region_sample(&mm, address(9, 256), clock_ns, false);
+    assert(!hermit_pebs_heat_read(&mm, address(8, 256), 128, heat));
+    assert(hermit_pebs_heat_read(&mm, address(7, 384), 128, heat) && heat[0] == 1);
     hermit_pebs_mm_exit(&mm);
     assert(allocations == 0);
     /* SPLIT off: the sample path must not allocate or create a heat record. */
     hermit_policy_features = 0;
     struct mm_struct off = { .hermit_pebs_enabled = true };
+    hermit_region_sample(&off, address(9, 0), clock_ns, false);
+    assert(!off.hermit_pebs);
     hermit_pebs_fault(&off, address(9, 0), pc_a, clock_ns);
     hermit_region_sample(&off, address(9, 0), clock_ns, false);
     assert(!hermit_pebs_heat_read(&off, address(9, 0), 16, heat));

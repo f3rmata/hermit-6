@@ -200,10 +200,24 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual(labels['policy-1999-no-batch'], 0x19f)
         self.assertEqual(labels['off'], None)
         self.assertEqual(labels['static-1999'], None)
-        # Historical behaviour: without --policy-features no mask is written.
+        # With no presets every cell requests the saved baseline.
         rows = workloads.plan(SimpleNamespace(**base, policy_features=None))
         self.assertEqual({r['case'] for r in rows}, {'off', 'static-1999', 'policy-1999'})
         self.assertTrue(all(r['policy_features'] is None for r in rows))
+
+    def test_policy_mask_is_written_and_verified_even_for_baselines(self):
+        baseline = '0x000001bd'
+        for requested in (0x11bf, None, 0, None):
+            writes = []
+            actual = metrics.apply_policy_mask('control', requested, baseline,
+                                               lambda p, v: writes.append(v),
+                                               lambda p: str(int(writes[-1], 0)))
+            expected = 0x1bd if requested is None else requested
+            self.assertEqual(writes, [hex(expected)])
+            self.assertEqual(int(actual), expected)
+        with self.assertRaisesRegex(RuntimeError, 'expected 0x1bd'):
+            metrics.apply_policy_mask('control', None, baseline, lambda p, v: None,
+                                      lambda p: '0x11bf')
 
 
 if __name__ == '__main__':

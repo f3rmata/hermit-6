@@ -26,7 +26,7 @@ from typing import Any
 
 from page_selection_metrics import table
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, counter_delta, wr_delta,
-                            policy_delta, policy_activity, policy_masks, policy_suffix,
+                            policy_delta, policy_activity, policy_masks, policy_suffix, apply_policy_mask,
                             read_optional, write_comparisons)
 
 RDMA = Path(__file__).resolve().parents[1]
@@ -481,19 +481,16 @@ def main():
     for cg in Path('/sys/fs/cgroup').glob('hermit-*'):
         if (cg/'cgroup.procs').exists() and read(cg/'cgroup.procs'):
             ap.error(f'busy benchmark cgroup: {cg}')
-    # Restore only sampling controls and THP ceilings owned by this experiment.
+    # Restore controls owned by this experiment.
     saved = {str(DEBUG/k):read(DEBUG/k) for k in SAMPLING_CONTROLS}
     baseline = policy_settings()
     saved.update({p:match[1] for p, value in baseline['thp'].items()
                   if (match := re.search(r'\[([^]]+)\]', value))})
-    # The ablation matrix owns policy_features per cell; anything else is drift.
-    owned = set()
-    if args.policy_features:
-        if not exists(DEBUG/'policy_features'):
-            ap.error('running kernel has no policy_features control')
-        saved[str(DEBUG/'policy_features')] = read(DEBUG/'policy_features')
-        # Reload config: the per-cell mask must not be reported as external drift.
-        owned.add('policy_features')
+    baseline_mask = baseline['controls'].get('policy_features')
+    if baseline_mask is not None:
+        saved[str(DEBUG/'policy_features')] = baseline_mask
+    elif args.policy_features:
+        ap.error('--policy-features requires the kernel policy_features control')
     args.output.mkdir(parents=True)
     source = args.output/'source'
     source_hashes = snapshot_sources(source)
@@ -532,12 +529,13 @@ def main():
             if row['mode'] is not None:
                 for k,v in dict(pebs_mode=row['mode'],pebs_adaptive=0,pebs_load_period=row['load_period'],
                                 pebs_store_period=row['store_period']).items(): write(DEBUG/k,v)
-            if row['policy_features'] is not None:
-                write(DEBUG/'policy_features', hex(row['policy_features']))
-                if int(read(DEBUG/'policy_features'), 0) != row['policy_features']:
-                    raise RuntimeError(f'policy_features did not take the requested mask {row["policy_features"]:#x}')
+            mask = apply_policy_mask(DEBUG/'policy_features', row['policy_features'],
+                                     baseline_mask, write, read)
+            expected = baseline
+            if mask is not None:
+                expected = baseline | {'controls': baseline['controls'] | {'policy_features': mask}}
             before = snapshot(folder/'before.json')
-            changes = policy_changes(baseline, before, owned)
+            changes = policy_changes(expected, before)
             if changes:
                 raise RuntimeError('; '.join(changes))
             if row['mode'] is not None:
@@ -567,7 +565,7 @@ def main():
                 return int(match[1])
             delta={key:count(after,key)-count(before,key) for key in ('sampled','lost','throttled')}
             issues = validate_results(folder/'results', row) if rc == 0 else ['workload failed']
-            issues += policy_changes(baseline, after, owned)
+            issues += policy_changes(expected, after)
             measurement = None
             policy_activity = None
             if rc == 0:
@@ -588,8 +586,7 @@ def main():
                 identity = dict(run_id=name, suite=row['suite'], max_page_kb=row['page_kb'],
                                 repeat=row['repeat'], case=row['case'], usable=valid,
                                 baseline_role=row['baseline_role'],
-                                policy_features=None if row['policy_features'] is None else
-                                hex(row['policy_features']))
+                                policy_features=None if mask is None else hex(int(mask, 0)))
                 activity_columns = {'application_policy_decisions': policy_activity['application_decisions'],
                                     'policy_path_exercised': policy_activity['path_exercised']} if policy_activity else {
                                     'application_policy_decisions': None, 'policy_path_exercised': None}

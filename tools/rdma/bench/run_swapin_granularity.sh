@@ -46,7 +46,7 @@ SEGMENT_PAGES=${SEGMENT_PAGES:-"1 4 16 32 64 128"}
 TRIALS=${TRIALS:-50}
 PAGE_SIZES_KB=${PAGE_SIZES_KB:-"4 64 2048"}
 POLICY_FEATURES=${POLICY_FEATURES:-"off 0x1bf"}
-LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-60}
+LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-10}
 BENCH_CPU=${BENCH_CPU:-0}
 SWAPOUT_TRIGGER=${SWAPOUT_TRIGGER:-cgroup}
 RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-1800}
@@ -55,7 +55,7 @@ COST_STATS=${COST_STATS:-1}
 CGROUP=${PEBS_CGROUP:-/sys/fs/cgroup/hermit-swapin-granularity}
 current_pid=
 bin=${SWAPIN_GRANULARITY_BIN:-}
-policy_stats_saved=
+policy_features_saved=
 cost_enabled_saved=
 
 while [ $# -gt 0 ]; do
@@ -136,12 +136,21 @@ cleanup_process() {
 }
 
 restore_controls() {
-  if [ -n "$policy_stats_saved" ] && sudo_test -e /sys/kernel/debug/hermit/policy_features; then
-    sudo_write "$policy_stats_saved" /sys/kernel/debug/hermit/policy_features || true
+  if [ -n "$policy_features_saved" ] && sudo_test -e /sys/kernel/debug/hermit/policy_features; then
+    sudo_write "$policy_features_saved" /sys/kernel/debug/hermit/policy_features || true
   fi
   if [ -n "$cost_enabled_saved" ] && sudo_test -e "$COST_ENABLE_FILE"; then
     sudo_write "$cost_enabled_saved" "$COST_ENABLE_FILE" || true
   fi
+}
+
+apply_policy_mask() {
+  local mask=${1:-$policy_features_saved} actual path=/sys/kernel/debug/hermit/policy_features
+  [ -n "$mask" ] || return 0
+  sudo_write "$mask" "$path"
+  actual=$(sudo_cat "$path")
+  [[ "$actual" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] && (( actual == mask )) ||
+    rdma_die "policy_features read back '$actual', expected $mask"
 }
 
 cleanup() {
@@ -185,7 +194,7 @@ snapshot_policy_stats() {
 }
 
 # Policy counters that say whether the new paths ran, as read-phase deltas.
-POLICY_KEYS="predicted_4k capped_batches medium_suggested medium_used_order2 medium_used_order3 medium_used_order4 medium_fallback_alloc medium_fallback_extent fitstart_batches fitstart_pages ptebatch_installed ptebatch_skipped"
+POLICY_KEYS="predicted_4k capped_batches medium_suggested medium_used_order2 medium_used_order3 medium_used_order4 medium_fallback_alloc medium_fallback_extent fitstart_batches fitstart_pages ptebatch_installed ptebatch_skipped ptebatch_gate_rejects medium_fallback_swpbatch medium_fallback_cache medium_fallback_remote medium_fallback_align"
 
 policy_columns() {
   local before=$1 after=$2 key value
@@ -220,8 +229,8 @@ emit_trials() {
         else if (kv[1] == "majflt") majflt = kv[2]
         else if (kv[1] == "checksum_errors") err = kv[2]
       }
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-             kb, mode, mask, seg, trial, start, bytes, sec, gib, minflt, majflt, err
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d\n",
+             kb, mode, mask, seg, trial, start, bytes, sec, gib, minflt, majflt, err, (majflt + 0 > 0)
     }' "$log"
 }
 
@@ -252,7 +261,7 @@ mkdir -p "$RESULT_DIR"
 
 # Save, then own, the two Hermit controls this benchmark needs.
 if sudo_test -e /sys/kernel/debug/hermit/policy_features; then
-  policy_stats_saved=$(sudo_cat /sys/kernel/debug/hermit/policy_features)
+  policy_features_saved=$(sudo_cat /sys/kernel/debug/hermit/policy_features)
 fi
 if [ "$COST_STATS" = 1 ] && sudo_test -e "$COST_ENABLE_FILE"; then
   cost_enabled_saved=$(sudo_cat "$COST_ENABLE_FILE")
@@ -275,7 +284,7 @@ prepare_sweep_cgroup
   printf 'backend=%s\n' "$(detect_rswap_backend)"
 } > "$RESULT_DIR/environment.txt"
 
-printf 'page_kb,mode,policy_features,segment_pages,trial,start_page,bytes,sec,gib_per_sec,minflt,majflt,checksum_errors\n' > "$TRIALS_CSV"
+printf 'page_kb,mode,policy_features,segment_pages,trial,start_page,bytes,sec,gib_per_sec,minflt,majflt,checksum_errors,swapped\n' > "$TRIALS_CSV"
 { printf 'page_kb,mode,policy_features'; while read -r key; do printf ',%s' "$key"; done < <(cost_keys)
   for key in $POLICY_KEYS; do printf ',%s' "$key"; done; printf '\n'; } > "$COST_CSV"
 
@@ -288,8 +297,7 @@ for kb in $PAGE_SIZES_KB; do
     else
       mask=$(policy_mask_of "$feature")
       valid_policy_mask "$mask" || rdma_die "invalid policy_features mask: $feature"
-      [ -n "$policy_stats_saved" ] || rdma_die "the running kernel has no policy_features control"
-      sudo_write "$mask" /sys/kernel/debug/hermit/policy_features
+      [ -n "$policy_features_saved" ] || rdma_die "the running kernel has no policy_features control"
       mode=policy
     fi
     run_dir="$RESULT_DIR/${kb}k/$mode${mask:+-$mask}"
@@ -298,6 +306,8 @@ for kb in $PAGE_SIZES_KB; do
     # Each cell starts from a stopped sampler: an "off" cell must not inherit
     # the PEBS session of the previous policy cell.
     stop_pebs_session
+    apply_policy_mask "$mask"
+    mask=${mask:-$policy_features_saved}
     if [ "$mode" = policy ]; then
       export PEBS_BENCH_MODE=policy
     else

@@ -184,7 +184,9 @@ def test_folio_selection():
     """Production allocation loop: legal candidates, failed allocation/charge."""
     root = Path(__file__).resolve().parents[3]
     source = (root / 'linux-stable/mm/memory.c').read_text()
-    start = source.index('static inline unsigned long thp_swap_suitable_orders(')
+    header = (root / 'linux-stable/include/linux/hermit_policy.h').read_text()
+    extent_enum = header[header.index('enum swapin_extent {'):header.index('struct hermit_reclaim_hint {')]
+    start = source.index('static enum swapin_extent swapin_thp_check(')
     end = source.index('#else /* !CONFIG_TRANSPARENT_HUGEPAGE */', start)
     functions = source[start:end]
     start = source.index('static unsigned long hermit_swapin_orders(')
@@ -237,6 +239,9 @@ static unsigned int pte_maps, gfp_orders;
 static gfp_t last_gfp;
 static unsigned int medium_used[10], medium_alloc_fallbacks;
 static unsigned int medium_extent_fallbacks, policy_calls;
+static enum swapin_extent last_reason;
+static unsigned int zeromap_limit = 512, cache_limit = 512;
+static bool remote_hole, remote_gap;
 static int policy_order = -1;
 static bool policy_medium;
 static pte_t ptes[512];
@@ -257,9 +262,9 @@ static int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders
     return policy_order;
 }
 static void hermit_policy_medium_used(unsigned int order)
-{ medium_used[order]++; }
-static void hermit_policy_medium_fallback(bool alloc)
-{ if (alloc) medium_alloc_fallbacks++; else medium_extent_fallbacks++; }
+{ if (order) medium_used[order]++; else medium_alloc_fallbacks++; }
+static void hermit_policy_medium_extent(enum swapin_extent reason)
+{ medium_extent_fallbacks++; last_reason = reason; }
 static bool userfaultfd_armed(struct vm_area_struct *vma) { (void)vma; return uffd; }
 static bool zswap_never_enabled(void) { return !zswap; }
 static swp_entry_t pte_to_swp_entry(pte_t pte) { return pte; }
@@ -281,11 +286,27 @@ static pte_t *pte_offset_map_lock(struct mm_struct *mm, void *pmd,
     return map_fail ? NULL : ptes;
 }
 static unsigned int pte_index(unsigned long addr) { return (addr >> 12) & 511; }
-static bool can_swapin_thp(struct vm_fault *vmf, pte_t *pte, unsigned int nr)
+static pte_t ptep_get(pte_t *p) { return *p; }
+static pte_t pte_move_swp_offset(pte_t p, int delta) { return p + delta; }
+static bool pte_same(pte_t a, pte_t b) { return a == b; }
+static int swap_zeromap_batch(swp_entry_t entry, int nr, void *arg)
+{ (void)entry; (void)arg; return min_t(int, nr, zeromap_limit); }
+static int non_swapcache_batch(swp_entry_t entry, int nr)
+{ (void)entry; return min_t(int, nr, cache_limit); }
+#define swp_entry(type, offset) (offset)
+#define ilog2(n) highest_order(n)
+static bool hermit_backend_entry_remote(swp_entry_t entry) { (void)entry; return true; }
+static bool hermit_backend_range_remote(swp_entry_t entry, int order)
+{ (void)entry; (void)order; return !remote_hole; }
+static int hermit_backend_offset(swp_entry_t entry, unsigned long *offset)
+{ *offset = entry + (remote_gap && (entry & 1)); return 0; }
+static int swap_pte_batch(pte_t *pte, int nr, pte_t first)
 {
     assert(pte >= ptes && pte + nr <= ptes + 512);
     assert(!((pte - ptes) % nr));
-    (void)vmf; return nr <= (1U << valid_order);
+    for (int i = 0; i < nr; i++)
+        if (first + i != pte[i] || i == (1 << valid_order)) return i;
+    return nr;
 }
 static void pte_unmap_unlock(pte_t *pte, spinlock_t *ptl) { (void)pte; (void)ptl; }
 static gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
@@ -352,6 +373,9 @@ static void medium_alloc_tests(void)
     f = alloc_swap_folio(&vmf);
     assert(f->order == 0 && medium_alloc_fallbacks == 1);
     alloc_fail = 0;
+    /* A uniform batch can pass the PTE scan and still fail swap alignment. */
+    vmf.orig_pte++;
+    assert(alloc_swap_folio(&vmf)->order == 0 && last_reason == SWAPIN_EXTENT_ALIGN);
     vmf.hermit_folio_order = 0;
 }
 
@@ -391,11 +415,32 @@ static void medium_decision_tests(void)
     valid_order = 1;
     assert(!hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
     assert(medium_extent_fallbacks == 1);
+    assert(last_reason == SWAPIN_EXTENT_SWPBATCH);
     valid_order = 9;
     /* A PTE map failure must keep the SG path too. */
     map_fail = true;
     assert(!hermit_swapin_folio(&vmf) && medium_extent_fallbacks == 2);
+    assert(last_reason == SWAPIN_EXTENT_SWPBATCH);
     map_fail = false;
+    /* Retain the first candidate's reason even if smaller orders fail later
+     * in the check. A successful lower order is not an extent fallback. */
+    zeromap_limit = 8; remote_gap = true;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_CACHE);
+    remote_gap = false;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 3);
+    assert(medium_extent_fallbacks == 3);
+    zeromap_limit = 512; cache_limit = 1;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_CACHE);
+    cache_limit = 512; remote_hole = true;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_REMOTE);
+    remote_hole = false; remote_gap = true;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_REMOTE);
+    vmf.orig_pte++;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_ALIGN);
+    vmf.orig_pte--; remote_gap = false;
+    /* No eligible order below the hint never reached an extent check. */
+    enabled_orders = BIT(7);
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_NO_ORDER);
     /* A 4 KiB ceiling, uffd and zswap never consult the policy. */
     enabled_orders = BIT(0); policy_calls = 0;
     assert(!hermit_swapin_folio(&vmf) && policy_calls == 0);
@@ -407,6 +452,7 @@ static void medium_decision_tests(void)
 }
 int main(void)
 {
+    for (int i = 0; i < 512; i++) ptes[i] = 1024 + i;
     wr_mask = 0x3fd; enabled_orders = 0x3fc;
     extent = valid_order = 9;
     check(9);
@@ -452,7 +498,7 @@ int main(void)
 '''
     with tempfile.TemporaryDirectory(prefix='hermit-allocation-test-') as tmp:
         cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
-        cfile.write_text(harness + functions + tests)
+        cfile.write_text(extent_enum + harness + functions + tests)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
                         '-Werror', '-fsanitize=address,undefined', '-g',
                         str(cfile), '-o', str(binary)], check=True)
@@ -1269,6 +1315,7 @@ static void fitstart_tests(void)
         assert(!hermit_policy_pte_install(&vmf, 2));
         st->refault = 0;
         assert(hermit_policy_pte_install(&vmf, 2));
+        assert(ptebatch_gate_rejects.counter == 7);
         hermit_policy_pte_installed(7);
         hermit_policy_pte_skipped(3);
         assert(ptebatch_installed.counter == 7 &&
@@ -1431,7 +1478,7 @@ int main(void)
     # run-length feedback and fit stability are exercised end to end.
     installed_end = source.index('/* Record one page read speculatively', installed_start)
     header = (root / 'linux-stable/include/linux/hermit_policy.h').read_text()
-    hint_struct = header[header.index('struct hermit_reclaim_hint {'):header.index('/* debugfs')]
+    hint_struct = header[header.index('enum swapin_extent {'):header.index('/* debugfs')]
     with tempfile.TemporaryDirectory(prefix='hermit-observe-test-') as tmp:
         cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
         cfile.write_text(harness + hint_struct + source[start:end] +
@@ -1678,8 +1725,9 @@ typedef struct { unsigned long val; } swp_entry_t;
 #define PTE_YOUNG (1UL << 60)
 #define PTE_SOFT (1UL << 59)
 #define PTE_UFFD (1UL << 58)
-struct page { unsigned long pfn; };
+struct page { unsigned long pfn; bool poisoned; };
 struct folio { struct page page; unsigned int order; int refs;
+	unsigned long rmap_addr;
 	bool locked, uptodate, ksm, anon, mappedtodisk, writeback, dropped; };
 struct mm_struct { int unused; };
 struct swap_info_struct { unsigned long flags; };
@@ -1697,6 +1745,7 @@ static bool policy_ok, policy_called, uffd;
 static unsigned int installed_pages, skipped_pages, folio_puts, unlocks, set_calls, frees;
 static unsigned int swap_frees, anon_delta, swpent_delta, rmap_exclusive, icache;
 static unsigned int mkwrite, mkuffd, mksoft, free_swap_calls;
+static unsigned int arch_updates, mmu_updates;
 static bool free_swap_result;
 
 static pte_t swap_pte(unsigned int off, unsigned int extra)
@@ -1744,7 +1793,10 @@ static void folio_put(struct folio *f) { f->refs--; folio_puts++; }
 static bool folio_matches_swap_entry(const struct folio *f, swp_entry_t e)
 { assert(f->locked); (void)e; return !f->dropped; }
 static int folio_ref_count(struct folio *f) { return f->refs; }
-static bool PageHWPoison(struct page *p) { (void)p; return false; }
+static bool PageHWPoison(struct page *p) { return p->poisoned; }
+static unsigned long page_address_in_vma(struct folio *f, struct page *p,
+		struct vm_area_struct *vma)
+{ assert(f->locked && p == &f->page); return f->rmap_addr; }
 static bool PageAnonExclusive(struct page *p) { (void)p; return false; }
 static bool pte_swp_exclusive(pte_t p) { return p.v & 1; }
 static bool pte_swp_soft_dirty(pte_t p) { return p.v & 2; }
@@ -1786,6 +1838,20 @@ static void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep, pte_
 	(void)mm; assert(nr == 1); assert((addr & PAGE_MASK) == addr);
 	*ptep = pte; set_calls++;
 }
+static void arch_do_swap_page_nr(struct mm_struct *mm, struct vm_area_struct *vma,
+		unsigned long addr, pte_t pte, pte_t old, int nr)
+{
+	unsigned int i = ++arch_updates;
+	assert(nr == 1 && folios[i].locked && addr == folios[i].rmap_addr);
+	assert(pte_same(pte, ptes[i]) && pte_same(old, pte));
+}
+static void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+		unsigned long addr, pte_t *ptep, int nr)
+{
+	unsigned int i = ++mmu_updates;
+	assert(nr == 1 && ptep == &ptes[i] && (ptep->v & PTE_PRESENT));
+	assert(addr == vmf->address + i * PAGE_SIZE && arch_updates == i);
+}
 '''
     tests = r'''
 static struct mm_struct mm;
@@ -1803,8 +1869,10 @@ static void reset(void)
 	installed_pages = skipped_pages = folio_puts = unlocks = set_calls = frees = 0;
 	swap_frees = anon_delta = swpent_delta = rmap_exclusive = icache = 0;
 	mkwrite = mkuffd = mksoft = free_swap_calls = 0;
+	arch_updates = mmu_updates = 0;
 	for (unsigned int i = 0; i < 16; i++) {
-		folios[i] = (struct folio){ .page = { .pfn = 5000 + i }, .order = 0,
+		folios[i] = (struct folio){ .page = { .pfn = 5000 + 3 * i }, .order = 0,
+			.rmap_addr = base + i * PAGE_SIZE,
 			.refs = 0, .uptodate = true, .anon = true };
 		registered[i] = true;
 	}
@@ -1836,6 +1904,7 @@ int main(void)
 	assert(swap_frees == 3 && anon_delta == 3 && swpent_delta == (unsigned int)-3);
 	assert(mkwrite == 3 && rmap_exclusive == 3 && icache == 3);
 	assert(set_calls == 3 && unlocks == 3 && free_swap_calls == 3);
+	assert(arch_updates == 3 && mmu_updates == 3);
 	for (unsigned int i = 1; i < 4; i++) {
 		assert(ptes[i].v & PTE_PRESENT);    /* present */
 		assert(ptes[i].v & PTE_YOUNG);      /* young, never old */
@@ -1884,6 +1953,7 @@ int main(void)
 		ptes[0] = swap_pte(0, 1); ptes[1] = swap_pte(1, 1);
 		ptes[2] = swap_pte(2, 1);
 		vma.vm_end = base + 2 * PMD_SIZE;
+		folios[1].rmap_addr = vmf.address + PAGE_SIZE;
 		assert(hermit_batch_ptes(&vmf, &si, ptes, vmf.address, ptes[0]) == 1);
 	}
 
@@ -1893,7 +1963,7 @@ int main(void)
 	for (unsigned int i = 1; i < 4; i++) folios[i].refs = 1;
 	folios[1].uptodate = false;
 	assert(run(4, 1) == 0 && skipped_pages == 3 && swap_frees == 0);
-	assert(folio_puts == 1 && unlocks == 0 && !folios[1].locked);
+	assert(folio_puts == 1 && unlocks == 1 && !folios[1].locked);
 	reset(); fill(4, 1); registered[1] = false;
 	assert(run(4, 1) == 0 && skipped_pages == 3 && folio_puts == 0);
 	reset(); fill(4, 1); folios[1].order = 2;  /* a large folio maps too much */
@@ -1911,7 +1981,12 @@ int main(void)
 	assert(run(4, 1) == 0 && skipped_pages == 3 && swap_frees == 0);
 	assert(folio_puts == 1 && unlocks == 1 && !folios[1].locked);
 
-	/* The policy gate, uffd, the VMA lock and a single-page batch install
+	reset(); fill(4, 1); folios[1].page.poisoned = true;
+	assert(run(4, 1) == 0 && skipped_pages == 3 && !swap_frees);
+	reset(); fill(4, 1); folios[1].rmap_addr = base;
+	assert(run(4, 1) == 0 && skipped_pages == 3 && !swap_frees);
+
+	/* The policy gate, uffd and a single-page batch install
 	 * nothing and touch no PTE. */
 	reset(); fill(4, 1); policy_ok = false;
 	assert(run(4, 1) == 0 && installed_pages == 0 && skipped_pages == 0);
@@ -1923,8 +1998,9 @@ int main(void)
 		struct vm_fault vmf = { .vma = &vma, .address = base,
 			.hermit_batch_pages = 4, .flags = FAULT_FLAG_VMA_LOCK };
 
-		assert(hermit_batch_ptes(&vmf, &si, ptes, base, ptes[0]) == 0);
-		assert(!policy_called);
+		assert(hermit_batch_ptes(&vmf, &si, ptes, base, ptes[0]) == 3);
+		assert(policy_called && arch_updates == 3 && mmu_updates == 3);
+		reset(); fill(4, 1);
 		vmf.flags = 0; vmf.hermit_batch_pages = 1;
 		assert(hermit_batch_ptes(&vmf, &si, ptes, base, ptes[0]) == 0);
 		assert(!policy_called);
@@ -2049,10 +2125,10 @@ def test_split_select():
         assert(pick() == HERMIT_SPLIT_PICK && order == 0);
         /* No samples at all is unknown, never cold. */
         reset();
-        assert(pick() == HERMIT_SPLIT_UNKNOWN);
+        assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
         /* Too few samples for the configured evidence threshold. */
         reset(); hot(128, 15, 1);
-        assert(pick() == HERMIT_SPLIT_UNKNOWN);
+        assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
         assert(rule.min_samples == 16);
         /* A 256 KiB half is hot: the largest qualifying block is order 8. */
         reset(); hot(256, 256, 4);

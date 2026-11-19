@@ -307,6 +307,38 @@ port = sys.argv[sys.argv.index('--port') + 1]
                 self.assertNotEqual(shell('valid_policy_mask "$1"', bad, check=False).returncode, 0)
 
 
+    def test_granularity_cell_restores_and_checks_mask(self):
+        source = (COMMON.parent/'bench'/'run_swapin_granularity.sh').read_text()
+        start = source.index('apply_policy_mask() {')
+        definition = source[start:source.index('\n}\n', start)+3]
+        script = definition + '''
+            policy_features_saved=0x000001bd
+            sudo_write() { actual=$1; echo "$1"; }
+            sudo_cat() { echo "${readback:-$actual}"; }
+            apply_policy_mask 0x11bf
+            apply_policy_mask ""
+        '''
+        self.assertEqual(shell(script).stdout.splitlines(), ['0x11bf', '0x000001bd'])
+        self.assertNotEqual(shell(script + 'readback=0x11bf; apply_policy_mask ""',
+                                  check=False).returncode, 0)
+
+    def test_granularity_swap_capacity_at_default_ratio(self):
+        source = (COMMON.parent/'bench'/'run_swapin_granularity.sh').read_text()
+        ratio = next(line for line in source.splitlines() if line.startswith('LOCAL_RATIO_PCT='))
+        start = source.index('      limit_mb=$(benchmark_memory_limit_mb')
+        guard = source[start:source.index('      wait_for_stores_quiet', start)]
+        script = 'unset LOCAL_RATIO_PCT MEMORY_LIMIT_MB\n' + ratio + '''
+            resident_mb=8192
+            awk() { command awk "$1" <<< "header
+swap partition $((free_mb * 1024)) 0 -2"; }
+            free_mb=$1
+        ''' + guard
+        self.assertEqual(shell(script + 'echo "$LOCAL_RATIO_PCT $limit_mb"', 7373).stdout.strip(),
+                         '10 819')
+        result = shell(script, 7372, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('7373 MiB is required', result.stderr)
+
     def test_granularity_runner_reports_policy_counter_deltas(self):
         runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
         source = runner.read_text()
@@ -318,7 +350,7 @@ port = sys.argv[sys.argv.index('--port') + 1]
             before, after = Path(directory)/'b', Path(directory)/'a'
             before.write_text('predicted_4k 10\nmedium_suggested 0\nptebatch_installed 5\n')
             after.write_text('predicted_4k 25\nmedium_suggested 3\nptebatch_installed 9\n'
-                             'fitstart_batches 2\n')
+                             'fitstart_batches 2\nptebatch_gate_rejects 9\nmedium_fallback_remote 2\n')
             out = shell(keys + func + 'policy_columns "$1" "$2"', str(before), str(after)).stdout
         values = dict(zip(keys.split('"')[1].split(), out.lstrip(',').split(',')))
         self.assertEqual(values['predicted_4k'], '15')
@@ -326,6 +358,8 @@ port = sys.argv[sys.argv.index('--port') + 1]
         self.assertEqual(values['ptebatch_installed'], '4')
         self.assertEqual(values['fitstart_batches'], '2')   # absent before = 0
         self.assertEqual(values['medium_fallback_extent'], '0')
+        self.assertEqual(values['ptebatch_gate_rejects'], '9')
+        self.assertEqual(values['medium_fallback_remote'], '2')
 
     def test_granularity_runner_parses_the_trial_protocol(self):
         runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
@@ -340,7 +374,7 @@ port = sys.argv[sys.argv.index('--port') + 1]
                'TRIAL seg=1 trial=1 start_page=512 bytes=4096 sec=0.001 gib_per_sec=3.8 '
                'minflt=2 majflt=1 checksum_errors=0\n'
                'TRIAL seg=1 trial=2 start_page=768 bytes=4096 sec=0.003 gib_per_sec=1.3 '
-               'minflt=1 majflt=1 checksum_errors=0\n'
+               'minflt=1 majflt=0 checksum_errors=0\n'
                'TRIAL seg=4 trial=1 start_page=1024 bytes=16384 sec=0.004 gib_per_sec=3.8 '
                'minflt=0 majflt=4 checksum_errors=0\n'
                'DONE sec=0.008 trials=3 pages=6 checksum_errors=0\n')
@@ -354,11 +388,12 @@ port = sys.argv[sys.argv.index('--port') + 1]
                 trial_summary 16 "$1"
             ''', path)
             lines = result.stdout.splitlines()
-        self.assertEqual(lines[0], '64,policy,0x1bf,1,1,512,4096,0.001,3.8,2,1,0')
-        self.assertEqual(lines[1], '64,policy,0x1bf,1,2,768,4096,0.003,1.3,1,1,0')
-        self.assertEqual(lines[2], '64,policy,0x1bf,4,1,1024,16384,0.004,3.8,0,4,0')
+        self.assertIn('minflt,majflt,checksum_errors,swapped\\n', source)
+        self.assertEqual(lines[0], '64,policy,0x1bf,1,1,512,4096,0.001,3.8,2,1,0,1')
+        self.assertEqual(lines[1], '64,policy,0x1bf,1,2,768,4096,0.003,1.3,1,0,0,0')
+        self.assertEqual(lines[2], '64,policy,0x1bf,4,1,1024,16384,0.004,3.8,0,4,0,1')
         # trial_summary prints faults,checksum_errors,seconds,bytes per segment.
-        self.assertEqual(lines[3], '5,0,0.004000,8192')
+        self.assertEqual(lines[3], '4,0,0.004000,8192')
         self.assertEqual(lines[4], '4,0,0.004000,16384')
         self.assertEqual(lines[5], '0,0,0.000000,0')
 

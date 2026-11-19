@@ -67,6 +67,18 @@ def policy_suffix(label):
     return '' if label in (None, 'default') else '-' + label
 
 
+def apply_policy_mask(path, requested, baseline, write, read):
+    """Set and verify the mask before a cell starts, including baseline cells."""
+    if requested is None and baseline is None:
+        return None  # Older kernels without this control.
+    mask = int(baseline, 0) if requested is None else requested
+    write(path, hex(mask))
+    actual = read(path).strip()
+    if int(actual, 0) != mask:
+        raise RuntimeError(f'policy_features read back {actual}, expected {mask:#x}')
+    return actual
+
+
 def counter_delta(before, after):
     if before.keys() != after.keys():
         raise ValueError('counter schema changed')
