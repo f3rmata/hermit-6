@@ -165,6 +165,7 @@ int main(int argc, char **argv)
 	struct sigaction sa;
 	struct rusage stamp;
 	double started_at, total_seconds;
+	size_t regions, next_region = 0, *order;
 	unsigned int i;
 	int argi;
 
@@ -282,8 +283,29 @@ int main(int argc, char **argv)
 	}
 	log_line("RUN");
 
-	/* The driver already quiesced stores; from here the reader only faults. */
+	/* Every trial gets its own 2 MiB region, drawn without replacement: a
+	 * region touched by an earlier trial is (partly) resident again and would
+	 * measure no swap-in at all.
+	 */
+	regions = nr_pages / region_pages;
+	if (regions < (size_t)nr_segments * trials)
+		die("%u segment sizes x %u trials need %zu regions; the mapping has %zu "
+		    "(raise --size-gib or lower --trials)", nr_segments, trials,
+		    (size_t)nr_segments * trials, regions);
+	order = calloc(regions, sizeof(*order));
+	if (!order)
+		die("calloc %zu region indices", regions);
 	srand48(seed);
+	for (size_t r = 0; r < regions; r++)
+		order[r] = r;
+	for (size_t r = regions - 1; r > 0; r--) {
+		size_t j = (size_t)lrand48() % (r + 1), tmp = order[r];
+
+		order[r] = order[j];
+		order[j] = tmp;
+	}
+
+	/* The driver already quiesced stores; from here the reader only faults. */
 	getrusage(RUSAGE_SELF, &stamp);
 	total_seconds = monotonic_seconds();
 	started_at = total_seconds;
@@ -291,19 +313,12 @@ int main(int argc, char **argv)
 		unsigned int trial;
 
 		for (trial = 1; trial <= trials; trial++) {
-			size_t regions = nr_pages / region_pages;
 			size_t start_page, page;
 			struct rusage_delta faults;
 			unsigned long long errors = 0;
 			double begin, seconds;
 
-			if (regions)
-				start_page = (size_t)(lrand48() % (long)regions) * region_pages;
-			else
-				start_page = (size_t)(lrand48() %
-						(long)(nr_pages ? nr_pages : 1));
-			if (start_page + segments[i] > nr_pages)
-				start_page = nr_pages - segments[i];
+			start_page = order[next_region++] * region_pages;
 
 			begin = monotonic_seconds();
 			for (page = start_page; page < start_page + segments[i]; page++)
@@ -335,6 +350,7 @@ int main(int argc, char **argv)
 		log_line("WAITING");
 		wait_for_signal(&finished);
 	}
+	free(order);
 	if (munmap(mapping, nr_pages * page_bytes))
 		fprintf(stderr, "swapin_granularity: munmap: %s\n", strerror(errno));
 	return checksum_errors ? 2 : 0;

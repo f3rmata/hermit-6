@@ -20,7 +20,9 @@
 #                              also accepts default/no-pebs/no-batch/medium-on and
 #                              commas)
 #   --segments "1 4 16 32 64 128"  SEGMENT_PAGES
-#   --trials N                 TRIALS
+#   --trials N                 TRIALS (default 50; each trial uses its own
+#                              untouched 2 MiB region, so segments x trials
+#                              must fit in SIZE_GIB * 512 regions)
 #   --size-gib N               SIZE_GIB
 #   --ratio PCT                LOCAL_RATIO_PCT
 #   --result-dir PATH          RESULT_DIR
@@ -39,9 +41,9 @@ usage() {
   sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
-SIZE_GIB=${SIZE_GIB:-4}
+SIZE_GIB=${SIZE_GIB:-8}
 SEGMENT_PAGES=${SEGMENT_PAGES:-"1 4 16 32 64 128"}
-TRIALS=${TRIALS:-5}
+TRIALS=${TRIALS:-50}
 PAGE_SIZES_KB=${PAGE_SIZES_KB:-"4 64 2048"}
 POLICY_FEATURES=${POLICY_FEATURES:-"off 0x1bf"}
 LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-60}
@@ -79,6 +81,11 @@ COST_CSV="$RESULT_DIR/swapin-cost.csv"
 
 [[ "$SIZE_GIB" =~ ^[1-9][0-9]*$ ]] || rdma_die "SIZE_GIB must be a positive integer"
 [[ "$TRIALS" =~ ^[1-9][0-9]*$ ]] || rdma_die "TRIALS must be a positive integer"
+regions_needed=$(( $(wc -w <<< "$SEGMENT_PAGES") * TRIALS ))
+[ "$regions_needed" -le $((SIZE_GIB * 512)) ] || \
+  rdma_die "$regions_needed trials need that many 2 MiB regions; SIZE_GIB=$SIZE_GIB has $((SIZE_GIB * 512))"
+[ ! -e "$RESULT_DIR" ] || \
+  rdma_die "result directory $RESULT_DIR already exists; completed results are never overwritten"
 [[ "$LOCAL_RATIO_PCT" =~ ^[1-9][0-9]?$ ]] || rdma_die "LOCAL_RATIO_PCT must be 1-99"
 case "$SWAPOUT_TRIGGER" in cgroup|madv-pageout) ;; *) rdma_die "SWAPOUT_TRIGGER must be cgroup or madv-pageout" ;; esac
 for page in $SEGMENT_PAGES; do
@@ -169,6 +176,25 @@ snapshot_cost() {
   fi
 }
 
+snapshot_policy_stats() {
+  if sudo_test -r /sys/kernel/debug/hermit/policy_stats; then
+    sudo_cat /sys/kernel/debug/hermit/policy_stats > "$1"
+  else
+    : > "$1"
+  fi
+}
+
+# Policy counters that say whether the new paths ran, as read-phase deltas.
+POLICY_KEYS="predicted_4k capped_batches medium_suggested medium_used_order2 medium_used_order3 medium_used_order4 medium_fallback_alloc medium_fallback_extent fitstart_batches fitstart_pages ptebatch_installed ptebatch_skipped"
+
+policy_columns() {
+  local before=$1 after=$2 key value
+  for key in $POLICY_KEYS; do
+    if value=$(cost_delta "$before" "$after" "$key"); then :; else value=0; fi
+    printf ',%s' "$value"
+  done
+}
+
 cost_columns() {
   local before=$1 after=$2 key value
   while read -r key; do
@@ -250,7 +276,8 @@ prepare_sweep_cgroup
 } > "$RESULT_DIR/environment.txt"
 
 printf 'page_kb,mode,policy_features,segment_pages,trial,start_page,bytes,sec,gib_per_sec,minflt,majflt,checksum_errors\n' > "$TRIALS_CSV"
-{ printf 'page_kb,mode,policy_features'; while read -r key; do printf ',%s' "$key"; done < <(cost_keys); printf '\n'; } > "$COST_CSV"
+{ printf 'page_kb,mode,policy_features'; while read -r key; do printf ',%s' "$key"; done < <(cost_keys)
+  for key in $POLICY_KEYS; do printf ',%s' "$key"; done; printf '\n'; } > "$COST_CSV"
 
 for kb in $PAGE_SIZES_KB; do
   page_order "$kb" >/dev/null || rdma_die "unsupported page size: ${kb} KiB"
@@ -281,9 +308,9 @@ for kb in $PAGE_SIZES_KB; do
     if [ "$SWAPOUT_TRIGGER" = madv-pageout ]; then
       args+=(--madv-pageout)
     fi
-    if [ "$COST_STATS" != 1 ]; then
-      args+=(--no-cost)
-    fi
+    # The benchmark runs unprivileged and cannot read debugfs; the runner
+    # snapshots the cost table around the read phase instead.
+    args+=(--no-cost)
     taskset -c "$BENCH_CPU" bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && shift && exec "$@"' \
       swapin-granularity "$CGROUP" "$bin" "${args[@]}" > "$log" 2>&1 &
     current_pid=$!
@@ -307,15 +334,18 @@ for kb in $PAGE_SIZES_KB; do
       # Counters below are sampled around the read phase only.
       snapshot_cost "$run_dir/cost-before-swapin.txt"
       snapshot_order_stats > "$run_dir/order-before-swapin.txt"
+      snapshot_policy_stats "$run_dir/policy-before-swapin.txt"
     else
       pswpin_before=$(read_vmstat_key pswpin)
       snapshot_cost "$run_dir/cost-before-swapin.txt"
       snapshot_order_stats > "$run_dir/order-before-swapin.txt"
+      snapshot_policy_stats "$run_dir/policy-before-swapin.txt"
     fi
     kill -USR1 "$current_pid"
     wait_for_log '^DONE ' "$log" "$RUN_TIMEOUT_SEC"
     snapshot_cost "$run_dir/cost-after-swapin.txt"
     snapshot_order_stats > "$run_dir/order-after-swapin.txt"
+    snapshot_policy_stats "$run_dir/policy-after-swapin.txt"
     pswpin_after=$(read_vmstat_key pswpin)
     if [ "$SWAPOUT_TRIGGER" = cgroup ]; then
       sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-after.txt"
@@ -336,6 +366,7 @@ for kb in $PAGE_SIZES_KB; do
     else
       while read -r _key; do printf ',0'; done < <(cost_keys) >> "$COST_CSV"
     fi
+    policy_columns "$run_dir/policy-before-swapin.txt" "$run_dir/policy-after-swapin.txt" >> "$COST_CSV"
     printf '\n' >> "$COST_CSV"
     [ "$pswpin_delta" -gt 0 ] || rdma_die "no swap-ins in ${kb}k/$mode; lower LOCAL_RATIO_PCT"
     [ "$loads_delta" -gt 0 ] || rdma_die "no backend loads recorded for ${kb}k/$mode; see $run_dir"

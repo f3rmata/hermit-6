@@ -307,6 +307,26 @@ port = sys.argv[sys.argv.index('--port') + 1]
                 self.assertNotEqual(shell('valid_policy_mask "$1"', bad, check=False).returncode, 0)
 
 
+    def test_granularity_runner_reports_policy_counter_deltas(self):
+        runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
+        source = runner.read_text()
+        start = source.index('POLICY_KEYS=')
+        keys = source[start:source.index('\n', start)+1]
+        start = source.index('policy_columns() {')
+        func = source[start:source.index('\n}\n', start)+3]
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = Path(directory)/'b', Path(directory)/'a'
+            before.write_text('predicted_4k 10\nmedium_suggested 0\nptebatch_installed 5\n')
+            after.write_text('predicted_4k 25\nmedium_suggested 3\nptebatch_installed 9\n'
+                             'fitstart_batches 2\n')
+            out = shell(keys + func + 'policy_columns "$1" "$2"', str(before), str(after)).stdout
+        values = dict(zip(keys.split('"')[1].split(), out.lstrip(',').split(',')))
+        self.assertEqual(values['predicted_4k'], '15')
+        self.assertEqual(values['medium_suggested'], '3')
+        self.assertEqual(values['ptebatch_installed'], '4')
+        self.assertEqual(values['fitstart_batches'], '2')   # absent before = 0
+        self.assertEqual(values['medium_fallback_extent'], '0')
+
     def test_granularity_runner_parses_the_trial_protocol(self):
         runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
         source = runner.read_text()
