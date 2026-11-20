@@ -2124,7 +2124,9 @@ def test_split_select():
     source = (ROOT / 'linux-stable/mm/hermit_split.c').read_text()
     start = source.index('/* hermit_split:begin pure */')
     end = source.index('/* hermit_split:end pure */')
-    function = source[start:end]
+    min_samples = next(line for line in source.splitlines()
+                       if line.startswith('static u32 hermit_split_min_samples ='))
+    function = min_samples + '\n' + source[start:end]
     harness = r"""
     #include <assert.h>
     #include <stdbool.h>
@@ -2142,7 +2144,7 @@ def test_split_select():
     static unsigned long young[NR / 64];
     static u8 heat[NR];
     static struct hermit_split_rule rule = {
-        .hot_cov = 80, .hot_pct = 75, .min_cold = 25, .min_samples = 16,
+        .hot_cov = 80, .hot_pct = 75, .min_cold = 25,
     };
     static unsigned int order;
 
@@ -2171,6 +2173,8 @@ def test_split_select():
 
     int main(void)
     {
+        rule.min_samples = hermit_split_min_samples;
+        assert(rule.min_samples == 4);
         /* An 8-page (32 KiB) hot block inside a 2 MiB folio is the largest
          * aligned block that is >=75% hot, so the folio splits to order 3. */
         reset(); hot(128, 8, 10);
@@ -2195,9 +2199,16 @@ def test_split_select():
         reset();
         assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
         /* Too few samples for the configured evidence threshold. */
+        reset(); hot(128, 3, 1);
+        assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
+        hot(131, 1, 1);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 2);
+        set_young(200);
+        assert(pick() == HERMIT_SPLIT_COLD_YOUNG);
+        rule.min_samples = 16;
         reset(); hot(128, 15, 1);
         assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
-        assert(rule.min_samples == 16);
+        rule.min_samples = hermit_split_min_samples;
         /* A 256 KiB half is hot: the largest qualifying block is order 8. */
         reset(); hot(256, 256, 4);
         assert(pick() == HERMIT_SPLIT_PICK && order == 8);
