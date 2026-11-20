@@ -26,6 +26,7 @@
 #   --size-gib N               SIZE_GIB
 #   --ratio PCT                LOCAL_RATIO_PCT
 #   --result-dir PATH          RESULT_DIR
+#   --adc                     capture inclusive Hermit ADC phase deltas
 #   --no-cost                  do not enable the kernel cost counters
 #
 # Requirements: cgroup v2, active Hermit RDMA backend, debugfs, zswap disabled,
@@ -51,6 +52,9 @@ BENCH_CPU=${BENCH_CPU:-0}
 SWAPOUT_TRIGGER=${SWAPOUT_TRIGGER:-cgroup}
 RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-1800}
 READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-300}
+ADC_STATS=${ADC_STATS:-0}
+ADC_DIR=/sys/kernel/debug/hermit
+adc_enabled_saved=
 COST_STATS=${COST_STATS:-1}
 CGROUP=${PEBS_CGROUP:-/sys/fs/cgroup/hermit-swapin-granularity}
 current_pid=
@@ -67,6 +71,7 @@ while [ $# -gt 0 ]; do
     --size-gib) SIZE_GIB=$2; shift 2 ;;
     --ratio) LOCAL_RATIO_PCT=$2; shift 2 ;;
     --result-dir) RESULT_DIR=$2; shift 2 ;;
+    --adc) ADC_STATS=1; shift ;;
     --no-cost) COST_STATS=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) rdma_die "unknown argument: $1" ;;
@@ -93,7 +98,11 @@ for page in $SEGMENT_PAGES; do
     rdma_die "segment size $page must be 1-512 pages (2 MiB region)"
 done
 
+case "$ADC_STATS" in 0|1) ;; *) rdma_die "ADC_STATS must be 0 or 1" ;; esac
 validate_sweep_host
+if [ "$ADC_STATS" = 1 ]; then
+  sudo_test -r "$ADC_DIR/adc_stats" || rdma_die "running kernel lacks Hermit adc_stats"
+fi
 save_thp_state
 
 compile_bench() {
@@ -136,6 +145,9 @@ cleanup_process() {
 }
 
 restore_controls() {
+  if [ -n "$adc_enabled_saved" ]; then
+    sudo_write "$adc_enabled_saved" "$ADC_DIR/adc_enable" || true
+  fi
   if [ -n "$policy_features_saved" ] && sudo_test -e /sys/kernel/debug/hermit/policy_features; then
     sudo_write "$policy_features_saved" /sys/kernel/debug/hermit/policy_features || true
   fi
@@ -174,6 +186,22 @@ wait_for_log() {
       rdma_die "timeout waiting for $pattern; see $log"
     sleep 1
   done
+}
+
+snapshot_adc() {
+  if [ "$ADC_STATS" = 1 ]; then
+    sudo_cat "$ADC_DIR/adc_stats" > "$1"
+  fi
+}
+
+adc_delta() {
+  local before=$1 after=$2 phase=$3
+  awk -v phase="$phase" 'FNR == 1 { next }
+    NR == FNR { count[$1]=$2; ns[$1]=$3; tc[$1]=$4; ticks[$1]=$5; next }
+    { n=$2-count[$1]; t=$3-ns[$1]
+      printf "%s,%s,%.0f,%.0f,%s,%.0f,%.0f\n",phase,$1,n,t,
+             (n ? sprintf("%.2f",t/n) : ""),$4-tc[$1],$5-ticks[$1] }
+  ' "$before" "$after"
 }
 
 snapshot_cost() {
@@ -271,6 +299,10 @@ if [ "$COST_STATS" = 1 ] && ! sudo_test -r "$COST_STATS_FILE"; then
   rdma_log "the running kernel has no swapin_cost_stats; per-order cost columns stay zero"
   COST_STATS=0
 fi
+if [ "$ADC_STATS" = 1 ]; then
+  adc_enabled_saved=$(sudo_cat "$ADC_DIR/adc_enable")
+  sudo_write 1 "$ADC_DIR/adc_enable"
+fi
 prepare_sweep_cgroup
 
 {
@@ -280,6 +312,7 @@ prepare_sweep_cgroup
   printf 'page_sizes_kb=%s\npolicy_features=%s\n' "$PAGE_SIZES_KB" "$POLICY_FEATURES"
   printf 'local_ratio_pct=%s\nswapout_trigger=%s\ncost_stats=%s\n' \
     "$LOCAL_RATIO_PCT" "$SWAPOUT_TRIGGER" "$COST_STATS"
+  printf 'adc_stats=%s\n' "$ADC_STATS"
   printf 'bench_cpu=%s\n' "$BENCH_CPU"
   printf 'backend=%s\n' "$(detect_rswap_backend)"
 } > "$RESULT_DIR/environment.txt"
@@ -321,6 +354,7 @@ for kb in $PAGE_SIZES_KB; do
     # The benchmark runs unprivileged and cannot read debugfs; the runner
     # snapshots the cost table around the read phase instead.
     args+=(--no-cost)
+    snapshot_adc "$run_dir/adc-start.txt"
     taskset -c "$BENCH_CPU" bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && shift && exec "$@"' \
       swapin-granularity "$CGROUP" "$bin" "${args[@]}" > "$log" 2>&1 &
     current_pid=$!
@@ -339,6 +373,7 @@ for kb in $PAGE_SIZES_KB; do
       snapshot_cost "$run_dir/cost-before.txt"
       snapshot_sweep_stats "$run_dir/stats-before.txt"
       pswpin_before=$(read_vmstat_key pswpin)
+      snapshot_adc "$run_dir/adc-before-limit.txt"
       sudo_write "$((limit_mb * 1024 * 1024))" "$CGROUP/memory.max"
       wait_for_stores_quiet "$(date +%s%N)"
       # Counters below are sampled around the read phase only.
@@ -351,8 +386,22 @@ for kb in $PAGE_SIZES_KB; do
       snapshot_order_stats > "$run_dir/order-before-swapin.txt"
       snapshot_policy_stats "$run_dir/policy-before-swapin.txt"
     fi
+    snapshot_adc "$run_dir/adc-before-read.txt"
     kill -USR1 "$current_pid"
     wait_for_log '^DONE ' "$log" "$RUN_TIMEOUT_SEC"
+    snapshot_adc "$run_dir/adc-after-read.txt"
+    if [ "$ADC_STATS" = 1 ]; then
+      {
+        echo phase,stage,count,total_ns,mean_ns,tsc_count,total_tsc_ticks
+        if [ "$SWAPOUT_TRIGGER" = cgroup ]; then
+          adc_delta "$run_dir/adc-start.txt" "$run_dir/adc-before-limit.txt" populate
+          adc_delta "$run_dir/adc-before-limit.txt" "$run_dir/adc-before-read.txt" reclaim
+        else
+          adc_delta "$run_dir/adc-start.txt" "$run_dir/adc-before-read.txt" populate_and_pageout
+        fi
+        adc_delta "$run_dir/adc-before-read.txt" "$run_dir/adc-after-read.txt" read
+      } > "$run_dir/adc.csv"
+    fi
     snapshot_cost "$run_dir/cost-after-swapin.txt"
     snapshot_order_stats > "$run_dir/order-after-swapin.txt"
     snapshot_policy_stats "$run_dir/policy-after-swapin.txt"

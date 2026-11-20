@@ -157,7 +157,7 @@ int main(int argc, char **argv)
 	static const unsigned int default_segments[] = {1, 4, 16, 32, 64, 128};
 	unsigned int segments[MAX_SEGMENTS], nr_segments = 0;
 	unsigned int trials = 5;
-	size_t region_pages = 2048 * 1024 / 4096, size_gib = 4;
+	size_t region_pages = 2048 * 1024 / 4096, size_mib = 4096;
 	unsigned long seed = 1;
 	bool madv_pageout = false, no_wait = false, populate_only = false;
 	bool read_cost = true;
@@ -192,7 +192,7 @@ int main(int argc, char **argv)
 			continue;
 		}
 		if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) {
-			printf("usage: %s [--size-gib N] [--segments P[,P...]] [--trials N] "
+			printf("usage: %s [--size-gib N | --size-mib N] [--segments P[,P...]] [--trials N] "
 			       "[--seed N] [--region-kb N] [--cost-stats PATH|none] "
 			       "[--madv-pageout] [--no-wait] [--populate-only] [--no-cost]\n",
 			       argv[0]);
@@ -204,9 +204,18 @@ int main(int argc, char **argv)
 			value = argv[++argi];
 		else
 			die("%s needs a value", arg);
-		if (!strcmp(arg, "--size-gib"))
-			size_gib = strtoul(value, NULL, 0);
-		else if (!strcmp(arg, "--trials"))
+		if (!strcmp(arg, "--size-gib") || !strcmp(arg, "--size-mib")) {
+			size_t unit_mib = !strcmp(arg, "--size-gib") ? 1024 : 1;
+			char *end;
+			unsigned long size;
+
+			errno = 0;
+			size = strtoul(value, &end, 0);
+			if (errno || *end || !size ||
+			    size > SIZE_MAX / (1024 * 1024) / unit_mib)
+				die("invalid mapping size %s", value);
+			size_mib = size * unit_mib;
+		} else if (!strcmp(arg, "--trials"))
 			trials = strtoul(value, NULL, 0);
 		else if (!strcmp(arg, "--seed"))
 			seed = strtoul(value, NULL, 0);
@@ -234,10 +243,10 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!size_gib || !trials || !region_pages)
+	if (!size_mib || !trials || !region_pages)
 		die("size, trials and region size must be positive");
 	page_bytes = (size_t)getpagesize();
-	nr_pages = size_gib * (1024UL * 1024 * 1024) / page_bytes;
+	nr_pages = size_mib * (1024UL * 1024) / page_bytes;
 	if (!nr_pages)
 		die("mapping size rounds to zero pages");
 	for (i = 0; i < nr_segments; i++)
@@ -248,7 +257,7 @@ int main(int argc, char **argv)
 	mapping = mmap(NULL, nr_pages * page_bytes, PROT_READ | PROT_WRITE,
 		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (mapping == MAP_FAILED)
-		die("mmap %zu GiB: %s", size_gib, strerror(errno));
+		die("mmap %zu MiB: %s", size_mib, strerror(errno));
 
 	/* Populate: write the pattern so the pages are dirty and swap-eligible. */
 	started_at = monotonic_seconds();
@@ -306,7 +315,6 @@ int main(int argc, char **argv)
 	}
 
 	/* The driver already quiesced stores; from here the reader only faults. */
-	getrusage(RUSAGE_SELF, &stamp);
 	total_seconds = monotonic_seconds();
 	started_at = total_seconds;
 	for (i = 0; i < nr_segments; i++) {
@@ -320,6 +328,8 @@ int main(int argc, char **argv)
 
 			start_page = order[next_region++] * region_pages;
 
+			if (getrusage(RUSAGE_SELF, &stamp))
+				die("getrusage: %s", strerror(errno));
 			begin = monotonic_seconds();
 			for (page = start_page; page < start_page + segments[i]; page++)
 				if (*(volatile uint64_t *)(mapping + page * page_bytes) !=
@@ -329,7 +339,7 @@ int main(int argc, char **argv)
 			faults = usage_now(&stamp);
 			trial_pages += segments[i];
 			checksum_errors += errors;
-			log_line("TRIAL seg=%u trial=%u start_page=%zu bytes=%zu sec=%.6f "
+			log_line("TRIAL seg=%u trial=%u start_page=%zu bytes=%zu sec=%.9f "
 				 "gib_per_sec=%.6f minflt=%ld majflt=%ld checksum_errors=%llu",
 				 segments[i], trial, start_page,
 				 (size_t)segments[i] * page_bytes, seconds,

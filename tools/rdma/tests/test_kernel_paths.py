@@ -598,6 +598,7 @@ def test_swapin_pages():
     start = source.index('static unsigned int hermit_swap_ptes(')
     end = source.index('#endif', source.index('struct folio *hermit_swapin_pages('))
     harness = r'''
+#define HERMIT_ADC_SCOPE(which)
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
