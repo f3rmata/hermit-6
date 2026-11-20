@@ -237,7 +237,8 @@ static unsigned int extent, valid_order, allocs, frees;
 static bool uffd, zswap, map_fail;
 static unsigned int pte_maps, gfp_orders;
 static gfp_t last_gfp;
-static unsigned int medium_used[10], medium_alloc_fallbacks;
+static unsigned int medium_used[10], medium_alloc_fallbacks, min_order = 2;
+static unsigned int hermit_policy_medium_min_order(void) { return min_order; }
 static unsigned int medium_extent_fallbacks, policy_calls;
 static enum swapin_extent last_reason;
 static unsigned int zeromap_limit = 512, cache_limit = 512;
@@ -367,6 +368,9 @@ static void medium_alloc_tests(void)
     charge_fail = BIT(4);
     f = alloc_swap_folio(&vmf);
     assert(f->order == 3 && medium_used[3] == 1);
+    min_order = 4;
+    assert(alloc_swap_folio(&vmf)->order == 0 && medium_used[3] == 1);
+    min_order = 2;
     charge_fail = 0; medium_alloc_fallbacks = 0;
     /* Every candidate order fails: one alloc fallback, base page. */
     alloc_fail = BIT(2) | BIT(3) | BIT(4);
@@ -406,6 +410,10 @@ static void medium_decision_tests(void)
     /* A fragmented extent keeps the highest legal order below the hint. */
     valid_order = 2;
     assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 2);
+    min_order = 4;
+    assert(!hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(last_reason == SWAPIN_EXTENT_SWPBATCH);
+    min_order = 2; medium_extent_fallbacks = 0;
     /* A ceiling above the legal mask never validates an illegal order. */
     valid_order = 9; enabled_orders = BIT(2) | BIT(3) | BIT(4);
     policy_order = 6;
@@ -1114,32 +1122,37 @@ static void medium_tests(void)
         unsigned long last = base;
 
         s.fit = 16; s.fit_stable = 3; s.last = last;
+        assert(policy_medium_min_order == 4);
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, BIT(3)) == -1);
+        assert(medium_below_min.counter == 1);
+        policy_medium_min_order = 0;
+        assert(hermit_policy_medium_min_order() == 2);
         /* A new segment starts at page 0: the whole 64 KiB. */
-        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 4);
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 4);
         /* A continuation is at page sequential + 1 and must be aligned to the
          * order, because the folio is allocated at ALIGN_DOWN(fault, 1<<order). */
         s.sequential = 0;
-        assert(policy_medium_order(&s, last + PAGE_SIZE) == -1);
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == -1);
         s.sequential = 3;               /* position 4: order 2 */
-        assert(policy_medium_order(&s, last + PAGE_SIZE) == 2);
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == 2);
         s.sequential = 7;               /* position 8: order 3 */
-        assert(policy_medium_order(&s, last + PAGE_SIZE) == 3);
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == 3);
         s.sequential = 11;              /* position 12: four pages left */
-        assert(policy_medium_order(&s, last + PAGE_SIZE) == 2);
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == 2);
         s.sequential = 12;              /* position 13: three pages left */
-        assert(policy_medium_order(&s, last + PAGE_SIZE) == -1);
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == -1);
         s.sequential = 15;              /* the run already reached the length */
-        assert(policy_medium_order(&s, last + PAGE_SIZE) == -1);
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == -1);
         s.fit_stable = 2;               /* not stable yet */
-        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == -1);
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == -1);
         s.fit_stable = 3; s.fit = 6;    /* rounded down to four pages */
-        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 2);
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 2);
         s.fit = 3;                      /* shorter than the smallest order */
-        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == -1);
-        s.fit = 16; policy_medium_max_order = 2;
-        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 2);
-        policy_medium_max_order = 6;
-        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE) == 4);
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == -1);
+        s.fit = 16; policy_medium_min_order = 9; policy_medium_max_order = 2;
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 2);
+        policy_medium_min_order = 4; policy_medium_max_order = 6;
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 4);
         policy_medium_max_order = 4;
     }
     /* Repeated 16-page segments: the first segments only teach the length (fit
@@ -1176,6 +1189,15 @@ static void medium_tests(void)
                       pc + PAGE_SIZE, &walk);
         assert(walk.suggestions == 0);
     }
+    /* Replaying a six-page stream keeps SG at the default minimum. */
+    for (i = 0; i < 6; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (16 + i) * stride, 6, pc + 4 * PAGE_SIZE, &walk);
+        assert(walk.suggestions == 0);
+    }
+    assert(medium_below_min.counter > 1);
+    policy_medium_min_order = 2;
     /* A six-page segment allows only what fits: order 2, never order 3. */
     for (i = 0; i < 6; i++) {
         struct medium_walk walk = {};

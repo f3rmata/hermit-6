@@ -598,3 +598,11 @@ folio 的冷子区间只是占着本地内存，从不被访问。阶段 D 用 P
 拆）；（2）=hermit_heat_add()/hermit_heat_decay()=（饱和、半衰、长空闲清零、时间倒退、
 越界索引、零周期）并打印每样本开销（≈10 ns，25k 样本/秒即 ≈0.03% 单核）；（3）预算
 窗口与 memcg 压力/refault 门限的边界。
+
+* 2026-11-20 MEDIUM 最小换入阶数
+
+=policy_medium_min_order= 默认 4，使用时限制到 2 至有效的 =policy_medium_max_order=。
+若稳定段的剩余长度、位置和 VMA 允许的最大候选仅有 order 2/3，默认沿用 4 KiB SG，
+仍可触发 FITSTART 和 PTEBATCH。追加的 =medium_below_min= 每次记录一个被下限挡住的
+候选。没有候选、置信度不足或 extent 验证失败分别沿用原有路径。验证和分配降阶也遵守
+下限；分配/计费失败仍可回退到单页。设为 2 可对照原来的 16/32 KiB 建议。

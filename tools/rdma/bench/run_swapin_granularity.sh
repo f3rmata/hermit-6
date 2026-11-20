@@ -222,7 +222,7 @@ snapshot_policy_stats() {
 }
 
 # Policy counters that say whether the new paths ran, as read-phase deltas.
-POLICY_KEYS="predicted_4k capped_batches medium_suggested medium_used_order2 medium_used_order3 medium_used_order4 medium_fallback_alloc medium_fallback_extent fitstart_batches fitstart_pages ptebatch_installed ptebatch_skipped ptebatch_gate_rejects medium_fallback_swpbatch medium_fallback_cache medium_fallback_remote medium_fallback_align"
+POLICY_KEYS="predicted_4k capped_batches medium_suggested medium_used_order2 medium_used_order3 medium_used_order4 medium_fallback_alloc medium_fallback_extent fitstart_batches fitstart_pages ptebatch_installed ptebatch_skipped ptebatch_gate_rejects medium_fallback_swpbatch medium_fallback_cache medium_fallback_remote medium_fallback_align medium_below_min"
 
 policy_columns() {
   local before=$1 after=$2 key value
