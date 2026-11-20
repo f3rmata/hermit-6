@@ -143,6 +143,9 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual(metrics.policy_masks(['ptebatch-on']), [('ptebatch-on', 0x9bf)])
         self.assertEqual(0x5bf, metrics.DEFAULT_POLICY_MASK | 0x400)
         self.assertEqual(0x9bf, metrics.DEFAULT_POLICY_MASK | 0x800)
+        self.assertEqual(metrics.policy_masks(['fitpte', 'fitpte-medium']),
+                         [('fitpte', metrics.DEFAULT_POLICY_MASK | 0xc00),
+                          ('fitpte-medium', metrics.DEFAULT_POLICY_MASK | 0xe00)])
         # Phase D adds SPLIT, a reclaim-side bit that is again a new preset.
         self.assertEqual(metrics.policy_masks(['split-on']), [('split-on', 0x11bf)])
         self.assertEqual(0x11bf, metrics.DEFAULT_POLICY_MASK | 0x1000)

@@ -64,6 +64,8 @@ policy_mask_of() {
     medium-on) printf '0x3bf' ;;
     fitstart-on) printf '0x5bf' ;;
     ptebatch-on) printf '0x9bf' ;;
+    fitpte) printf '0xdbf' ;;
+    fitpte-medium) printf '0xfbf' ;;
     split-on) printf '0x11bf' ;;
     *) printf '%s' "$1" ;;
   esac

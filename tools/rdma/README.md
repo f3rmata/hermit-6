@@ -25,8 +25,9 @@
 
 两个矩阵入口都支持 `--policy-features`：给 policy 单元指定 `policy_features` 消融预设
 `default`（`0x1bf`）、`no-pebs`（`0x1bd`）、`no-batch`（`0x19f`）、
-`medium-on`（`0x3bf`）、`fitstart-on`（`0x5bf`）、`ptebatch-on`（`0x9bf`）或原始掩码
-（上限 `0xfff`）。
+`medium-on`（`0x3bf`）、`fitstart-on`（`0x5bf`）、`ptebatch-on`（`0x9bf`）、
+`fitpte`（默认 + FITSTART + PTEBATCH，`0xdbf`）、`fitpte-medium`（再加 MEDIUM，
+`0xfbf`）或原始掩码（上限 `0x1fff`）。11 月 19 日粒度实验的 `0xcbf` 关闭了 MGLRU 位。
 预设在同一矩阵内各自成为一个带标签的 case，与同一块的 `off`/`static` 共享 baseline；
 不传该参数时保持原行为（不改写 `policy_features`）。详见
 [策略内核集成](../../docs/pebs/kernel-policy-integration.org)。

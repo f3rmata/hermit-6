@@ -19,6 +19,8 @@ POLICY_MASKS = {
     'medium-on': 0x3bf,  # default + MEDIUM (fit-driven 16-64 KiB swap-in orders)
     'fitstart-on': 0x5bf,  # default + FITSTART (fit-sized first batch of a segment)
     'ptebatch-on': 0x9bf,  # default + PTEBATCH (map the pages a batch read ahead)
+    'fitpte': 0xdbf,  # default + FITSTART + PTEBATCH
+    'fitpte-medium': 0xfbf,  # fitpte + MEDIUM
     'split-on': 0x11bf,  # default + SPLIT (PEBS-guided split of large folios)
 }
 DEFAULT_POLICY_MASK = POLICY_MASKS['default']

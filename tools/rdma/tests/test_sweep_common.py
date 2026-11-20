@@ -291,7 +291,8 @@ port = sys.argv[sys.argv.index('--port') + 1]
     def test_policy_mask_names_match_the_python_presets(self):
         expected = {'default': '0x1bf', 'no-pebs': '0x1bd', 'no-batch': '0x19f',
                     'medium-on': '0x3bf', 'fitstart-on': '0x5bf',
-                    'ptebatch-on': '0x9bf', 'split-on': '0x11bf'}
+                    'ptebatch-on': '0x9bf', 'split-on': '0x11bf',
+                    'fitpte': '0xdbf', 'fitpte-medium': '0xfbf'}
         for name, mask in expected.items():
             with self.subTest(preset=name):
                 self.assertEqual(shell('policy_mask_of '+name).stdout.strip(), mask)
