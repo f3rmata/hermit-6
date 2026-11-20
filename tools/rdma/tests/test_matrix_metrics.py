@@ -167,7 +167,8 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual(metrics.policy_masks(['512']), [('f200', 0x200)])
         self.assertEqual(metrics.policy_masks(['0xfff']), [('ffff', 0xfff)])
         self.assertEqual(metrics.policy_masks(['0x11bf']), [('f11bf', 0x11bf)])
-        for bad in (['bogus'], ['0x2000'], ['8192'], ['-1'], []):
+        self.assertEqual(metrics.policy_masks(['0x2fbf']), [('f2fbf', 0x2fbf)])
+        for bad in (['bogus'], ['0x4000'], ['16384'], ['-1'], []):
             with self.subTest(value=bad), self.assertRaises(ValueError):
                 metrics.policy_masks(bad)
 

@@ -24,8 +24,8 @@ POLICY_MASKS = {
     'split-on': 0x11bf,  # default + SPLIT (PEBS-guided split of large folios)
 }
 DEFAULT_POLICY_MASK = POLICY_MASKS['default']
-# Bits 0..12 exist; 0x2000 is the next free bit.
-POLICY_MASK_MAX = 0x1fff
+# Bit 13 enables SLOTRUN diagnostics.
+POLICY_MASK_MAX = 0x3fff
 
 
 def policy_mask(value):

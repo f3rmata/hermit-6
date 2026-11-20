@@ -519,6 +519,7 @@ def test_reclaim_sort():
     source = (root / 'linux-stable/mm/hermit_policy.c').read_text()
     start = source.index('struct policy_rank {')
     end = source.index('/* Drop per-page state', start)
+    slotrun = source[source.index('void hermit_policy_slotrun('):source.index('void hermit_policy_mm_exit(')]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -531,6 +532,11 @@ def test_reclaim_sort():
 #define atomic_long_inc(p) (++(p)->counter)
 #define atomic_long_add(n, p) ((p)->counter += (n))
 static atomic_long_t ranked_pages, sorted_lists, mglru_sort_bypasses;
+static atomic_long_t slotrun_groups, slotrun_contiguous, slotrun_fallback;
+struct hermit_batch { unsigned long addresses[16], entries[16]; unsigned int nr; };
+#define PAGE_SIZE 4096UL
+#define IS_ALIGNED(value, align) (!((value) & ((align) - 1)))
+#define swp_offset(entry) (entry)
 struct folio { struct list_head lru; unsigned int heat; bool dirty, locked; u64 age; };
 struct hermit_reclaim_hint { u64 age; unsigned int heat; };
 static bool mode = true, feature = true, mglru, cooperative = true;
@@ -548,6 +554,28 @@ static void hermit_policy_hint(struct folio *f, struct hermit_reclaim_hint *h)
 static struct folio *tail(struct list_head *l) { return list_entry(l->prev, struct folio, lru); }
 int main(void)
 {
+    struct hermit_batch batch = {};
+    for (unsigned int i = 0; i < 16; i++) {
+        batch.addresses[i] = 0x200000 + i * PAGE_SIZE;
+        batch.entries[i] = 128 + i;
+    }
+    for (batch.nr = 1; batch.nr <= 16; batch.nr++)
+        hermit_policy_slotrun(&batch);
+    assert(slotrun_groups.counter == 3 && slotrun_contiguous.counter == 3);
+    batch.nr = 4;
+    batch.addresses[0] += PAGE_SIZE;             /* misaligned VA */
+    hermit_policy_slotrun(&batch);
+    batch.addresses[0] -= PAGE_SIZE;
+    batch.addresses[3] += PAGE_SIZE;             /* VA hole */
+    hermit_policy_slotrun(&batch);
+    assert(slotrun_groups.counter == 3);
+    batch.addresses[3] -= PAGE_SIZE;
+    for (unsigned int i = 0; i < 4; i++) batch.entries[i]++;
+    hermit_policy_slotrun(&batch);               /* contiguous but misaligned slots */
+    batch.entries[0]--;
+    hermit_policy_slotrun(&batch);               /* aligned base, fragmented slots */
+    assert(slotrun_groups.counter == 5 && slotrun_contiguous.counter == 3);
+    assert(slotrun_fallback.counter == 2);
     struct folio f[40] = {};
     LIST_HEAD(list);
     for (unsigned int i = 0; i < 40; i++) {
@@ -591,7 +619,7 @@ int main(void)
 '''
     with tempfile.TemporaryDirectory(prefix='hermit-sort-test-') as tmp:
         cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
-        cfile.write_text(harness + source[start:end] + tests)
+        cfile.write_text(harness + source[start:end] + slotrun + tests)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
                         '-Werror', '-fsanitize=address,undefined', '-g',
                         '-I', str(root / 'linux-stable/tools/include'),

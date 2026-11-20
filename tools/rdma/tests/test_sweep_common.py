@@ -303,7 +303,8 @@ port = sys.argv[sys.argv.index('--port') + 1]
         self.assertEqual(shell('valid_policy_mask 0x200').returncode, 0)
         self.assertEqual(shell('valid_policy_mask 0xfff').returncode, 0)
         self.assertEqual(shell('valid_policy_mask 0x11bf').returncode, 0)
-        for bad in ('0x2000', '8192', 'zz', ''):
+        self.assertEqual(shell('valid_policy_mask 0x2fbf').returncode, 0)
+        for bad in ('0x4000', '16384', 'zz', ''):
             with self.subTest(mask=bad):
                 self.assertNotEqual(shell('valid_policy_mask "$1"', bad, check=False).returncode, 0)
 
