@@ -620,3 +620,14 @@ folio 的冷子区间只是占着本地内存，从不被访问。阶段 D 用 P
 =policy_split_min_samples= 的默认值从 16 降到 4。dnet-61 每格观察到 204–252 个候选，
 都有 heat，但全被原门限挡住。新值允许用 4–15 个样本的候选继续检验冷区间的 young
 位和热区分布，原有的速率限制、内存压力和结构检查仍然生效。可写回 16 做同配置对照。
+
+** ADC 新增行
+
+=adc_stats= 在原 31 行之后依次追加：
+
+- =medium_swapin=：直接读回并安装多页 MEDIUM folio 的整次 =do_swap_page= 时间。
+  同一样本也进入 =do_swap_page= 和 =swap_major=。
+- =ptebatch_install=：通过置信度门控后，整次相邻 PTE 安装循环的耗时。
+- =ptebatch_skip=：上述循环中因 PTE 或 folio 重验失败而提前结束的子集，含此前
+  成功安装前缀的时间。次数按尝试计，跳过的页数读 =policy_stats/ptebatch_skipped=。
+- =slotrun=：开启 SLOTRUN 后扫描一个已排序 BATCH 的时间，含判定为不合格的批次。

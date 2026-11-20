@@ -1741,12 +1741,23 @@ def test_pte_batch_install():
     source = (root / 'linux-stable/mm/memory.c').read_text()
     start = source.index('static unsigned int hermit_batch_ptes(')
     end = source.index('\n#endif\n\n/*\n * We enter with non-exclusive mmap_lock', start)
+    adc = (root / 'linux-stable/include/linux/hermit_adc.h').read_text()
+    timing = adc[adc.index('enum hermit_adc_stage {'):adc.index('/* Each invocation')]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+typedef uint64_t u64;
+static u64 clock_reads, tick_reads;
+#define DECLARE_STATIC_KEY_FALSE(key) static bool key
+#define static_branch_unlikely(key) (*(key))
+#define ktime_get_ns() (++clock_reads)
+#define boot_cpu_has(feature) true
+#define check_tsc_unstable() false
+#define rdtsc_ordered() (++tick_reads * 2)
+#define barrier() ((void)0)
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096UL
 #define PAGE_MASK (~(PAGE_SIZE - 1))
@@ -1914,6 +1925,12 @@ static void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *
 }
 '''
     tests = r'''
+static unsigned int samples[ADC_STAGE_NR];
+void hermit_adc_record(enum hermit_adc_stage stage, u64 ns, u64 ticks)
+{
+    assert(ns == 1 && ticks == 2);
+    samples[stage]++;
+}
 static struct mm_struct mm;
 static struct swap_info_struct si;
 static struct vm_area_struct vma;
@@ -1961,6 +1978,8 @@ int main(void)
 	for (unsigned int i = 1; i < 4; i++) folios[i].refs = 1;   /* swapcache */
 	assert(run(4, 1) == 3 && policy_called);
 	assert(installed_pages == 3 && skipped_pages == 0);
+	assert(!clock_reads && !tick_reads && !samples[ADC_PTEBATCH_INSTALL]);
+	hermit_adc_key = true;
 	assert(swap_frees == 3 && anon_delta == 3 && swpent_delta == (unsigned int)-3);
 	assert(mkwrite == 3 && rmap_exclusive == 3 && icache == 3);
 	assert(set_calls == 3 && unlocks == 3 && free_swap_calls == 3);
@@ -1979,6 +1998,7 @@ int main(void)
 	for (unsigned int i = 1; i < 4; i++) folios[i].refs = 1;
 	assert(run(4, 1) == 3);
 	assert(mkwrite == 0 && rmap_exclusive == 3);
+	assert(samples[ADC_PTEBATCH_INSTALL] == 1 && !samples[ADC_PTEBATCH_SKIP]);
 	for (unsigned int i = 1; i < 4; i++)
 		assert(!(ptes[i].v & PTE_WRITE) && (ptes[i].v & PTE_YOUNG));
 
@@ -1989,6 +2009,7 @@ int main(void)
 	ptes[2] = swap_pte(99, 1);              /* e.g. swapped out again */
 	assert(run(4, 1) == 1);
 	assert(installed_pages == 1 && skipped_pages == 2 && swap_frees == 1);
+	assert(samples[ADC_PTEBATCH_INSTALL] == 2 && samples[ADC_PTEBATCH_SKIP] == 1);
 	assert(!(ptes[2].v & PTE_PRESENT) && !(ptes[3].v & PTE_PRESENT));
 	/* Same for a PTE whose offset is right but whose markers differ. */
 	reset(); fill(4, 1);
@@ -2104,13 +2125,18 @@ int main(void)
 	folios[1].refs = 2; folios[1].writeback = true;
 	si.flags = SWP_STABLE_WRITES;
 	assert(run(2, 1) == 1 && mkwrite == 0 && rmap_exclusive == 0);
-	puts("Batch PTE install tests: PASS");
+	struct hermit_adc_interval medium = hermit_adc_begin(ADC_TOTAL_PF);
+	medium.subtype = ADC_MEDIUM_SWAPIN;
+	hermit_adc_finish(&medium);
+	assert(samples[ADC_TOTAL_PF] == 1 && samples[ADC_MEDIUM_SWAPIN] == 1);
+	assert(samples[ADC_SWAP_MAJOR] == 1 && !samples[ADC_SWAP_MINOR]);
+	puts("Batch PTE install and ADC accounting tests: PASS");
 	return 0;
 }
 '''
     with tempfile.TemporaryDirectory(prefix='hermit-ptebatch-test-') as tmp:
         cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
-        cfile.write_text(harness + source[start:end] + tests)
+        cfile.write_text(harness + timing + source[start:end] + tests)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
                         '-Werror', '-Wno-unused-parameter', '-Wno-unused-function',
                         '-fsanitize=address,undefined', '-g',
