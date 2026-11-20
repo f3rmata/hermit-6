@@ -8,6 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pebs'))
 import matrix_metrics as metrics
@@ -29,6 +30,45 @@ def policy(**values):
 
 
 class MatrixMetricsTests(unittest.TestCase):
+    def test_adc_client_window_and_restore(self):
+        header = 'stage count total_ns tsc_count total_tsc_ticks\n'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control, stats = root/'adc_enable', root/'adc_stats'
+            control.write_text('0\n')
+            # The general before/after captures simulate extra system activity.
+            def capture(folder, cg, pid):
+                self.assertEqual(control.read_text().strip(), '1')
+                ns = 2**55 if folder.name == 'before' else 2**56
+                stats.write_text(header + f'swap_major 6 {ns} 0 0\nslotrun 0 0 0 0\n')
+            with patch.object(memcached, 'D', root), patch.object(memcached, 'capture', capture):
+                with memcached.measurement_window(root, None, 0, True):
+                    stats.write_text(header + f'swap_major 8 {2**55+25} 0 0\nslotrun 0 0 0 0\n')
+                self.assertEqual(control.read_text().strip(), '0')
+                self.assertEqual((root/'adc.csv').read_text().splitlines(), [
+                    'stage,count,ns,avg_ns', 'swap_major,2,25,12.50', 'slotrun,0,0,'])
+                for saved in ('0', '1'):
+                    control.write_text(saved)
+                    with self.assertRaises(InterruptedError):
+                        with memcached.measurement_window(root, None, 0, True):
+                            raise InterruptedError
+                    self.assertEqual(control.read_text().strip(), saved)
+            # Older kernels can run uninstrumented cells with no ADC interface.
+            with metrics.cell_adc(False, root/'absent', Path.read_text, Path.write_text):
+                pass
+
+    def test_adc_rejects_resets_and_missing_stages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before, after = root/'before', root/'after'
+            header = 'stage count total_ns\n'
+            before.write_text(header + 'swap_major 7 100\n')
+            for row in ('swap_major 8 99', 'swap_minor 7 100', 'swap_major x 101'):
+                with self.subTest(row=row), self.assertRaises(ValueError):
+                    after.write_text(header + row + '\n')
+                    metrics.write_adc_csv(root/'adc.csv', before, after)
+            self.assertFalse((root/'adc.csv').exists())
+
     def test_order_and_batch_namespaces_are_additive(self):
         result = metrics.wr_delta(wr(10, 3, 2), wr(12, 8, 6))
         self.assertEqual(result[4]['read_wrs'], 7)
@@ -82,9 +122,14 @@ class MatrixMetricsTests(unittest.TestCase):
                     Path(str(path)+'.pebs').write_text('0: 0\nactual_order_0: 0\n')
                     Path(str(path)+'.policy').write_text(policy())
                     Path(str(path)+'.vmstat').write_text(f'pswpin {4*n}\npswpout {n}\n')
+                    count = n if phase == '-swapin' else 100 * n
+                    Path(str(path)+'.adc').write_text('stage count total_ns\n'
+                                                     f'swap_major {count} {9*count}\n')
                     Path(str(path)+'.thp').write_text('/thp/enabled=never\n/thp/hugepages-64kB/enabled=always\n')
             row = dict(suite='redis', page_kb=64, mode=1)
-            result = workloads.collect_measurement(root, row)
+            result = workloads.collect_measurement(root, row, root/'adc.csv')
+            self.assertEqual((root/'adc.csv').read_text().splitlines(),
+                             ['stage,count,ns,avg_ns', 'swap_major,1,9,9.00'])
             batch = next(r for r in result['granularity'] if r['phase']=='application' and r['size_kib']==12)
             self.assertIsNone(batch['order'])
             self.assertEqual(batch['read_bytes'], 12288)

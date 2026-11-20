@@ -32,6 +32,11 @@
 不传该参数时保持原行为（不改写 `policy_features`）。详见
 [策略内核集成](../../docs/pebs/kernel-policy-integration.org)。
 
+两个矩阵都可加 `--adc`。每格的 `adc.csv` 按阶段列出实测窗口的次数、总纳秒、
+平均纳秒（次数为零时留空）。多负载矩阵取应用阶段的 `order-{before,after}-swapin.txt.adc`
+差值；Memcached 在预热之后取 `adc-before.txt` / `adc-after.txt`，只包围实测客户端。
+各格在 `case.json` / `config.json` 记录 `adc`，退出该格时恢复原始 `adc_enable`。
+
 ```sh
 python3 tools/rdma/pebs/run_workload_matrix.py --dry-run --suites anon-1t-full \
   --pages 64 2048 --periods 1999 --repeats 1 --policy-features default no-pebs no-batch

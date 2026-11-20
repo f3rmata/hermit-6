@@ -1,6 +1,7 @@
 """Counter formats shared by the application matrix drivers."""
 import csv
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 WR_FIELDS = ('write_wrs', 'read_wrs', 'write_bytes', 'read_bytes')
@@ -88,6 +89,57 @@ def counter_delta(before, after):
     if any(v < 0 for v in result.values()):
         raise ValueError('counter reset during measurement')
     return result
+
+
+@contextmanager
+def cell_adc(enabled, debug, read, write):
+    """Own the ADC switch while running a cell that requested snapshots."""
+    if not enabled:
+        yield
+        return
+    control = debug/'adc_enable'
+    saved = read(control).strip()
+    try:
+        write(control, '1')
+        if read(control).strip() != '1':
+            raise RuntimeError('adc_enable did not turn on')
+        yield
+    finally:
+        write(control, saved)
+        if read(control).strip() != saved:
+            raise RuntimeError('adc_enable restore failed')
+
+
+def adc_counters(path):
+    result = {}
+    with path.open() as f:
+        header = f.readline().split()
+        if header[:3] != ['stage', 'count', 'total_ns']:
+            raise ValueError(f'invalid ADC header in {path}')
+        for line in f:
+            fields = line.split()
+            if (len(fields) != len(header) or fields[0] in result or
+                    not all(value.isdigit() for value in fields[1:])):
+                raise ValueError(f'invalid ADC row in {path}')
+            result[fields[0]] = dict(count=int(fields[1]), ns=int(fields[2]))
+    if not result:
+        raise ValueError(f'empty ADC table in {path}')
+    return result
+
+
+def write_adc_csv(output, before, after):
+    old, new = adc_counters(before), adc_counters(after)
+    if old.keys() != new.keys():
+        raise ValueError('ADC stage schema changed')
+    rows = []
+    for stage in old:
+        delta = counter_delta(old[stage], new[stage])
+        count, ns = delta['count'], delta['ns']
+        rows.append((stage, count, ns, f'{ns / count:.2f}' if count else ''))
+    with output.open('w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(('stage', 'count', 'ns', 'avg_ns'))
+        writer.writerows(rows)
 
 
 def wr_sections(text):

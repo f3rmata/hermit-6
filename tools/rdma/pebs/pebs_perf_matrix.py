@@ -4,10 +4,11 @@
 # research script permissive instead of annotating every regex lookup.
 # pyright: reportOptionalSubscript=false, reportArgumentType=false, reportAttributeAccessIssue=false
 import argparse, ctypes, csv, fcntl, json, os, pwd, random, re, signal, socket, subprocess, time, hashlib, shutil, resource, itertools
+from contextlib import contextmanager
 from pathlib import Path
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, PAGE_SIZES, counter_delta, wr_delta,
                             policy_delta, policy_activity, policy_masks, policy_suffix, apply_policy_mask,
-                            page_ceiling_settings, read_optional, write_comparisons)
+                            page_ceiling_settings, cell_adc, read_optional, write_adc_csv, write_comparisons)
 D = Path('/sys/kernel/debug/hermit')
 LIBC = ctypes.CDLL(None, use_errno=True)
 LIBC.syscall.restype = ctypes.c_long
@@ -79,6 +80,22 @@ def capture(folder, cg, pid):
         except (FileNotFoundError,ProcessLookupError): pass
     (folder/'vmstat').write_text(read('/proc/vmstat'))
     write(folder/'time',time.monotonic())
+
+
+@contextmanager
+def measurement_window(run, cg, pid, adc):
+    with cell_adc(adc, D, read, write):
+        capture(run/'before', cg, pid)
+        if adc:
+            (run/'adc-before.txt').write_text(read(D/'adc_stats'))
+        yield
+        if adc:
+            (run/'adc-after.txt').write_text(read(D/'adc_stats'))
+        capture(run/'after', cg, pid)
+    if adc:
+        write_adc_csv(run/'adc.csv', run/'adc-before.txt', run/'adc-after.txt')
+
+
 def latency(log):
     result={}
     for kind in ['read','update']:
@@ -288,6 +305,7 @@ def main():
     ap.add_argument('--pages', nargs='+', type=int, choices=PAGE_SIZES,
                     help='allocation ceilings in KiB, plus a 4KiB/off reference; smaller sizes stay eligible; omitted preserves THP')
     ap.add_argument('--policy-features',nargs='+',default=None,help='policy_features ablations for policy cells: preset names (default, no-pebs, no-batch, medium-on), raw masks (0x1bd) or comma-separated lists; each preset becomes a labelled policy case; omitted preserves the kernel mask and is restored on exit')
+    ap.add_argument('--adc', action='store_true', help='capture measured-client Hermit ADC deltas')
     ap.add_argument('--dry-run', action='store_true', help='print matrix without sudo or host changes')
     ap.add_argument('--port',type=int,default=11329);ap.add_argument('--require-fixed',action='store_true')
     ap.add_argument('--memory-mb',type=int,default=640)
@@ -311,7 +329,7 @@ def main():
     if args.dry_run:
         plan = matrix_plan(args.pages, args.repeats, cases)
         print(json.dumps(dict(samples=len(plan), baseline_case='off', plan=plan,
-                              policy_presets=presets,
+                              policy_presets=presets, adc=args.adc,
                               page_policy='max-allocation-v1' if args.pages else 'preserve-system',
                               writes=False, workload_execution=False), indent=2))
         return
@@ -475,16 +493,16 @@ def main():
             write(cg/'memory.high',args.memory_mb*1024**2)
             requests=base+['--noload','-T',str(len(client_ids)),'-c',str(args.connections),'-q',str(args.qps),'--update=0.1','--iadist=fb_ia']
             client(requests+['-t',str(args.warmup)],run/'warmup.log',args.warmup+120)
-            (run/'config.json').write_text(json.dumps({'case':label,'mode':mode,
+            (run/'config.json').write_text(json.dumps({'case':label,'mode':mode,'adc':args.adc,
                 'load_period':period,'store_period':1500003 if period else None,
                 'sampler_affinity':sampler_affinity,'pebs_event_scope':'all online CPUs',
                 'controls':{f:read(D/f) for f in controls},'thp':read(thp_control),
                 'thp_settings':actual_thp,'off_baseline':'same-settings-v1',
                 'max_page_kb':max_page_kb,'page_allocation':manifest['page_policy']},indent=2))
             pages_before=record_page_sizes(run/'pages-before',server.pid)
-            capture(run/'before',cg,server.pid)
-            client_usage=client(requests+['-t',str(args.duration)],run/'measure.log',args.duration+120)
-            capture(run/'after',cg,server.pid)
+            with measurement_window(run, cg, server.pid, args.adc):
+                client_usage = client([*requests, '-t', str(args.duration)],
+                                      run/'measure.log', args.duration + 120)
             pages_after=record_page_sizes(run/'pages-after',server.pid)
             collect_final_stats(args.port,run,server)
             if sampler_affinity is not None and sorted(os.sched_getaffinity(sampler_affinity['pid']))!=sampler_ids:

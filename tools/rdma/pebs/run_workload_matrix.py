@@ -27,7 +27,7 @@ from typing import Any
 from page_selection_metrics import table
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, counter_delta, wr_delta,
                             policy_delta, policy_activity, policy_masks, policy_suffix, apply_policy_mask,
-                            read_optional, write_comparisons)
+                            cell_adc, read_optional, write_adc_csv, write_comparisons)
 
 RDMA = Path(__file__).resolve().parents[1]
 DEBUG = Path('/sys/kernel/debug/hermit')
@@ -302,7 +302,7 @@ def table_delta(before, after):
     return result
 
 
-def collect_measurement(folder, row) -> dict[str, Any]:
+def collect_measurement(folder, row, adc_csv=None) -> dict[str, Any]:
     """Pair application performance with phase deltas, never with a requested size."""
     with next(folder.glob('*summary.csv')).open() as f:
         record, = list(csv.DictReader(f))
@@ -334,6 +334,8 @@ def collect_measurement(folder, row) -> dict[str, Any]:
             raise ValueError(f'expected one {phase} counter snapshot pair')
         before = paths[0]
         after = before.with_name(before.name.replace('before', 'after', 1))
+        if adc_csv is not None and phase == 'application':
+            write_adc_csv(adc_csv, Path(str(before)+'.adc'), Path(str(after)+'.adc'))
         folios = table_delta(before, after)
         wrs = wr_delta(Path(str(before)+'.wr').read_text(), Path(str(after)+'.wr').read_text())
         policy[phase] = policy_delta(read_optional(str(before)+'.policy'), read_optional(str(after)+'.policy'))
@@ -416,6 +418,7 @@ def main():
                          'no-batch, medium-on), raw masks (0x1bd) or comma-separated lists; omitted '
                          'preserves the kernel mask and keeps the historical '
                          'off/static/policy cells')
+    ap.add_argument('--adc', action='store_true', help='capture application-phase Hermit ADC deltas')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
     if min(args.periods+[args.store_period,args.repeats,args.timeout]) < 1:
@@ -431,7 +434,7 @@ def main():
     rows, env = plan(args), environment(args)
     if args.dry_run:
         print(json.dumps({'samples':len(rows), 'memory_policy':MEMORY_POLICY, 'page_policy':PAGE_POLICY,
-                          'environment':env, 'plan':rows}, indent=2))
+                          'environment':env, 'plan':rows, 'adc':args.adc}, indent=2))
         return
     if os.geteuid() == 0: ap.error('run as the benchmark user after sudo -v')
     if platform.machine() != 'x86_64' or 'hermit-pebs' not in platform.release():
@@ -543,11 +546,12 @@ def main():
             script, suite_env = SUITES[row['suite']]
             case_env = env | {k:str(v) for k,v in suite_env.items()} | dict(
                 PAGE_SIZES_KB=str(row['page_kb']), RESULT_DIR=str(folder.resolve()/'results'),
-                RUN_ID=name, PEBS_CGROUP=str(cg), PEBS_BENCH_MODE=row['case'])
+                RUN_ID=name, PEBS_CGROUP=str(cg), PEBS_BENCH_MODE=row['case'],
+                PEBS_MATRIX_ADC=str(int(args.adc)))
             save_json(folder/'case.json',row | {'environment':case_env, 'memory_policy':MEMORY_POLICY,
-                                               'page_policy':PAGE_POLICY})
+                                               'page_policy':PAGE_POLICY, 'adc':args.adc})
             start=time.monotonic()
-            with (folder/'run.log').open('w') as log:
+            with cell_adc(args.adc, DEBUG, read, write), (folder/'run.log').open('w') as log:
                 child=subprocess.Popen(['bash',str(source/script)],env=case_env,stdout=log,stderr=subprocess.STDOUT,preexec_fn=os.setpgrp)
                 while True:
                     try: rc=child.wait(timeout=30); break
@@ -570,7 +574,8 @@ def main():
             policy_activity = None
             if rc == 0:
                 try:
-                    measurement = collect_measurement(folder/'results', row)
+                    measurement = collect_measurement(folder/'results', row,
+                                                      folder/'adc.csv' if args.adc else None)
                     save_json(folder/'measurement.json', measurement)
                     policy_activity, policy_issues = check_policy_activity(row, measurement)
                     issues += policy_issues

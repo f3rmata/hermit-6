@@ -267,6 +267,10 @@ check_swap_capacity() {
 }
 
 snapshot_sweep_stats() {
+  # Take ADC closest to the application, outside the other counter reads.
+  if [[ ${PEBS_MATRIX_ADC:-0} = 1 && ${1##*/} = order-after*.txt ]]; then
+    sudo_cat /sys/kernel/debug/hermit/adc_stats > "$1.adc"
+  fi
   snapshot_order_stats > "$1"
   snapshot_benchmark_pebs "$1.pebs"
   sudo_cat "$WR_STATS_FILE" > "$1.wr"
@@ -281,6 +285,9 @@ snapshot_sweep_stats() {
   for file in /sys/kernel/mm/lru_gen/enabled /sys/kernel/mm/lru_gen/min_ttl_ms; do
     [ ! -r "$file" ] || printf '%s=%s\n' "$file" "$(cat "$file")"
   done > "$1.mglru"
+  if [[ ${PEBS_MATRIX_ADC:-0} = 1 && ${1##*/} = order-before*.txt ]]; then
+    sudo_cat /sys/kernel/debug/hermit/adc_stats > "$1.adc"
+  fi
 }
 
 # order_stats measures folio requests, not actual WRs. Keep the historical

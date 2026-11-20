@@ -17,6 +17,30 @@ def shell(script, *args, check=True):
 
 
 class SweepTests(unittest.TestCase):
+    def test_adc_snapshots_bracket_the_application(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shell('''
+                set -e
+                WR_STATS_FILE=wr
+                thp_files=()
+                sudo_test() { return 1; }
+                sudo_cat() { echo "${1##*/}" >> "$trace"; echo fixture; }
+                snapshot_benchmark_pebs() { :; }
+                trace=$1/trace
+                PEBS_MATRIX_ADC=1
+                snapshot_sweep_stats "$1/order-before-swapin.txt"
+                snapshot_sweep_stats "$1/order-after-swapin.txt"
+                PEBS_MATRIX_ADC=0
+                snapshot_sweep_stats "$1/order-before.txt"
+            ''', root)
+            self.assertEqual((root/'trace').read_text().splitlines(),
+                             ['order_stats', 'wr', 'adc_stats', 'adc_stats', 'order_stats', 'wr',
+                              'order_stats', 'wr'])
+            for tag in ('before', 'after'):
+                self.assertEqual((root/f'order-{tag}-swapin.txt.adc').read_text(), 'fixture\n')
+            self.assertFalse((root/'order-before.txt.adc').exists())
+
     def test_absolute_memory_budget(self):
         self.assertEqual(shell('MEMORY_LIMIT_MB=512; benchmark_memory_limit_mb 2000 70').stdout.strip(),'512')
         self.assertEqual(shell('unset MEMORY_LIMIT_MB; benchmark_memory_limit_mb 2000 70').stdout.strip(),'1400')

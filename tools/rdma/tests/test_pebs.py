@@ -185,6 +185,17 @@ class ThpCases(unittest.TestCase):
 
 
 class MatrixTests(unittest.TestCase):
+    def test_adc_dry_runs_preserve_the_cell_plan(self):
+        for driver, args in [(MATRIX_PATH, ['--suites', 'redis', '--periods', '1999']),
+                             (THP_PATH, ['--user', 'unused', '--output', '/unused'])]:
+            command = [sys.executable, str(driver), '--dry-run', '--pages', '64',
+                       '--repeats', '1', *args]
+            plain = json.loads(subprocess.check_output(command))
+            capture = json.loads(subprocess.check_output([*command, '--adc']))
+            self.assertFalse(plain['adc'])
+            self.assertTrue(capture['adc'])
+            self.assertEqual(plain['plan'], capture['plan'])
+
     def test_archived_drivers_include_pebs_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)/'source'
