@@ -42,6 +42,75 @@ order_total_stores() {
   snapshot_order_stats | awk 'NR > 1 { total += $3 } END { printf "%d", total }'
 }
 
+# Seconds between two `date +%s%N` samples. Protocol bandwidth must pair a
+# counter delta with the interval the counters were sampled in; a protocol
+# timer (for example the sum of application trial times) excludes work that the
+# counter delta includes, such as graph re-verification between trials.
+elapsed_seconds() {
+  local start=$1 end=$2
+  [[ "$start" =~ ^[0-9]+$ ]] && [[ "$end" =~ ^[0-9]+$ ]] || return 1
+  [ "$end" -ge "$start" ] || return 1
+  awk -v a="$start" -v b="$end" 'BEGIN { printf "%.6f", (b - a) / 1000000000 }'
+}
+
+# policy_features ablations shared with the Python matrix runners
+# (tools/rdma/pebs/matrix_metrics.py POLICY_MASKS). Other values are raw masks.
+policy_mask_of() {
+  case "$1" in
+    default) printf '0xa3' ;;
+    no-pebs) printf '0xa1' ;;
+    no-batch) printf '0x83' ;;
+    medium-on) printf '0x2a3' ;;
+    fitstart-on) printf '0x4a3' ;;
+    ptebatch-on) printf '0x8a3' ;;
+    fitpte) printf '0xca3' ;;
+    fitpte-medium) printf '0xea3' ;;
+    split-on) printf '0x10a3' ;;
+    split-obs) printf '0x40a3' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+valid_policy_mask() {
+  local value
+  if [[ "$1" =~ ^0[xX]0*([0-9a-fA-F]{1,4})$ ]]; then
+    value=$((16#${BASH_REMATCH[1]}))
+  elif [[ "$1" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
+    value=$1
+  else
+    return 1
+  fi
+  # Bits 2–4 and 8 are retired.
+  (( (value & ~0x7ee3) == 0 ))
+}
+
+# Per-order swap-in cost table (debugfs swapin_cost_stats). Rows are
+# "name value"; keep this order stable, it also defines the CSV columns.
+COST_STATS_FILE=${COST_STATS_FILE:-/sys/kernel/debug/hermit/swapin_cost_stats}
+COST_ENABLE_FILE=${COST_ENABLE_FILE:-/sys/kernel/debug/hermit/swapin_cost_enable}
+
+cost_keys() {
+  local order
+  for order in $(seq 0 9); do
+    printf 'order%s_faults\norder%s_ns\n' "$order" "$order"
+  done
+  printf 'prefetched_4k\nprefetch_hit_faults\nprefetch_hit_ns\n'
+}
+
+cost_stat() {
+  awk -v k="$2" '$1 == k { print $2; found = 1 } END { if (!found) print 0 }' "$1"
+}
+
+cost_delta() {
+  local before after key old new
+  before=$1 after=$2 key=$3
+  old=$(cost_stat "$before" "$key") || return 1
+  new=$(cost_stat "$after" "$key") || return 1
+  [[ "$old" =~ ^[0-9]+$ ]] && [[ "$new" =~ ^[0-9]+$ ]] || return 1
+  [ "$new" -ge "$old" ] || return 1
+  printf '%s' "$(( new - old ))"
+}
+
 memory_event() {
   local key=$1
   awk -v key="$key" '$1 == key { print $2; found=1 } END { if (!found) print 0 }' \
@@ -156,7 +225,11 @@ wait_for_stores_quiet() {
 }
 
 validate_sweep_host() {
-  local swap_count
+  local swap_count mglru
+  mglru=$(cat /sys/kernel/mm/lru_gen/enabled) || rdma_die "MGLRU control is unavailable"
+  if ! [[ "$mglru" =~ ^0x[0-9a-fA-F]+$ ]] || ! (( mglru & 1 )); then
+    rdma_die "Hermit requires MGLRU with the core bit enabled"
+  fi
   [ -r /sys/fs/cgroup/cgroup.controllers ] || rdma_die "cgroup v2 is required"
   mount_debugfs_if_needed
   sudo_test -r /sys/kernel/debug/hermit/order_stats || rdma_die "Hermit order_stats is unavailable"
@@ -203,6 +276,10 @@ check_swap_capacity() {
 }
 
 snapshot_sweep_stats() {
+  # Take ADC closest to the application, outside the other counter reads.
+  if [[ ${PEBS_MATRIX_ADC:-0} = 1 && ${1##*/} = order-after*.txt ]]; then
+    sudo_cat /sys/kernel/debug/hermit/adc_stats > "$1.adc"
+  fi
   snapshot_order_stats > "$1"
   snapshot_benchmark_pebs "$1.pebs"
   sudo_cat "$WR_STATS_FILE" > "$1.wr"
@@ -217,6 +294,9 @@ snapshot_sweep_stats() {
   for file in /sys/kernel/mm/lru_gen/enabled /sys/kernel/mm/lru_gen/min_ttl_ms; do
     [ ! -r "$file" ] || printf '%s=%s\n' "$file" "$(cat "$file")"
   done > "$1.mglru"
+  if [[ ${PEBS_MATRIX_ADC:-0} = 1 && ${1##*/} = order-before*.txt ]]; then
+    sudo_cat /sys/kernel/debug/hermit/adc_stats > "$1.adc"
+  fi
 }
 
 # order_stats measures folio requests, not actual WRs. Keep the historical

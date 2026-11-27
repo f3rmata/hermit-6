@@ -157,7 +157,7 @@ mkdir -p "$RESULT_DIR"
   printf 'swap:\n'
   sed 's/^/  /' /proc/swaps
 } > "$RESULT_DIR/environment.txt"
-printf 'page_kb,order,repeat,mode,kernel,scale,degree,nodes,edges,resident_mb,limit_mb,trials,verified_trials,trial_sec_total,run_sec,trials_per_sec,pswpout_delta,target_stores_delta,total_store_bytes,large_store_pct,protocol_gib_per_sec,pswpin_delta,run_pswpout_delta,target_loads_delta,target_fallback_delta,target_errors_delta,total_load_bytes,large_load_pct,load_protocol_gib_per_sec,checksum_errors\n' > "$CSV"
+printf 'page_kb,order,repeat,mode,kernel,scale,degree,nodes,edges,resident_mb,limit_mb,trials,verified_trials,trial_sec_total,run_sec,trials_per_sec,pswpout_delta,target_stores_delta,total_store_bytes,large_store_pct,store_phase_sec,store_phase_gib_per_sec,pswpin_delta,run_pswpout_delta,target_loads_delta,target_fallback_delta,target_errors_delta,total_load_bytes,large_load_pct,load_phase_sec,load_phase_gib_per_sec,checksum_errors\n' > "$CSV"
 
 export OMP_NUM_THREADS="$GAPBS_THREADS" OMP_PROC_BIND=true OMP_PLACES=cores
 
@@ -194,10 +194,12 @@ for kb in $PAGE_SIZES_KB; do
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-before.txt"
     sudo_cat "$CGROUP/memory.stat" > "$run_dir/memory-stat-before.txt"
     wait_for_stores_quiet
+    # Store bytes are counted between these two snapshots, so the interval is
+    # the time up to the last store change, not the script's total runtime.
+    store_start_ns=$(date +%s%N)
     snapshot_sweep_stats "$before"
     pswpout_before=$(read_vmstat_key pswpout)
     oom_before=$(memory_event oom_kill)
-    start_ns=$(date +%s%N)
     sudo_write "$((limit_mb * 1024 * 1024))" "$CGROUP/memory.max"
     wait_for_stores_quiet "$(date +%s%N)"
     snapshot_sweep_stats "$after"
@@ -206,8 +208,10 @@ for kb in $PAGE_SIZES_KB; do
     [ "$(memory_event oom_kill)" -eq "$oom_before" ] || rdma_die "cgroup OOM during swap-out; see $run_dir"
     kill -0 "$current_pid" 2>/dev/null || rdma_die "gapbs process exited during reclaim; see $run_dir"
 
-    completion_ms=$(( (last_change_ns - start_ns) / 1000000 ))
+    completion_ms=$(( (last_change_ns - store_start_ns) / 1000000 ))
     [ "$completion_ms" -gt 0 ] || completion_ms=1
+    store_phase_sec=$(elapsed_seconds "$store_start_ns" "$last_change_ns") || \
+      rdma_die "invalid store interval; see $run_dir"
     target_stores=$(( $(order_field "$after" "$order" 3) - $(order_field "$before" "$order" 3) ))
     pswpout_delta=$((pswpout_after - pswpout_before))
     summarize_stores "$before" "$after" "$completion_ms"
@@ -216,12 +220,19 @@ for kb in $PAGE_SIZES_KB; do
     snapshot_fixed_memory_budget "$CGROUP" "$run_dir" before-swapin "$((limit_mb * 1024 * 1024))"
     load_before="$run_dir/order-before-swapin.txt"
     load_after="$run_dir/order-after-swapin.txt"
+    # The load counters below are sampled between these two snapshots, so the
+    # interval that pairs with them is the whole application phase: timed
+    # trials plus the verification GAPBS runs after each trial. Dividing the
+    # same bytes by the trial timer alone (trial_sec_total) overstated the
+    # remote-read bandwidth, so phase time is used and labelled as such.
+    load_start_ns=$(date +%s%N)
     snapshot_sweep_stats "$load_before"
     pswpin_before=$(read_vmstat_key pswpin)
     run_pswpout_before=$(read_vmstat_key pswpout)
     kill -USR2 "$current_pid"
     wait_for_log '^DONE ' "$log" "$RUN_TIMEOUT_SEC" 1
     snapshot_sweep_stats "$load_after"
+    load_end_ns=$(date +%s%N)
     pswpin_after=$(read_vmstat_key pswpin)
     run_pswpout_after=$(read_vmstat_key pswpout)
     sudo_cat "/proc/$current_pid/smaps_rollup" > "$run_dir/smaps-rollup-after-swapin.txt"
@@ -245,19 +256,23 @@ for kb in $PAGE_SIZES_KB; do
     target_loads=$(( $(order_field "$load_after" "$order" 4) - $(order_field "$load_before" "$order" 4) ))
     target_fallback=$(( $(order_field "$load_after" "$order" 5) - $(order_field "$load_before" "$order" 5) ))
     target_errors=$(( $(order_field "$load_after" "$order" 6) - $(order_field "$load_before" "$order" 6) ))
-    summarize_loads "$load_before" "$load_after" "$trial_sec"
+    load_phase_sec=$(elapsed_seconds "$load_start_ns" "$load_end_ns") || \
+      rdma_die "invalid swap-in interval; see $run_dir"
+    awk -v s="$load_phase_sec" 'BEGIN { exit !(s > 0) }' || \
+      rdma_die "zero-length swap-in interval; see $run_dir"
+    summarize_loads "$load_before" "$load_after" "$load_phase_sec"
     [ "$pswpin_delta" -gt 0 ] || rdma_die "trials caused no swap-ins; lower LOCAL_RATIO_PCT; see $run_dir"
     [[ "$total_load_bytes" =~ ^[0-9]+$ ]] && [ "$total_load_bytes" -gt 0 ] || \
       rdma_die "Hermit recorded no backend loads; see $run_dir"
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$kb" "$order" "$repeat" "$MODE" "$GAPBS_KERNEL" "$GAPBS_SCALE" "$GAPBS_DEGREE" \
       "$nodes" "$edges" "$resident_mb" "$limit_mb" "$trials" "$verified" "$trial_sec" \
       "$run_sec" "$trials_per_sec" "$pswpout_delta" "$target_stores" "$total_store_bytes" \
-      "$large_store_pct" "$protocol_gib_per_sec" "$pswpin_delta" "$run_pswpout_delta" \
-      "$target_loads" "$target_fallback" "$target_errors" "$total_load_bytes" \
-      "$large_load_pct" "$load_protocol_gib_per_sec" "0" >> "$CSV"
-    rdma_log "page=${kb}k repeat=$repeat kernel=$GAPBS_KERNEL trials/s=$trials_per_sec resident=${resident_mb}MiB limit=${limit_mb}MiB swapin=${load_protocol_gib_per_sec}GiB/s load_large=${large_load_pct}% fallback=$target_fallback errors=$target_errors"
+      "$large_store_pct" "$store_phase_sec" "$protocol_gib_per_sec" "$pswpin_delta" \
+      "$run_pswpout_delta" "$target_loads" "$target_fallback" "$target_errors" \
+      "$total_load_bytes" "$large_load_pct" "$load_phase_sec" "$load_protocol_gib_per_sec" "0" >> "$CSV"
+    rdma_log "page=${kb}k repeat=$repeat kernel=$GAPBS_KERNEL trials/s=$trials_per_sec resident=${resident_mb}MiB limit=${limit_mb}MiB swapin=${load_protocol_gib_per_sec}GiB/s over ${load_phase_sec}s phase load_large=${large_load_pct}% fallback=$target_fallback errors=$target_errors"
     kill -USR2 "$current_pid"
     wait "$current_pid" || rdma_die "gapbs exited with an error; see $log"
     current_pid=

@@ -22,10 +22,13 @@ import socket
 import subprocess
 import sys
 import time
+from typing import Any
 
 from page_selection_metrics import table
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, counter_delta, wr_delta,
-                            policy_delta, policy_activity, read_optional, write_comparisons)
+                            policy_delta, policy_activity, policy_masks, policy_suffix, apply_policy_mask,
+                            cell_adc, mglru_core_enabled, read_optional, write_adc_csv, write_comparisons,
+                            split_obs_delta)
 
 RDMA = Path(__file__).resolve().parents[1]
 DEBUG = Path('/sys/kernel/debug/hermit')
@@ -58,14 +61,24 @@ SUITES['gapbs-bfs'] = ('run_gapbs_page_sweep.sh', dict(GAPBS_KERNEL='bfs', GAPBS
                                                        GAPBS_THREADS=8, BENCH_CPUS='0-7'))
 SUITES['gapbs-pr'] = ('run_gapbs_page_sweep.sh', dict(GAPBS_KERNEL='pr', GAPBS_TRIALS=4,
                                                       GAPBS_THREADS=8, BENCH_CPUS='0-7'))
+# Fault-path scalability: full scans with 4 and 16 threads, one per physical
+# core of socket 0, complementing anon-1t-full and anon-8t-full.
+for _threads in (4, 16):
+    SUITES[f'anon-{_threads}t-full'] = ('run_anon_swapout_sweep.sh', dict(
+        BENCH_THREADS=_threads, BENCH_CPUS=f'0-{_threads - 1}', ACCESS_RATIOS='100'))
 CONTROLS = '''remote_order_mask pebs_mode pebs_adaptive pebs_load_period
 pebs_store_period apt_reclaim batch_account batch_io batch_swapout batch_tlb
 bypass_swapcache lazy_poll reclaim_headroom_pages reclaim_mode speculative_io
 speculative_lock sthd_cnt vaddr_swapout exclusive_swapout swap_thread prefetch_thread'''.split()
 CONTROLS += '''effective_order_mask pebs_all pebs_window_ms pebs_history_ms
 pebs_pc_max pebs_fixed_cost_ns pebs_region_max
-policy_features policy_cold_us policy_cold_epochs policy_pages_max policy_swapin_max
-pebs_predict_regions pebs_predict_samples'''.split()
+policy_features policy_swapin_max
+pebs_predict_regions pebs_predict_samples pebs_heat_ms
+policy_medium_min_order policy_medium_max_order
+policy_split_rate policy_split_min_samples policy_split_hot_cov'''.split()
+# Observe-only skew counters; snapshotted per cell, never a control.
+SPLIT_OBS = DEBUG/'split_obs_stats'
+SWAPIN_BIT = 0x1
 
 
 def command(args, **kwargs):
@@ -78,6 +91,14 @@ def read(path):
 
 def exists(path):
     return subprocess.run(['sudo', '-n', 'test', '-e', str(path)]).returncode == 0
+
+
+def executable(path):
+    """Return True only for an executable regular file (never a directory)."""
+    try:
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def write(path, value):
@@ -115,7 +136,7 @@ def snapshot_sources(destination):
             for p in sorted(destination.rglob('*')) if p.is_file()}
 
 
-def policy_settings():
+def policy_settings() -> dict[str, Any]:
     return {'controls': {k: read(DEBUG/k) for k in CONTROLS if exists(DEBUG/k)},
             'mglru': {name: read_optional(Path('/sys/kernel/mm/lru_gen')/name)
                       for name in ('enabled', 'min_ttl_ms')},
@@ -123,19 +144,19 @@ def policy_settings():
                 Path('/sys/kernel/mm/transparent_hugepage').glob('**/enabled'))}}
 
 
-def policy_changes(baseline, current):
+def policy_changes(baseline, current, owned=()):
     changes = []
     for section in ('controls', 'thp', 'mglru'):
         old, new = baseline.get(section, {}), current.get(section, {})
         for key in old.keys() | new.keys():
-            if section == 'controls' and key in SAMPLING_CONTROLS + ['pebs_enabled', 'pebs_order_stats']:
+            if section == 'controls' and key in SAMPLING_CONTROLS + ['pebs_enabled', 'pebs_order_stats'] + list(owned):
                 continue
             if old.get(key) != new.get(key):
                 changes.append(f'policy configuration changed: {section}/{key}')
     return sorted(changes)
 
 
-def snapshot(path):
+def snapshot(path) -> dict[str, Any]:
     settings = policy_settings()
     data = {'time_ns': time.time_ns(), 'uname': list(platform.uname()),
             'controls': settings['controls'] |
@@ -146,24 +167,30 @@ def snapshot(path):
             'cpu_stat': Path('/proc/stat').read_text(),
             'swaps': Path('/proc/swaps').read_text(), 'vmstat': Path('/proc/vmstat').read_text()}
     data['policy_stats'] = read(DEBUG/'policy_stats') if exists(DEBUG/'policy_stats') else None
+    data['split_obs_stats'] = read(SPLIT_OBS) if exists(SPLIT_OBS) else None
     save_json(path, data)
     return data
 
 
 def plan(args):
-    cases = [('off', None, 0)]
+    # None = preserve the kernel's current mask (historical behaviour).
+    masks = policy_masks(args.policy_features) if getattr(args, 'policy_features', None) else [(None, None)]
+    cases: list[tuple[str, int | None, int | None, int | None]] = [('off', None, 0, None)]
     for period in args.periods:
-        cases.extend([(f'static-{period}', 0, period), (f'policy-{period}', 1, period)])
+        cases.append((f'static-{period}', 0, period, None))
+        for label, mask in masks:
+            cases.append((f'policy-{period}{policy_suffix(label)}', 1, period, mask))
     rng = random.Random(args.seed)
     rows = []
     pages = args.pages if 4 in args.pages else [4, *args.pages]
     for repeat, suite, page in itertools.product(range(1, args.repeats+1), args.suites, pages):
         block = cases.copy() if page in args.pages else [cases[0]]
         rng.shuffle(block)
-        for label, mode, period in block:
+        for label, mode, period, mask in block:
             rows.append(dict(suite=suite, page_kb=page, max_page_kb=page, repeat=repeat, case=label,
                              baseline_role='4KiB-only' if page == 4 and label == 'off' else '',
-                             mode=mode, load_period=period, store_period=args.store_period))
+                             mode=mode, load_period=period, store_period=args.store_period,
+                             policy_features=mask))
     return rows
 
 
@@ -190,7 +217,16 @@ def check_policy_activity(row, measurement):
     decisions = sum(counts) if counts and all(v is not None for v in counts) else None
     policy = measurement.get('policy', {}).get('application')
     wrs = {r['size_kib']: r for r in application} if policy is not None else {}
-    return policy_activity(row['mode'], row['page_kb'], decisions, policy, wrs)
+    predict_calls = measurement.get('pebs_predict', {}).get('application', 0)
+    activity, issues = policy_activity(row['mode'], row['page_kb'], decisions, policy, wrs,
+                                       predict_calls=predict_calls)
+    # A mask without SWAPIN deliberately disables the base-page swap-in path
+    # (write-side or largest-folio ablations); lack of its activity is expected.
+    mask = row.get('policy_features')
+    if mask is not None and not mask & SWAPIN_BIT:
+        activity = activity | {'swapin_disabled': True, 'waived_issues': issues}
+        issues = []
+    return activity, issues
 
 
 def environment(args):
@@ -285,7 +321,7 @@ def table_delta(before, after):
     return result
 
 
-def collect_measurement(folder, row):
+def collect_measurement(folder, row, adc_csv=None) -> dict[str, Any]:
     """Pair application performance with phase deltas, never with a requested size."""
     with next(folder.glob('*summary.csv')).open() as f:
         record, = list(csv.DictReader(f))
@@ -310,6 +346,7 @@ def collect_measurement(folder, row):
     histogram = []
     allocation_settings = {}
     policy = {}
+    pebs_predict = {}
     swap = {}
     for phase, suffix in [('populate', ''), ('application', '-swapin')]:
         paths = list(folder.rglob(f'order-before{suffix}.txt'))
@@ -317,16 +354,19 @@ def collect_measurement(folder, row):
             raise ValueError(f'expected one {phase} counter snapshot pair')
         before = paths[0]
         after = before.with_name(before.name.replace('before', 'after', 1))
+        if adc_csv is not None and phase == 'application':
+            write_adc_csv(adc_csv, Path(str(before)+'.adc'), Path(str(after)+'.adc'))
         folios = table_delta(before, after)
         wrs = wr_delta(Path(str(before)+'.wr').read_text(), Path(str(after)+'.wr').read_text())
         policy[phase] = policy_delta(read_optional(str(before)+'.policy'), read_optional(str(after)+'.policy'))
-        vmstat = [read_optional(str(p)+'.vmstat') for p in (before, after)]
-        if any(v is not None for v in vmstat):
-            if any(v is None for v in vmstat):
+        snapshots = [read_optional(str(p)+'.vmstat') for p in (before, after)]
+        present = [text for text in snapshots if text is not None]
+        if present:
+            if len(present) != len(snapshots):
                 raise ValueError('missing vmstat snapshot')
             swap[phase] = counter_delta(*[{k: int(v) for k, v in
                                           (line.split() for line in text.splitlines())
-                                          if k in ('pswpin', 'pswpout')} for text in vmstat])
+                                          if k in ('pswpin', 'pswpout')} for text in present])
         thp_before, thp_after = (Path(str(p)+'.thp').read_text() for p in (before, after))
         if not thp_before.strip() or thp_before != thp_after:
             raise ValueError('THP settings missing or changed during measurement')
@@ -338,12 +378,16 @@ def collect_measurement(folder, row):
             if setting != expected:
                 raise ValueError(f'THP allocation ceiling mismatch: {path}={setting}')
         pebs = []
+        pred = []
         for path in (before, after):
             text = Path(str(path)+'.pebs').read_text()
             pebs.append({k:int(v) for k,v in re.findall(r'^\s*(actual_order_\d+|\d+):\s*(\d+)\s*$', text, re.M)})
+            m_pred = re.search(r'^\s*predict_calls:\s*(\d+)\s*$', text, re.M)
+            pred.append(int(m_pred[1]) if m_pred else None)
         if not pebs[0] or not pebs[1]:
             raise ValueError('missing PEBS order counters')
         decisions = counter_delta(*pebs)
+        pebs_predict[phase] = pred[1] - pred[0] if None not in pred and pred[1] >= pred[0] else 0
         total_read = sum(v['read_bytes'] for v in wrs.values())
         folios_by_size = {4 << int(order): values for order, values in folios.items()}
         for size_kib in sorted(folios_by_size.keys() | wrs.keys()):
@@ -362,7 +406,7 @@ def collect_measurement(folder, row):
                 pebs_decisions=decisions.get(str(order)), pebs_actual_swapins=decisions.get('actual_order_'+str(order))))
     return dict(page_policy=PAGE_POLICY, max_page_kb=row['page_kb'], performance=performance,
                 workload=record, allocation_settings=allocation_settings, granularity=histogram,
-                policy=policy, swap=swap)
+                policy=policy, pebs_predict=pebs_predict, swap=swap)
 
 
 def append_csv(path, rows):
@@ -393,24 +437,38 @@ def main():
     ap.add_argument('--gapbs', default=str(Path.home()/'pebs-apps-20261031/gapbs-1.5'),
                     help='GAPBS checkout (src/ is compiled with gapbs_hermit_hook.h)')
     ap.add_argument('--gapbs-scale', type=int, default=24, help='Kronecker graph scale (2^scale vertices)')
+    ap.add_argument('--policy-features', nargs='+', default=None,
+                    help='policy_features ablations for policy cells: preset names (default, no-pebs, '
+                         'no-batch, medium-on), raw masks (0xa1) or comma-separated lists; omitted '
+                         'preserves the kernel mask and keeps the historical '
+                         'off/static/policy cells')
+    ap.add_argument('--adc', action='store_true', help='capture application-phase Hermit ADC deltas')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
     if min(args.periods+[args.store_period,args.repeats,args.timeout]) < 1:
         ap.error('periods, repeats and timeout must be positive')
     if not 10 <= args.gapbs_scale <= 30: ap.error('--gapbs-scale must be in [10, 30]')
+    if args.policy_features:
+        try:
+            policy_masks(args.policy_features)
+        except ValueError as exc:
+            ap.error(str(exc))
     for values in (args.periods, args.suites, args.pages):
         if len(set(values)) != len(values): ap.error('duplicate selections are not allowed')
     rows, env = plan(args), environment(args)
     if args.dry_run:
         print(json.dumps({'samples':len(rows), 'memory_policy':MEMORY_POLICY, 'page_policy':PAGE_POLICY,
-                          'environment':env, 'plan':rows}, indent=2))
+                          'environment':env, 'plan':rows, 'adc':args.adc}, indent=2))
         return
     if os.geteuid() == 0: ap.error('run as the benchmark user after sudo -v')
-    if platform.machine() != 'x86_64' or 'hermit-pebs' not in platform.release():
-        ap.error('requires x86_64 hermit-pebs kernel')
+    if platform.machine() != 'x86_64' or 'hermit' not in platform.release():
+        ap.error('requires x86_64 hermit kernel')
     if args.output.exists(): ap.error('output must be a new directory; completed results are never overwritten')
     command(['sudo','-n','true'])
-    lock = open(f'/tmp/hermit-pebs-workloads-{os.getuid()}.lock', 'w')
+    try:
+        lock = open(f'/tmp/hermit-pebs-workloads-{os.getuid()}.lock', 'w')
+    except OSError as exc:
+        ap.error(f'cannot create the matrix lock file: {exc}')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     for key in ['remote_order_mask', *SAMPLING_CONTROLS, 'pebs_enabled', 'pebs_order_stats', 'order_stats']:
         read(DEBUG/key)
@@ -430,9 +488,12 @@ def main():
     for binary in ('cc','numactl','taskset','sudo','python3'):
         if not shutil.which(binary): ap.error(f'missing {binary}')
     if {'redis','ycsb'} & set(args.suites):
-        if not os.access(args.redis,os.X_OK): ap.error(f'missing executable {args.redis}')
-        with socket.socket() as sock: sock.bind(('127.0.0.1',args.port))
-    if 'ycsb' in args.suites and not os.access(args.ycsb,os.X_OK): ap.error(f'missing executable {args.ycsb}')
+        if not executable(args.redis): ap.error(f'missing executable {args.redis}')
+        try:
+            with socket.socket() as sock: sock.bind(('127.0.0.1',args.port))
+        except OSError as exc:
+            ap.error(f'cannot bind 127.0.0.1:{args.port} for redis: {exc}')
+    if 'ycsb' in args.suites and not executable(args.ycsb): ap.error(f'missing executable {args.ycsb}')
     if any(s.startswith('gapbs-') for s in args.suites):
         for name in ('bfs.cc', 'pr.cc', 'benchmark.h'):
             if not (Path(args.gapbs)/'src'/name).is_file(): ap.error(f'missing GAPBS source: {Path(args.gapbs)/"src"/name}')
@@ -447,16 +508,25 @@ def main():
     for cg in Path('/sys/fs/cgroup').glob('hermit-*'):
         if (cg/'cgroup.procs').exists() and read(cg/'cgroup.procs'):
             ap.error(f'busy benchmark cgroup: {cg}')
-    # Restore only sampling controls and THP ceilings owned by this experiment.
+    # Restore controls owned by this experiment.
     saved = {str(DEBUG/k):read(DEBUG/k) for k in SAMPLING_CONTROLS}
     baseline = policy_settings()
-    saved.update({p:re.search(r'\[([^]]+)\]', value)[1] for p,value in baseline['thp'].items()})
+    if not mglru_core_enabled(baseline['mglru']['enabled']):
+        ap.error('Hermit requires MGLRU with the core bit enabled')
+    saved.update({p:match[1] for p, value in baseline['thp'].items()
+                  if (match := re.search(r'\[([^]]+)\]', value))})
+    baseline_mask = baseline['controls'].get('policy_features')
+    if baseline_mask is not None:
+        saved[str(DEBUG/'policy_features')] = baseline_mask
+    elif args.policy_features:
+        ap.error('--policy-features requires the kernel policy_features control')
     args.output.mkdir(parents=True)
     source = args.output/'source'
     source_hashes = snapshot_sources(source)
     save_json(args.output/'plan.json', {'samples':len(rows),'seed':args.seed,'environment':env,'plan':rows,
         'workload_parameters_from':'20260924-prepebs-full', 'memory_policy':MEMORY_POLICY,
         'page_policy':PAGE_POLICY, 'initial_policy_settings':baseline,
+        'policy_presets':None if not args.policy_features else policy_masks(args.policy_features),
         'dataset': {'path':args.higgs,'size':Path(args.higgs).stat().st_size} if 'xgboost' in args.suites else None, 'source_sha256':source_hashes})
     save_json(args.output/'restore.json',saved)
     save_json(args.output/'host.json', {
@@ -488,8 +558,13 @@ def main():
             if row['mode'] is not None:
                 for k,v in dict(pebs_mode=row['mode'],pebs_adaptive=0,pebs_load_period=row['load_period'],
                                 pebs_store_period=row['store_period']).items(): write(DEBUG/k,v)
+            mask = apply_policy_mask(DEBUG/'policy_features', row['policy_features'],
+                                     baseline_mask, write, read)
+            expected = baseline
+            if mask is not None:
+                expected = baseline | {'controls': baseline['controls'] | {'policy_features': mask}}
             before = snapshot(folder/'before.json')
-            changes = policy_changes(baseline, before)
+            changes = policy_changes(expected, before)
             if changes:
                 raise RuntimeError('; '.join(changes))
             if row['mode'] is not None:
@@ -497,16 +572,17 @@ def main():
             script, suite_env = SUITES[row['suite']]
             case_env = env | {k:str(v) for k,v in suite_env.items()} | dict(
                 PAGE_SIZES_KB=str(row['page_kb']), RESULT_DIR=str(folder.resolve()/'results'),
-                RUN_ID=name, PEBS_CGROUP=str(cg), PEBS_BENCH_MODE=row['case'])
+                RUN_ID=name, PEBS_CGROUP=str(cg), PEBS_BENCH_MODE=row['case'],
+                PEBS_MATRIX_ADC=str(int(args.adc)))
             save_json(folder/'case.json',row | {'environment':case_env, 'memory_policy':MEMORY_POLICY,
-                                               'page_policy':PAGE_POLICY})
+                                               'page_policy':PAGE_POLICY, 'adc':args.adc})
             start=time.monotonic()
-            with (folder/'run.log').open('w') as log:
+            with cell_adc(args.adc, DEBUG, read, write), (folder/'run.log').open('w') as log:
                 child=subprocess.Popen(['bash',str(source/script)],env=case_env,stdout=log,stderr=subprocess.STDOUT,preexec_fn=os.setpgrp)
                 while True:
                     try: rc=child.wait(timeout=30); break
                     except subprocess.TimeoutExpired:
-                        command(['sudo','-n','-v'])
+                        command(['sudo','-n','true'])
                         if time.monotonic()-start > args.timeout: raise TimeoutError(name)
             child=None
             after=snapshot(folder/'after.json')
@@ -519,12 +595,13 @@ def main():
                 return int(match[1])
             delta={key:count(after,key)-count(before,key) for key in ('sampled','lost','throttled')}
             issues = validate_results(folder/'results', row) if rc == 0 else ['workload failed']
-            issues += policy_changes(baseline, after)
+            issues += policy_changes(expected, after)
             measurement = None
             policy_activity = None
             if rc == 0:
                 try:
-                    measurement = collect_measurement(folder/'results', row)
+                    measurement = collect_measurement(folder/'results', row,
+                                                      folder/'adc.csv' if args.adc else None)
                     save_json(folder/'measurement.json', measurement)
                     policy_activity, policy_issues = check_policy_activity(row, measurement)
                     issues += policy_issues
@@ -539,16 +616,19 @@ def main():
             if measurement is not None:
                 identity = dict(run_id=name, suite=row['suite'], max_page_kb=row['page_kb'],
                                 repeat=row['repeat'], case=row['case'], usable=valid,
-                                baseline_role=row['baseline_role'])
+                                baseline_role=row['baseline_role'],
+                                policy_features=None if mask is None else hex(int(mask, 0)))
                 activity_columns = {'application_policy_decisions': policy_activity['application_decisions'],
                                     'policy_path_exercised': policy_activity['path_exercised']} if policy_activity else {
                                     'application_policy_decisions': None, 'policy_path_exercised': None}
-                counters = {key: sum(r[key] for r in measurement['granularity'] if r['phase'] == 'application')
-                            for key in WR_FIELDS}
+                counters: dict[str, Any] = {
+                    key: sum(r[key] for r in measurement['granularity'] if r['phase'] == 'application')
+                    for key in WR_FIELDS}
                 counters.update({'policy_' + k: (measurement['policy']['application'] or {}).get(k)
                                  for k in POLICY_FIELDS})
                 counters.update({k: measurement['swap'].get('application', {}).get(k) for k in ('pswpin', 'pswpout')})
                 counters.update({k: measurement['workload'].get(k) for k in ('read_avg_us', 'read_p95_us', 'read_p99_us')})
+                counters.update(split_obs_delta(before.get('split_obs_stats'), after.get('split_obs_stats')))
                 append_csv(args.output/'summary.csv', [identity | measurement['performance'] | delta | activity_columns | counters])
                 append_csv(args.output/'granularity.csv', [identity | r for r in measurement['granularity']])
             if not valid: raise RuntimeError(f'{name}: {"; ".join(issues)}; see status.json and run.log')

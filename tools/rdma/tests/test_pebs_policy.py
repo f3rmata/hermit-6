@@ -39,6 +39,8 @@ def test_policy():
 #define PAGE_SIZE 4096UL
 #define NSEC_PER_MSEC 1000000ULL
 #define U32_MAX UINT32_MAX
+#define U8_MAX 255
+#define div_u64(a, b) ((a) / (b))
 #define GFP_NOWAIT 0
 #define GFP_ATOMIC 0
 #define __GFP_NOWARN 0
@@ -80,6 +82,13 @@ struct perf_buffer { unsigned int nr_pages; void *data_pages[2]; };
 '''
     # Same predicate as mm/hermit_policy.c, defined after the PEBS globals.
     active = r'''
+#define HERMIT_POLICY_SPLIT (1U << 12)
+#define HERMIT_POLICY_SPLIT_OBS (1U << 14)
+static unsigned int hermit_policy_features;
+static bool hermit_policy_feature(unsigned int feature)
+{
+    return hermit_policy_features & feature;
+}
 static bool hermit_policy_active(struct mm_struct *mm)
 {
     return hermit_pebs_enabled && hermit_pebs_mode == HERMIT_PEBS_MODE_POLICY &&
@@ -292,14 +301,78 @@ static void accounting_tests(void)
     hermit_pebs_account_swapin(&mm, HERMIT_PEBS_MAX_ORDER + 1);
     assert(hermit_actual_orders[4].counter == before + 1);
     assert(!mm.hermit_pebs); /* Counting actual sizes must not create history. */
+    /* Phase B reads a 16/32/64 KiB extent as one folio instead of 4 KiB pages.
+     * The tiers stay separate, so a run can compare medium_used_orderN with the
+     * order-0 it costs on the batched path. */
+    for (unsigned int order = 2; order <= 4; order++)
+        hermit_pebs_account_swapin(&mm, order);
+    assert(hermit_actual_orders[2].counter == 1);
+    assert(hermit_actual_orders[3].counter == 1);
+    assert(hermit_actual_orders[4].counter == before + 2);
+    assert(hermit_actual_orders[0].counter == 0);
     hermit_pebs_enabled = 0;
     hermit_pebs_account_swapin(&mm, 4);
-    assert(hermit_actual_orders[4].counter == before + 1);
+    assert(hermit_actual_orders[4].counter == before + 2);
+}
+
+
+/* Phase D: per-(mm, 2 MiB region) subpage heat, fed by the sampler from load
+ * and store samples, decayed by halving, and only recorded when SPLIT is on. */
+static void heat_tests(void)
+{
+    struct mm_struct mm = { .hermit_pebs_enabled = true };
+    u8 heat[HERMIT_REGION_NR_SUBPAGES];
+
+    hermit_pebs_mode = HERMIT_PEBS_MODE_POLICY;
+    hermit_pebs_enabled = 1; hermit_pebs_all = 0;
+    hermit_pebs_region_max = HERMIT_PEBS_MAX_REGIONS;
+    clock_ns += ms; hermit_pebs_epoch = clock_ns;
+    /* No region yet: no samples means unknown, never cold. */
+    assert(!hermit_pebs_heat_read(&mm, address(7, 0), 16, heat));
+    assert(!mm.hermit_pebs);    /* resident mapping, no swap-fault history */
+    hermit_policy_features = HERMIT_POLICY_SPLIT;
+    for (unsigned int i = 0; i < 8; i++)
+        hermit_region_sample(&mm, address(7, 3 + i % 4), clock_ns, false);
+    hermit_region_sample(&mm, address(7, 9), clock_ns, true);     /* stores count */
+    assert(hermit_pebs_heat_read(&mm, address(7, 0), 16, heat));
+    assert(heat[0] == 0 && heat[3] == 2 && heat[4] == 2 && heat[5] == 2);
+    assert(heat[6] == 2 && heat[9] == 1 && heat[8] == 0);
+    /* A different subrange of the same region reads the same counters. */
+    assert(hermit_pebs_heat_read(&mm, address(7, 3), 1, heat) && heat[0] == 2);
+    /* One decay period halves every counter before the new sample lands. */
+    clock_ns += (u64)hermit_pebs_heat_ms * ms;
+    hermit_region_sample(&mm, address(7, 0), clock_ns, false);
+    assert(hermit_pebs_heat_read(&mm, address(7, 0), 16, heat));
+    assert(heat[0] == 1 && heat[3] == 1 && heat[9] == 0);
+    /* Subranges are bounded by the 2 MiB region. */
+    assert(!hermit_pebs_heat_read(&mm, address(7, 500), 16, heat));
+    assert(!hermit_pebs_heat_read(&mm, address(7, 0), 0, heat));
+    /* Sample-only regions participate in LRU replacement on every hit. */
+    hermit_pebs_region_max = 2;
+    hermit_region_sample(&mm, address(8, 256), clock_ns, false);
+    hermit_region_sample(&mm, address(7, 384), clock_ns, true);
+    hermit_region_sample(&mm, address(9, 256), clock_ns, false);
+    assert(!hermit_pebs_heat_read(&mm, address(8, 256), 128, heat));
+    assert(hermit_pebs_heat_read(&mm, address(7, 384), 128, heat) && heat[0] == 1);
+    hermit_pebs_mm_exit(&mm);
+    assert(allocations == 0);
+    /* SPLIT off: the sample path must not allocate or create a heat record. */
+    hermit_policy_features = 0;
+    struct mm_struct off = { .hermit_pebs_enabled = true };
+    hermit_region_sample(&off, address(9, 0), clock_ns, false);
+    assert(!off.hermit_pebs);
+    hermit_pebs_fault(&off, address(9, 0), pc_a, clock_ns);
+    hermit_region_sample(&off, address(9, 0), clock_ns, false);
+    assert(!hermit_pebs_heat_read(&off, address(9, 0), 16, heat));
+    hermit_pebs_mm_exit(&off);
+    assert(allocations == 0);
+    puts("PEBS subpage heat tests: PASS");
 }
 
 int main(void)
 {
     ring_tests(); window_tests(); table_tests(); predict_tests(); accounting_tests();
+    heat_tests();
     puts("PEBS production window/table/predictor tests: PASS");
 }
 '''

@@ -325,6 +325,142 @@ verify_remote_order_mask() {
         [ \$((observed_effective)) -eq 1 ]
 }
 
+# Per-order swap-in cost instrumentation: prove both debugfs nodes exist, that
+# the static-key toggle round-trips, and that the table has the documented rows.
+configure_swapin_cost() {
+    stats=/sys/kernel/debug/hermit/swapin_cost_stats
+    enable=/sys/kernel/debug/hermit/swapin_cost_enable
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$enable" ]; then
+        echo "SWAPIN_COST: status=unavailable"
+        return 0
+    fi
+    printf '%s' 0 > "\$enable" || return 1
+    [ "\$(cat "\$enable")" -eq 0 ] || return 1
+    keys=\$(grep -c '^order[0-9]*_faults \|^order[0-9]*_ns ' "\$stats")
+    prefetch=\$(grep -c '^prefetch' "\$stats")
+    printf '%s' 1 > "\$enable" || return 1
+    enabled=\$(awk '\$1 == "enabled" { print \$2 }' "\$stats")
+    echo "SWAPIN_COST: status=checked enabled=\$enabled order_rows=\$keys prefetch_rows=\$prefetch"
+    [ "\$enabled" = 1 ] && [ "\$keys" -eq 20 ] && [ "\$prefetch" -eq 3 ]
+}
+
+# Phase C fit-sized first batches and batch PTE install: both bits are off in
+# the default mask. Turn them on for the whole run, together with the policy
+# mode they belong to (pebs_enabled/pebs_all/pebs_mode), so the SG batch and its
+# PTE installs run against real swap-ins instead of the native path. The
+# confidence threshold is lowered because the smoke only has a few hundred
+# sequential runs. The DRAM backend is order-0, so the 4 KiB SG batch is the
+# path under test here.
+configure_policy_ptebatch() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    features=/sys/kernel/debug/hermit/policy_features
+    stable=/sys/kernel/debug/hermit/policy_fitstart_stable
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$features" ] || [ ! -r "\$stable" ]; then
+        echo "POLICY_PTEBATCH: status=unavailable"
+        return 0
+    fi
+    mask=\$(cat "\$features")
+    rows=\$(grep -c '^fitstart_batches \|^fitstart_pages \|^ptebatch_installed \|^ptebatch_skipped ' "\$stats")
+    # The policy only runs in =policy= mode for mms selected by pebs_all or the
+    # per-pid interface; the swap-in batch these bits extend is policy-only.
+    printf '%s' 1 > /sys/kernel/debug/hermit/pebs_enabled || return 1
+    printf '%s' 1 > /sys/kernel/debug/hermit/pebs_all || return 1
+    printf '%s' 1 > /sys/kernel/debug/hermit/pebs_mode || return 1
+    printf '%s' "\$((mask | 0xc00))" > "\$features" || return 1
+    printf '%s' 1 > "\$stable" || return 1
+    after=\$(cat "\$features")
+    count=\$(awk '\$1 == "ptebatch_installed" { print \$2 }' "\$stats")
+    skip=\$(awk '\$1 == "ptebatch_skipped" { print \$2 }' "\$stats")
+    echo "POLICY_PTEBATCH: status=checked before=\$mask after=\$after rows=\$rows stable=\$(cat "\$stable") mode=\$(cat /sys/kernel/debug/hermit/pebs_mode) enabled=\$(cat /sys/kernel/debug/hermit/pebs_enabled) installed=\$count skipped=\$skip"
+    [ "\$rows" -eq 4 ] && [ "\$((after & 0xc00))" -eq 3072 ] &&
+        [ "\$(cat /sys/kernel/debug/hermit/pebs_mode)" -eq 1 ]
+}
+
+# Appended Phase C counters after the reload: how many batches started at the
+# learned length and how many prefetched pages became PTEs instead of faults.
+dump_policy_ptebatch() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    label=\${1:-after_reload}
+
+    [ -r "\$stats" ] || return 0
+    batches=\$(awk '\$1 == "fitstart_batches" { print \$2 }' "\$stats")
+    pages=\$(awk '\$1 == "fitstart_pages" { print \$2 }' "\$stats")
+    installed=\$(awk '\$1 == "ptebatch_installed" { print \$2 }' "\$stats")
+    skipped=\$(awk '\$1 == "ptebatch_skipped" { print \$2 }' "\$stats")
+    predicted=\$(awk '\$1 == "predicted_4k" { print \$2 }' "\$stats")
+    refault=\$(awk '\$1 == "refault_4k" { print \$2 }' "\$stats")
+    capped=\$(awk '\$1 == "capped_batches" { print \$2 }' "\$stats")
+    evictions=\$(awk '\$1 == "stream_evictions" { print \$2 }' "\$stats")
+    echo "POLICY_PTEBATCH: label=\$label batches=\$batches pages=\$pages installed=\$installed skipped=\$skipped predicted=\$predicted refault=\$refault capped=\$capped stream_evictions=\$evictions"
+}
+
+# Phase B fit-driven medium orders: the ablation bit is off in the default mask,
+# both tunables exist, and policy_stats carries the appended fields. The DRAM
+# backend is order-0 only, so the bit is left off and no medium read is expected.
+configure_policy_medium() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    features=/sys/kernel/debug/hermit/policy_features
+    ceiling=/sys/kernel/debug/hermit/policy_medium_max_order
+    repeat=/sys/kernel/debug/hermit/policy_medium_stable
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$features" ] ||
+       [ ! -r "\$ceiling" ] || [ ! -r "\$repeat" ]; then
+        echo "POLICY_MEDIUM: status=unavailable"
+        return 0
+    fi
+    mask=\$(cat "\$features")
+    suggested=\$(awk '\$1 == "medium_suggested" { print \$2 }' "\$stats")
+    orders=\$(grep -c '^medium_used_order[0-9][0-9]* ' "\$stats")
+    fallbacks=\$(grep -c '^medium_fallback_' "\$stats")
+    echo "POLICY_MEDIUM: status=checked features=\$mask suggested=\$suggested order_rows=\$orders fallback_rows=\$fallbacks max_order=\$(cat "\$ceiling") stable=\$(cat "\$repeat")"
+    [ "\$orders" -eq 8 ] && [ "\$fallbacks" -eq 2 ] &&
+        [ "\$(cat "\$ceiling")" -eq 4 ] && [ "\$(cat "\$repeat")" -eq 3 ] &&
+        [ \$((mask & 0x200)) -eq 0 ]
+}
+
+# Phase D PEBS-guided split of resident large folios: the bit is off in the
+# default mask. The DRAM backend is order-0 only, so no 2 MiB folio exists and
+# no split can happen here; this checks the interface and that the bit is
+# inert. The heat histogram is fed by hermit_pebsd from load+store samples.
+configure_policy_split() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    features=/sys/kernel/debug/hermit/policy_features
+    heat=/sys/kernel/debug/hermit/pebs_heat_ms
+    rate=/sys/kernel/debug/hermit/policy_split_rate
+
+    if [ ! -r "\$stats" ] || [ ! -w "\$features" ] || [ ! -r "\$heat" ] ||
+       [ ! -r "\$rate" ]; then
+        echo "POLICY_SPLIT: status=unavailable"
+        return 0
+    fi
+    mask=\$(cat "\$features")
+    rows=\$(grep -c '^split_' "\$stats")
+    skipped=\$(grep -c '^split_skipped_reason_' "\$stats")
+    done=\$(grep -c '^split_done_order[0-9][0-9]* ' "\$stats")
+    printf '%s' "\$((mask | 0x1000))" > "\$features" || return 1
+    after=\$(cat "\$features")
+    echo "POLICY_SPLIT: status=checked before=\$mask after=\$after rows=\$rows skip_rows=\$skipped order_rows=\$done heat_ms=\$(cat "\$heat") rate=\$(cat "\$rate") mode=\$(cat /sys/kernel/debug/hermit/pebs_mode)"
+    [ "\$rows" -eq 27 ] && [ "\$skipped" -eq 13 ] && [ "\$done" -eq 10 ] &&
+        [ "\$((after & 0x1000))" -eq 4096 ] && [ "\$(cat "\$heat")" -eq 1000 ]
+}
+
+# Appended Phase D counters after the reload. No large anonymous folio exists
+# with an order-0 backend, so "candidates=0" is the expected picture.
+dump_policy_split() {
+    stats=/sys/kernel/debug/hermit/policy_stats
+    label=\${1:-after_reload}
+
+    [ -r "\$stats" ] || return 0
+    candidates=\$(awk '\$1 == "split_candidates" { print \$2 }' "\$stats")
+    attempts=\$(awk '\$1 == "split_attempts" { print \$2 }' "\$stats")
+    pages=\$(awk '\$1 == "split_pages" { print \$2 }' "\$stats")
+    failures=\$(awk '\$1 == "split_failures" { print \$2 }' "\$stats")
+    unknown=\$(awk '\$1 == "split_skipped_reason_unknown" { print \$2 }' "\$stats")
+    echo "POLICY_SPLIT: label=\$label candidates=\$candidates attempts=\$attempts pages=\$pages failures=\$failures skipped_unknown=\$unknown"
+}
+
 configure_thp() {
     [ "$THP_SIZE_KB" -gt 0 ] || return 0
 
@@ -381,6 +517,10 @@ run_step swapon_ramdisk swapon /dev/ram0
 
 run_step load_rswap_client insmod /rswap-client.ko rmsize=$RSWAP_MEM_GB $RSWAP_MODULE_ARGS
 run_step configure_hermit configure_hermit
+run_step configure_swapin_cost configure_swapin_cost
+run_step configure_policy_medium configure_policy_medium
+run_step configure_policy_ptebatch configure_policy_ptebatch
+run_step configure_policy_split configure_policy_split
 run_step verify_remote_order_mask verify_remote_order_mask
 run_step configure_thp configure_thp
 run_step reset_hermit_stats /bin/hermit_swap_stats reset boot
@@ -456,6 +596,8 @@ dump_rswap_dram_stats after_reload
 dump_hermit_order_stats after_reload
 dump_swap_vmstat after_reload
 /bin/hermit_swap_stats stats after_reload
+dump_policy_ptebatch after_reload
+dump_policy_split after_reload
 :> /tmp/dmesg.before.after_reload
 capture_dmesg /tmp/dmesg.after.after_reload
 emit_new_hermit_dmesg after_reload /tmp/dmesg.before.after_reload /tmp/dmesg.after.after_reload
@@ -471,6 +613,17 @@ fi
 PSWPIN_AFTER=\$(read_vmstat_counter pswpin)
 PSWPOUT_AFTER=\$(read_vmstat_counter pswpout)
 RAMDISK_WRITE_SECTORS_AFTER=\$(read_ramdisk_write_sectors)
+SWAPIN_COST_FAULTS=0
+SWAPIN_COST_NS=0
+if [ -r /sys/kernel/debug/hermit/swapin_cost_stats ]; then
+    SWAPIN_COST_FAULTS=\$(awk '\$1 ~ /^order[0-9]+_faults\$/ { s += \$2 } END { print s + 0 }' \
+        /sys/kernel/debug/hermit/swapin_cost_stats)
+    SWAPIN_COST_NS=\$(awk '\$1 ~ /^order[0-9]+_ns\$/ { s += \$2 } END { print s + 0 }' \
+        /sys/kernel/debug/hermit/swapin_cost_stats)
+    SWAPIN_COST_HITS=\$(awk '\$1 == "prefetch_hit_faults" { print \$2 }' \
+        /sys/kernel/debug/hermit/swapin_cost_stats)
+    echo "SWAPIN_COST: label=after_reload faults=\$SWAPIN_COST_FAULTS total_ns=\$SWAPIN_COST_NS prefetch_hits=\$SWAPIN_COST_HITS"
+fi
 echo "VALIDATION_SNAPSHOT: label=after_reload stores=\$RSWAP_STORES_AFTER loads=\$RSWAP_LOADS_AFTER errors=\$RSWAP_ERRORS_AFTER pswpin=\$PSWPIN_AFTER pswpout=\$PSWPOUT_AFTER memhog_rc=\$MEMHOG_RC"
 
 boot_end_ms=\$(now_ms)
@@ -497,6 +650,16 @@ if ! emit_validation_check memhog_rc_eq_0 "\$MEMHOG_RC" eq 0; then
 fi
 if ! emit_validation_check local_swap_write_sectors_unchanged "\$RAMDISK_WRITE_SECTORS_AFTER" eq "\$RAMDISK_WRITE_SECTORS_BOOT"; then
     VALIDATION_PASS=0
+fi
+if [ -r /sys/kernel/debug/hermit/swapin_cost_stats ]; then
+    # The cost table is enabled for this run: the reload must have recorded
+    # swap-in faults and non-zero fault time at the folio orders it installed.
+    if ! emit_validation_check swapin_cost_faults_gt_0 "\$SWAPIN_COST_FAULTS" gt 0; then
+        VALIDATION_PASS=0
+    fi
+    if ! emit_validation_check swapin_cost_ns_gt_0 "\$SWAPIN_COST_NS" gt 0; then
+        VALIDATION_PASS=0
+    fi
 fi
 if [ "$THP_SIZE_KB" -gt 0 ]; then
     if ! emit_validation_check large_stores_before_gt_0 "\${LARGE_STORES_BEFORE:-0}" gt 0; then
@@ -552,7 +715,7 @@ run_qemu() {
 
 extract_summary() {
     if [ -f "$SERIAL_LOG" ]; then
-        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
+        grep -E '^(TIMING|MEMHOG_STATE|MEMHOG_TIMING|MEMHOG_CHECKSUM|HERMIT_SWAP_STATS|HERMIT_DMESG|HERMIT_ORDER_MASK|HERMIT_ORDER_STATS|RSWAP_DRAM_STATS|THP_STATS|SWAP_VMSTAT|SWAPIN_COST|POLICY_MEDIUM|POLICY_PTEBATCH|POLICY_SPLIT|PEBS_RING|VALIDATION):' "$SERIAL_LOG" || true
     fi
 }
 

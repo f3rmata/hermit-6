@@ -10,6 +10,10 @@ CompileFlags:
   Add:
     - -Wno-unknown-warning-option
     - -Wno-unused-command-line-argument
+    # scripts/Makefile.extrawarn disables this for clang builds; without it the
+    # LSP reports upstream enum-arithmetic (e.g. mm/vmscan.c) as blocking.
+    - -Wno-enum-enum-conversion
+    - -Wno-enum-conversion
 
 Diagnostics:
   Suppress:

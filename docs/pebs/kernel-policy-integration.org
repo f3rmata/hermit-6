@@ -304,3 +304,330 @@ SQLite 检查确定性查询/更新结果和 quick_check；GAPBS 要求验证 PA
 服务器需先构建完整内核以更新 Module.symvers，再用同一内核构建 rswap；backend ABI 已变化，旧模块不可混用。
 
 未运行 QEMU、回归矩阵、服务器工作负载或性能实验。实际 swap 次数、吞吐和延迟收益以服务器配对结果为准。
+
+* 2026-11-16 消融预设、换入成本计数与粒度微基准
+
+本阶段只增加实验工具与观测，不改变任何策略行为：`policy_features` 的默认值仍是
+`0x1bf`，新的成本计数默认关闭，微基准只在服务器上运行。
+
+** policy_features 消融预设
+
+两个矩阵入口都新增 `--policy-features`，用预设名、原始掩码或两者混合（逗号或空格分隔）
+在同一次矩阵内并列多个策略消融：
+
+| 预设名 | 掩码 | 相对默认关闭的机制 |
+|--------+------+---------------------|
+| =default= | =0x1bf= | 无（SWAPIN/PEBS/SORT/OBSERVE/FLUSH/BATCH/LARGE/MGLRU 全开） |
+| =no-pebs= | =0x1bd= | bit 1 PEBS 足迹投票（批次延长） |
+| =no-batch= | =0x19f= | bit 5 冷脏页 SG 合并换出 |
+
+预设只清除默认掩码中的位，因此每个消融单元与同一块的 =off=/=static= 单元共享 baseline；
+原始掩码（例如 =0x1a1=）也接受，标签使用 =f1a1= 形式。
+
+- =run_workload_matrix.py=：每个周期、每个预设生成一个 policy 单元，
+  case 名为 =policy-<period>=（=default=）或 =policy-<period>-<preset>=。
+  单元的 =policy_features= 写入 =summary.csv=；=plan.json= 记录 =policy_presets=。
+- =pebs_perf_matrix.py=：同理生成 =policy-adaptive[-preset]=、
+  =policy-low|medium|high[-preset]=；=manifest.json= 记录 =policy_presets= 与逐单元
+  =plan[*].policy_features=，单元 =config.json= 的 =controls.policy_features= 是实测值。
+
+运行示例（先 =--dry-run= 检查单元数）：
+
+#+begin_src sh
+python3 tools/rdma/pebs/run_workload_matrix.py --dry-run \
+  --suites anon-1t-full --pages 64 2048 --periods 1999 --repeats 1 \
+  --policy-features default no-pebs no-batch
+#+end_src
+
+规则与限制：
+
+- 不传 =--policy-features= 时保持历史行为：不写 `policy_features`，只在快照中记录其值，
+  所以旧命令行和旧结果口径不变。
+- 传入后该控制项由矩阵拥有：每个 policy 单元写入对应掩码并回读校验，被外部改动仍会
+  报配置漂移；退出时恢复原值（与采样控制项同样的恢复/校验流程）。
+- =off=/=static= 单元不写掩码；=static= 的采样模式为 =pebs_mode=0=，策略开关不影响它。
+- 消融单元仍然要求 =bypass_swapcache=Y=、backend order 覆盖所选上限，配对规则
+  (同一块内 =off= 与该块的 static/policy) 不变。
+- 标签是记录用途，不是证据：判断某个机制是否真的被消融，要看 =policy_stats= 差分
+  （例如关闭 BATCH 后 =mglru_candidates= 仍增长，但 batch read WR 不再出现）。
+
+** 换入成本计数（debugfs `swapin_cost_stats`）
+
+新增两个 debugfs 文件，默认不影响生产运行：
+
+| 文件 | 权限 | 含义 |
+|------+------+------|
+| =swapin_cost_stats= | 0400 | 逐 order 的换入成本与预取命中计数 |
+| =swapin_cost_enable= | 0600 | =0=（默认）/ =1=，static key 开关 |
+
+=swapin_cost_stats= 的字段（=name value=，顺序稳定，只追加）：
+
+#+begin_example
+enabled 1
+order0_faults 1234
+order0_ns 4567890
+...
+order9_faults 0
+order9_ns 0
+prefetched_4k 512
+prefetch_hit_faults 300
+prefetch_hit_ns 987654
+#+end_example
+
+语义：
+
+- =orderN_faults= / =orderN_ns=：=do_swap_page()= 入口到 PTE 安装之间的次数与总纳秒数，
+  按被安装 folio 的 order 记账。区间包含 backend 读、swapcache 处理和等待，因此是
+  "一次缺页的总成本"，不是 RDMA 读延迟（后者仍在 =hermit_stats_report()= 的
+  =RDMA read latency=）。时间戳复用缺页入口已有的 =ktime_get_mono_fast_ns()=，
+  不新增入口时钟。
+- =prefetched_4k=：=hermit_swapin_pages()= 为**其它地址**预读的页数（不含需求页），
+  包括之后变陈旧或读失败的页。
+- =prefetch_hit_faults= / =prefetch_hit_ns=：需求缺页在 swapcache 中直接找到
+  "策略预读过"的页的次数及其缺页成本。命中一次即消耗该记录，避免同一 entry 被重复计数；
+  记录 TTL 为 1 s，per-mm 直接映射 256 槽，槽冲突只会漏计一次命中，不影响任何策略输入。
+- =enabled= 是采样时刻的开关值；syscall 471 (=reset_swap_stats=) 同时清零这些计数。
+
+开销与边界：
+
+- 关闭时（默认）每次缺页只多一次已被 patch 成 nop 的 jump label 判断，不调用
+  =ktime_get_*=；开启后每次 swap 缺页增加一次 =ktime_get_mono_fast_ns()= 与两次
+  atomic64 加法，每个预读页额外一次 per-mm 策略锁。长时间生产运行不要默认开启。
+- 统计覆盖所有 swap 缺页（Hermit 直读与原生路径都算），不受 =policy_features= 影响；
+  但 =prefetch_*= 只在策略换入路径（=SWAPIN= 位 + =hermit_policy_active()=）有值。
+- 按 folio order 记账，不是传输 order：order-0 folio 的 SG 批次仍计入 order 0。
+- MGLRU 下预取命中来自 swapcache，与 =policy_stats= 的 =refault_4k= 是不同口径。
+
+** 粒度微基准（tools/rdma/bench/swapin_granularity.c）
+
+单线程微基准：映射 =SIZE_GIB= 匿名内存并写入校验模式，由驱动用 =memory.max=
+（或 =--madv-pageout=）把它换出，然后在随机 2 MiB 对齐起点上依次触碰
+=S∈{1,4,16,32,64,128}= 页的连续段。每次 trial 报告墙钟时间、GiB/s、
+=getrusage()= 的 minor/major 缺页增量和数据校验，并读取 =swapin_cost_stats=。
+
+#+begin_src sh
+sudo tools/rdma/bench/run_swapin_granularity.sh \
+  --pages "4 64 2048" --policy-features "off default no-pebs no-batch" \
+  --segments "1 4 16 32 64 128" --trials 5 --size-gib 8
+#+end_src
+
+- 每个 (页大小上限, 模式) 单元先在 cgroup 内填充，降低 =memory.max= 后等待
+  store 计数静默，再发 =SIGUSR1= 开始 trial；=DONE= 后驱动拍快照再 =SIGUSR2= 退出。
+- 驱动逐单元切换 PEBS 会话：先 =hermit_pebs_stop=，=off= 单元不启用采样，
+  policy 单元用 =enable_pebs_pid.py= 把本进程加入策略；=policy_features= 与
+  =swapin_cost_enable= 在退出时恢复。
+- 输出 =swapin-granularity.csv=（每次 trial：=page_kb,mode,policy_features,
+  segment_pages,trial,start_page,bytes,sec,gib_per_sec,minflt,majflt,checksum_errors=）
+  与 =swapin-cost.csv=（每单元 23 个 =swapin_cost_stats= 差分列）。每单元要求
+  =pswpin= 与 backend load 都有增长、每段都产生缺页且校验零错误，否则判定该单元无效。
+- 服务器上这是"策略换入粒度代价"的对照工具：off 的曲线是 4 KiB/大 folio 基线，
+  =0x1bf= 的曲线给出 1→2→4→…→64 页 ramp 的单次缺页成本，=no-pebs=/=no-batch=
+  用来判断哪个机制在 16–128 KiB 档位改变了斜率。不要用本地 DRAM/QEMU 结果代替。
+- 本机只做了编译和 =--populate-only= / 无 swap 的协议检查，未在服务器运行。
+
+** GAPBS 带宽口径修正
+
+=run_gapbs_page_sweep.sh= 原来把整个应用阶段（trial + 每次 trial 后的
+verification）的 backend load 字节数除以 *trial 计时之和*，分母缺了 verification，
+带宽因此虚高。现在两侧都用"字节被计数的同一区间"：
+
+- =load_phase_sec=：=order-before-swapin= 快照到 =order-after-swapin= 快照的墙钟时间，
+  与 =total_load_bytes= 同一区间；=load_phase_gib_per_sec= 用它做分母。
+- =store_phase_sec=：=order-before= 快照到 store 计数最后一次变化的墙钟时间；
+  =store_phase_gib_per_sec= 同样与 =total_store_bytes= 配对（不含收尾静默期）。
+- 旧列名 =protocol_gib_per_sec= / =load_protocol_gib_per_sec= 改为
+  =store_phase_*=/=load_phase_*=；历史结果目录不改。
+- =sweep_common.sh= 新增 =elapsed_seconds=，=tests/test_sweep_common.py= 固定
+  "分母必须是快照区间"这一约定；应用吞吐仍用 =trials_per_sec= 和 =trial_sec_total=。
+
+* 2026-11-17 阶段 B：按 fit 的中等 order 换入
+
+换出时按对齐 mTHP extent（例如 2 MiB extent 内的 64 KiB）写出的数据，换入时旧路径
+只读 order-0 页，extent 被永久拆成 4 KiB。本阶段新增 bit 9 (=0x200=, =MEDIUM=)，
+默认关闭，=policy_features= 默认值仍是 =0x1bf=。
+
+- =hermit_policy_large()= 改为 =hermit_policy_swapin_order(vmf, orders, &medium)=：
+  返回调用方可分配的最大 order，=-1= 表示继续用 4 KiB SG 批次。=LARGE= 分支的判据
+  与 #20 完全相同（=run >= 2 * policy_swapin_limit()= 且剩余长度足够），只是不再
+  返回布尔值；MEDIUM 分支给出 fit 驱动的 order。
+- 流的 fit 置信度：每次 run 结束时已记录的段长 =fit= 的 =ilog2= 若与上一次相同则累加
+  =fit_stable=，否则从 1 重新开始。=fit_stable >= policy_medium_stable=（默认 3）且
+  =fit >= 4= 页时，建议 =order = min(ilog2(fit), policy_medium_max_order)=
+  （默认 4，即 64 KiB）。两个新字段放在 =struct policy_stream= 原有的 padding 里，
+  流槽大小不变。
+- 不越读：folio 由 =ALIGN_DOWN(fault, 1 << order)= 分配，所以只有
+  =(pos & ((1 << order) - 1)) == 0= 且 =pos + (1 << order) <= fit= 的 order 才被建议
+  （pos 是本次缺页在段内的页号），否则降阶；降到 order < 2 就不建议。
+- 校验：=do_swap_page()= 在分配前用 =can_swapin_thp()= 在 PTE 锁下验证建议 order 的
+  对齐区间（连续 swap PTE、swapcache/zeromap 一致、远端连续）。失败即
+  =medium_fallback_extent= 并回到 4 KiB SG 批次；=thp_swap_suitable_orders()= 只保留
+  合法的更低 order。被采纳的 order 记在 =vmf->hermit_folio_order=，=alloc_swap_folio()=
+  据此裁剪候选 order 并跳过第二次 PTE 扫描（安装前的 PTE 批次重验仍在）。
+- 不触发直接 compaction：MEDIUM 的分配用
+  =(vma_thp_gfp_mask() & ~__GFP_DIRECT_RECLAIM) | __GFP_NORETRY | __GFP_NOWARN=；
+  分配或 memcg 计费失败记 =medium_fallback_alloc= 并回退到 base page。
+- 流记账一致：一次 N 页的 folio 换入与 N 页 SG 批次一样推进 =sequential= /
+  =batch_start,end=，所以 =fit= 学习不受换入方式影响（=hermit_policy_installed()=）。
+- 新 tunable（debugfs，0600）：=policy_medium_max_order=（默认 4，clamp 2..PMD_ORDER）、
+  =policy_medium_stable=（默认 3，clamp 1..8）。
+- =policy_stats= 追加（只追加，不改已有字段顺序）：=medium_suggested=、
+  =medium_used_order2= … =medium_used_order9=、=medium_fallback_alloc=、
+  =medium_fallback_extent=。每次建议只计一次，随后恰好落在某个 order 或某个 fallback
+  上，因此 =medium_suggested ≈ Σ medium_used_orderN + 两个 fallback=。
+
+后端子区间语义已验证：=hermit_backend_range_remote()= 只逐页检查 entry 远端有效，
+=hermit_io_offset()= 以 folio 自身的 order 遍历并要求 =offset == first + i=；更大的
+extent 内一段对齐子区间的远端偏移同样连续，因此无需改动，仍保留 =-ERANGE=
+（远端不连续）语义。
+
+测试：=tools/rdma/tests/test_kernel_paths.py= 端到端重放（1 页一段的 16 页段 →
+K 段后 order 4；长度交替 → 不建议；6 页段 → 只允许 order 2，不越读；默认掩码关闭
+→ 不建议；misaligned/fragmented extent → 4 KiB SG），以及 =alloc_swap_folio()=
+的 hint 裁剪、跳过 PTE 扫描、无直接回收位和 fallback 计数。
+
+* 2026-11-18 阶段 C：fit 起始批次 + 批次 PTE 安装
+
+阶段 B 之后换入已是 16–64 KiB 的 folio，但 4 KiB SG 批次仍有两个代价：每段开头都要
+从 1 页重新爬坡（1→2→4→…），以及预取到的每页仍要各自走一次 minor fault 才能映射。
+本阶段新增两个 bit，默认都关闭，=policy_features= 默认值仍是 =0x1bf=。
+
+** bit 10 (=0x400=) =FITSTART=
+
+=hermit_policy_predict()= 在 =run == 0=（段开头：新段的第一页，或刚装完一页之后）
+且流满足 =fit >= 2=、=fit_stable >= policy_fitstart_stable= 时，直接用
+=nr = min(fit - pos, policy_swapin_limit())= 起始，而不是 1 页；=pos= 与
+=policy_medium_order()= 相同（连续运行是 =sequential + 1=，否则 0）。因此永不越过
+学到的段长。不稳定或未学到长度时仍是原来的倍增。计数：=fitstart_batches=、
+=fitstart_pages=（含 demand page，故 =fitstart_pages - fitstart_batches= 是预取页数）。
+
+** bit 11 (=0x800=) =PTEBATCH=
+
+SG 批次读完、demand page 的 PTE 装好后，=do_swap_page()= 在同一次 PTE 锁内为批次里
+仍有效的预取页装 PTE（=hermit_batch_ptes()=），于是应用不再为每页各吃一次 minor
+fault。逐页复刻 =do_swap_page()= 的 swapcache 命中路径：
+
+- 门控（=hermit_policy_pte_install()=）：只在该批次整体落在已确认的段内时安装
+  （=pos + pages <= fit=，且 =fit_stable >= policy_fitstart_stable=）。越过 fit 的
+  投机预取保持 swap entry，照常缺页，让下一次运行能得到纠正。=uffd= 与
+  =FAULT_FLAG_VMA_LOCK= 下不安装。
+- 逐页重验：当前 PTE 必须仍等于批次规划时的 =pte_move_swp_offset(swap_pte, i)=
+  （偏移连续的同一 swap 条目，标志位不变）；folio 必须仍在 swapcache、=uptodate=、
+  order 0、anon、非 KSM；=folio_trylock= 成功（PTE 锁下只 trylock，绝不睡眠）。
+  任一条不满足即停止，剩余页计 =ptebatch_skipped=，已装的计 =ptebatch_installed=。
+- 安装语义完全同 =do_swap_page()=：=arch_swap_restore()=、=swap_free()=、
+  =should_try_to_free_swap()/folio_free_swap()=、=MM_ANONPAGES +1 / MM_SWAPENTS -1=、
+  =mk_pte()= + soft-dirty/uffd-wp、独占标记（=pte_swp_exclusive()= 或
+  =folio_ref_count() == 1=，受 =SWP_STABLE_WRITES= 约束）、=mkdir= 写入位、
+  =folio_add_anon_rmap_pte()=、=set_ptes()=。与旧 =hermit_set_swapin_ptes()=（见
+  =cccf12df09^= / =bce9c57631=）的区别：这里 PTE 是 **young**（旧代码置 old，
+  之后被回收惩罚），并且不重写已存在的 PTE。
+- 记账一致：=hermit_policy_installed()= 按 =1 + 已装预取页= 调用，等价于 N 页 folio
+  安装，=sequential/batch_start,end= 与逐页 minor fault 的结果相同。
+
+** 新增接口
+
+- tunable（debugfs，0600）：=policy_fitstart_stable=（默认 3，clamp 1..8），同时作为
+  FITSTART 与 PTEBATCH 的置信度门限。
+- =policy_stats= 追加：=fitstart_batches=、=fitstart_pages=、=ptebatch_installed=、
+  =ptebatch_skipped=。
+- 消融预设：=fitstart-on= = =0x5bf=、=ptebatch-on= = =0x9bf=（=matrix_metrics.py= 与
+  =sweep_common.sh= 同步；合法掩码上限升到 =0xfff=）。
+
+注意：PTEBATCH 生效时这些页不再缺页，=swapin_cost_stats= 的 =prefetch_hit_faults=
+会因此下降，这不是预取失效；请对照 =ptebatch_installed= 读数。
+
+测试：=test_kernel_paths.py= 新增两段重放——（1）32 页段的端到端重放：前 3 段仍是
+倍增（>2 次缺页），第 4 段起每段 1 次缺页，关闭 bit 后爬坡恢复，长度交替时永不
+触发；（2）=hermit_batch_ptes()= 的生产代码重放：happy path（present/young/writable、
+swap_free、rmap、mm 计数、引用转移）、PTE 变化、VMA/PMD 边界、非 uptodate、不在
+swapcache、order>0、KSM、trylock 失败、门控/uffd/VMA-lock/batch<2 的跳过，以及
+soft-dirty/uffd-wp 标记和 SWP_STABLE_WRITES 的独占降级。
+
+* 2026-11-19 阶段 D：PEBS 引导的常驻大 folio 拆分（回收侧）
+
+Memcached 把 48% 的常驻字节保持在 512 KiB folio 里，而换入粒度是 4 KiB：这些
+folio 的冷子区间只是占着本地内存，从不被访问。阶段 D 用 PEBS 样本（不在缺页路径上）
+判断大 folio 里哪一段是热的，并在 MGLRU 回收时把 folio 拆到“热子序”的 order，让冷
+部分可以按小粒度换出。新 bit 默认关闭，=policy_features= 默认值仍是 =0x1bf=。
+
+** bit 12 (=0x1000=) =SPLIT=
+
+1) 聚合（=mm/hermit_pebs.c=）：每个 (mm, 2 MiB 区) 在原有 =hermit_region= 上增加一个
+   =u8 heat[512]=（每 4 KiB 子页一个饱和计数器）和 =heat_ns=。=hermit_pebsd= 的
+   =hermit_region_sample()= 把每个 load/store 样本计入对应子页（=hermit_heat_add()=），
+   每 =pebs_heat_ms=（默认 1000 ms）把所有计数器右移 1 位（指数衰减；长时间空闲一次
+   清零）。heat 缓冲只在 =SPLIT= 打开后按需 =kzalloc(GFP_NOWAIT)=（样本路径绝不睡眠），
+   区表仍是 =pebs_region_max= 个条目的 LRU 表，驱逐时复用 heat 缓冲，=mm= 退出时释放。
+   **没有样本 = unknown，绝不等于 cold**：=hermit_split_select()= 对样本不足的 folio
+   直接返回 =HERMIT_SPLIT_UNKNOWN=。
+
+2) 判定（=mm/hermit_split.c=，纯函数 =hermit_split_select()=，可单测）：
+   - 热集合 = 覆盖 80%（=policy_split_hot_cov=）样本的子页，即计数器直方图的尾部；
+   - 需要冷页占比 ≥ =policy_split_min_cold=（默认 25%），否则没有值得拆的余量；
+   - 冷子页的 PTE  accessed 位必须为 0（否则 =HERMIT_SPLIT_COLD_YOUNG= 否决）；
+   - 取“热页占比 ≥ 75%（=policy_split_hot_pct=）的最大对齐子 order”，且该 order 下
+     必须同时存在热块与冷块（TierBPF 式）。order 1 的匿名 folio 不能拆，跳过。
+
+3) 执行（=mm/vmscan.c= =shrink_folio_list()=，仅 =lru_gen_reclaim=，即 MGLRU 从最老
+   代挑出的 folio）：=hermit_split_try()= 做结构门控（anon、order ≥ 2、非 KSM、非
+   writeback、非 swapcache、=mapcount == nr_pages= 即单 mm 全映射、非 DMA-pinned、
+   =can_split_folio()=），再看预算与压力，然后用一次 =rmap_walk()= 找到唯一的 vma：
+   超过一个映射、=mm_has_notifiers()=、或取不到 heat 都记 skip；PTE 用
+   =page_vma_mapped_walk()= 读 young 位（PMD 映射时整 folio 共用一位）。最后在 folio
+   锁下 =split_folio_to_list_to_order()=，尾部分片进入同一次 =shrink_folio_list()=，
+   =sc->nr_scanned= 与 =nr_pages= 按新 order 修正。
+
+4) 预算与压力：=policy_split_rate=（默认 32 folios/s，1 s 窗口）限制拆分速率；
+   只有 memcg 用量 ≥ 75% 的 memory.max，或该 memcg 的 refault 分数
+   （=hermit_refault=）< =policy_split_refault_max=（默认 256）时才拆。
+
+** 新增接口
+
+- tunable（debugfs，0600）：=policy_split_rate=、=policy_split_hot_cov=、
+  =policy_split_hot_pct=、=policy_split_min_cold=、=policy_split_min_samples=（默认 16）、
+  =policy_split_refault_max=、=pebs_heat_ms=。
+- =policy_stats= 追加：=split_candidates=、=split_attempts=、=split_pages=、
+  =split_failures=、=split_done_order0..9=，以及 13 个
+  =split_skipped_reason_*=（=shared/ksm/writeback/swapcache/pinned/notifier/unknown/
+  all_hot/cold_young/no_order/budget/pressure/memory=）。
+- 消融预设：=split-on= = =0x11bf=（=matrix_metrics.py= 与 =sweep_common.sh= 同步；
+  合法掩码上限升到 =0x1fff=）。
+
+测试：=test_kernel_paths.py= 新增三段——（1）=hermit_split_select()= 的合成直方图用例
+（对齐/非对齐热点、80% 覆盖尾部、样本不足、全热、min_cold、young 否决、order 1 不可
+拆）；（2）=hermit_heat_add()/hermit_heat_decay()=（饱和、半衰、长空闲清零、时间倒退、
+越界索引、零周期）并打印每样本开销（≈10 ns，25k 样本/秒即 ≈0.03% 单核）；（3）预算
+窗口与 memcg 压力/refault 门限的边界。
+
+* 2026-11-20 MEDIUM 最小换入阶数
+
+=policy_medium_min_order= 默认 4，使用时限制到 2 至有效的 =policy_medium_max_order=。
+若稳定段的剩余长度、位置和 VMA 允许的最大候选仅有 order 2/3，默认沿用 4 KiB SG，
+仍可触发 FITSTART 和 PTEBATCH。追加的 =medium_below_min= 每次记录一个被下限挡住的
+候选。没有候选、置信度不足或 extent 验证失败分别沿用原有路径。验证和分配降阶也遵守
+下限；分配/计费失败仍可回退到单页。设为 2 可对照原来的 16/32 KiB 建议。
+
+** BATCH 本地槽位诊断
+
+=SLOTRUN=（bit 13，=0x2000=，默认关闭）在整批按虚拟地址排序后、写出前检查布局。
+=slotrun_groups= 只计含 4、8 或 16 页且整批 VA 自然对齐并连续的 SG 写出批次。
+其中本地首槽按相同页数对齐且后续槽号逐一递增的批次计入 =slotrun_contiguous=，
+其余计入 =slotrun_fallback=。三项均在 I/O 前计数，远端提交成功率另看 backend 统计。
+此处 swap PTE 已发布，诊断只读原槽位。非整批的子区间不计入分母。
+
+** SPLIT 样本门限
+
+=policy_split_min_samples= 的默认值从 16 降到 4。dnet-61 每格观察到 204–252 个候选，
+都有 heat，但全被原门限挡住。新值允许用 4–15 个样本的候选继续检验冷区间的 young
+位和热区分布，原有的速率限制、内存压力和结构检查仍然生效。可写回 16 做同配置对照。
+
+** ADC 新增行
+
+=adc_stats= 在原 31 行之后依次追加：
+
+- =medium_swapin=：直接读回并安装多页 MEDIUM folio 的整次 =do_swap_page= 时间。
+  同一样本也进入 =do_swap_page= 和 =swap_major=。
+- =ptebatch_install=：通过置信度门控后，整次相邻 PTE 安装循环的耗时。
+- =ptebatch_skip=：上述循环中因 PTE 或 folio 重验失败而提前结束的子集，含此前
+  成功安装前缀的时间。次数按尝试计，跳过的页数读 =policy_stats/ptebatch_skipped=。
+- =slotrun=：开启 SLOTRUN 后扫描一个已排序 BATCH 的时间，含判定为不合格的批次。

@@ -17,6 +17,30 @@ def shell(script, *args, check=True):
 
 
 class SweepTests(unittest.TestCase):
+    def test_adc_snapshots_bracket_the_application(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shell('''
+                set -e
+                WR_STATS_FILE=wr
+                thp_files=()
+                sudo_test() { return 1; }
+                sudo_cat() { echo "${1##*/}" >> "$trace"; echo fixture; }
+                snapshot_benchmark_pebs() { :; }
+                trace=$1/trace
+                PEBS_MATRIX_ADC=1
+                snapshot_sweep_stats "$1/order-before-swapin.txt"
+                snapshot_sweep_stats "$1/order-after-swapin.txt"
+                PEBS_MATRIX_ADC=0
+                snapshot_sweep_stats "$1/order-before.txt"
+            ''', root)
+            self.assertEqual((root/'trace').read_text().splitlines(),
+                             ['order_stats', 'wr', 'adc_stats', 'adc_stats', 'order_stats', 'wr',
+                              'order_stats', 'wr'])
+            for tag in ('before', 'after'):
+                self.assertEqual((root/f'order-{tag}-swapin.txt.adc').read_text(), 'fixture\n')
+            self.assertFalse((root/'order-before.txt.adc').exists())
+
     def test_absolute_memory_budget(self):
         self.assertEqual(shell('MEMORY_LIMIT_MB=512; benchmark_memory_limit_mb 2000 70').stdout.strip(),'512')
         self.assertEqual(shell('unset MEMORY_LIMIT_MB; benchmark_memory_limit_mb 2000 70').stdout.strip(),'1400')
@@ -205,9 +229,11 @@ port = sys.argv[sys.argv.index('--port') + 1]
                     p = subprocess.Popen([str(binary), '4', advice, '2048', 'chunk64k',
                                           'sequential', 'high', '1', '1'], stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True)
+                    assert p.stdout is not None and p.stderr is not None
+                    stdout, stderr = p.stdout, p.stderr
                     def response(prefix):
-                        self.assertTrue(select.select([p.stdout], [], [], 10)[0], 'worker timed out')
-                        line = p.stdout.readline()
+                        self.assertTrue(select.select([stdout], [], [], 10)[0], 'worker timed out')
+                        line = stdout.readline()
                         self.assertTrue(line.startswith(prefix), line)
                         return dict(word.split('=', 1) for word in line.split()[1:])
                     try:
@@ -226,6 +252,222 @@ port = sys.argv[sys.argv.index('--port') + 1]
                         if p.poll() is None:
                             p.kill(); p.wait()
                         p.stdout.close(); p.stderr.close()
+
+    def test_bandwidth_uses_the_interval_its_bytes_were_sampled_in(self):
+        # Protocol counters are snapshotted around a phase, so the pairing
+        # interval is wall time between the snapshots. GAPBS verification
+        # runs inside that window but outside the trial timer.
+        self.assertEqual(shell('elapsed_seconds 1000000000 3500000000').stdout.strip(),
+                         '2.500000')
+        self.assertEqual(shell('elapsed_seconds 500 500').stdout.strip(), '0.000000')
+        for values in ('4000 3000', '4000 x'):
+            with self.subTest(values=values):
+                self.assertNotEqual(shell('elapsed_seconds '+values, check=False).returncode, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = (Path(directory)/name for name in ('before', 'after'))
+            # 2 MiB loaded, counted over a 4 s phase including verification.
+            before.write_text(HEADER+'0 4096 0 0 0 0\n')
+            after.write_text(HEADER+'0 4096 0 512 0 0\n')
+            seconds = shell('elapsed_seconds 2000000000 6000000000').stdout.strip()
+            result = shell('summarize_loads "$1" "$2" "$3"; printf "%s|%s\n" \
+                "$total_load_bytes" "$load_protocol_gib_per_sec"', before, after, seconds)
+            # 512 pages * 4096 B / 4 s = 0.000488 GiB/s, not /trial-time.
+            self.assertEqual(result.stdout.strip(), '2097152|0.000488')
+
+    def test_gapbs_reports_phase_bandwidth_not_trial_bandwidth(self):
+        source = (COMMON.parent/'run_gapbs_page_sweep.sh').read_text()
+        self.assertIn('load_start_ns=$(date +%s%N)', source)
+        self.assertIn('load_end_ns=$(date +%s%N)', source)
+        self.assertIn('load_phase_sec=$(elapsed_seconds "$load_start_ns" "$load_end_ns")', source)
+        self.assertIn('summarize_loads "$load_before" "$load_after" "$load_phase_sec"', source)
+        self.assertIn('store_phase_sec=$(elapsed_seconds "$store_start_ns" "$last_change_ns")', source)
+        self.assertNotIn('summarize_loads "$load_before" "$load_after" "$trial_sec"', source)
+        header = next(line for line in source.splitlines() if line.startswith("printf 'page_kb,"))
+        self.assertIn('store_phase_sec,store_phase_gib_per_sec', header)
+        self.assertIn('load_phase_sec,load_phase_gib_per_sec', header)
+        self.assertNotIn('load_protocol_gib_per_sec', header)
+
+
+    def test_cost_table_helpers_diff_stable_columns(self):
+        keys = ' '.join(shell('cost_keys').stdout.split())
+        self.assertEqual(keys.split(),
+                         ['order0_faults', 'order0_ns', 'order1_faults', 'order1_ns',
+                          'order2_faults', 'order2_ns', 'order3_faults', 'order3_ns',
+                          'order4_faults', 'order4_ns', 'order5_faults', 'order5_ns',
+                          'order6_faults', 'order6_ns', 'order7_faults', 'order7_ns',
+                          'order8_faults', 'order8_ns', 'order9_faults', 'order9_ns',
+                          'prefetched_4k', 'prefetch_hit_faults', 'prefetch_hit_ns'])
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = (Path(directory)/name for name in ('before', 'after'))
+            before.write_text('enabled 1\norder0_faults 10\norder0_ns 1000\nprefetch_hit_faults 2\n')
+            after.write_text('enabled 1\norder0_faults 14\norder0_ns 5000\nprefetch_hit_faults 5\n')
+            self.assertEqual(shell('cost_delta "$1" "$2" order0_faults; echo; \
+                cost_delta "$1" "$2" order0_ns; echo; \
+                cost_delta "$1" "$2" prefetch_hit_faults; echo; \
+                cost_delta "$1" "$2" order9_ns', before, after).stdout.split(),
+                ['4', '4000', '3', '0'])
+            # A reset counter must not be reported as a negative delta.
+            before.write_text('order0_faults 20\n')
+            after.write_text('order0_faults 3\n')
+            self.assertNotEqual(shell('cost_delta "$1" "$2" order0_faults', before, after,
+                                      check=False).returncode, 0)
+
+    def test_policy_mask_names_match_the_python_presets(self):
+        expected = {'default': '0xa3', 'no-pebs': '0xa1', 'no-batch': '0x83',
+                    'medium-on': '0x2a3', 'fitstart-on': '0x4a3',
+                    'ptebatch-on': '0x8a3', 'split-on': '0x10a3',
+                    'split-obs': '0x40a3',
+                    'fitpte': '0xca3', 'fitpte-medium': '0xea3'}
+        for name, mask in expected.items():
+            with self.subTest(preset=name):
+                self.assertEqual(shell('policy_mask_of '+name).stdout.strip(), mask)
+                self.assertEqual(shell('valid_policy_mask '+mask).returncode, 0)
+        self.assertEqual(shell('policy_mask_of 0x1ae').stdout.strip(), '0x1ae')
+        # Surviving features retain their bit positions.
+        self.assertEqual(shell('valid_policy_mask 0x200').returncode, 0)
+        self.assertEqual(shell('valid_policy_mask 0xee3').returncode, 0)
+        self.assertEqual(shell('valid_policy_mask 0x10a3').returncode, 0)
+        self.assertEqual(shell('valid_policy_mask 0x2ea3').returncode, 0)
+        self.assertEqual(shell('valid_policy_mask 0x4ea3').returncode, 0)
+        for bad in ('0x8000', '32768', '0x4', '0x8', '0x10', '0x100', '0x1bf', '09',
+                    '18446744073709551616', '0x10000000000000000', 'zz', ''):
+            with self.subTest(mask=bad):
+                self.assertNotEqual(shell('valid_policy_mask "$1"', bad, check=False).returncode, 0)
+
+
+    def test_granularity_cell_restores_and_checks_mask(self):
+        source = (COMMON.parent/'bench'/'run_swapin_granularity.sh').read_text()
+        start = source.index('apply_policy_mask() {')
+        definition = source[start:source.index('\n}\n', start)+3]
+        script = definition + '''
+            policy_features_saved=0x000000a1
+            sudo_write() { actual=$1; echo "$1"; }
+            sudo_cat() { echo "${readback:-$actual}"; }
+            apply_policy_mask 0x10a3
+            apply_policy_mask ""
+        '''
+        self.assertEqual(shell(script).stdout.splitlines(), ['0x10a3', '0x000000a1'])
+        self.assertNotEqual(shell(script + 'readback=0x10a3; apply_policy_mask ""',
+                                  check=False).returncode, 0)
+
+    def test_granularity_swap_capacity_at_default_ratio(self):
+        source = (COMMON.parent/'bench'/'run_swapin_granularity.sh').read_text()
+        ratio = next(line for line in source.splitlines() if line.startswith('LOCAL_RATIO_PCT='))
+        start = source.index('      limit_mb=$(benchmark_memory_limit_mb')
+        guard = source[start:source.index('      wait_for_stores_quiet', start)]
+        script = 'unset LOCAL_RATIO_PCT MEMORY_LIMIT_MB\n' + ratio + '''
+            resident_mb=8192
+            awk() { command awk "$1" <<< "header
+swap partition $((free_mb * 1024)) 0 -2"; }
+            free_mb=$1
+        ''' + guard
+        self.assertEqual(shell(script + 'echo "$LOCAL_RATIO_PCT $limit_mb"', 7373).stdout.strip(),
+                         '10 819')
+        result = shell(script, 7372, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('7373 MiB is required', result.stderr)
+
+    def test_granularity_runner_reports_policy_counter_deltas(self):
+        runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
+        source = runner.read_text()
+        start = source.index('POLICY_KEYS=')
+        keys = source[start:source.index('\n', start)+1]
+        start = source.index('policy_columns() {')
+        func = source[start:source.index('\n}\n', start)+3]
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = Path(directory)/'b', Path(directory)/'a'
+            before.write_text('predicted_4k 10\nmedium_suggested 0\nptebatch_installed 5\n')
+            after.write_text('predicted_4k 25\nmedium_suggested 3\nptebatch_installed 9\n'
+                             'fitstart_batches 2\nptebatch_gate_rejects 9\nmedium_fallback_remote 2\n')
+            out = shell(keys + func + 'policy_columns "$1" "$2"', str(before), str(after)).stdout
+        values = dict(zip(keys.split('"')[1].split(), out.lstrip(',').split(',')))
+        self.assertEqual(values['predicted_4k'], '15')
+        self.assertEqual(values['medium_suggested'], '3')
+        self.assertEqual(values['ptebatch_installed'], '4')
+        self.assertEqual(values['fitstart_batches'], '2')   # absent before = 0
+        self.assertEqual(values['medium_fallback_extent'], '0')
+        self.assertEqual(values['ptebatch_gate_rejects'], '9')
+        self.assertEqual(values['medium_fallback_remote'], '2')
+
+    def test_granularity_runner_parses_the_trial_protocol(self):
+        runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
+        source = runner.read_text()
+
+        def definition(name):
+            start = source.index(name+'() {')
+            return source[start:source.index('\n}\n', start)+3]
+
+        log = ('POPULATE pages=4 size_bytes=16384 sec=0.1\n'
+               'READY pid=9 pages=4 size_bytes=16384\nRUN\n'
+               'TRIAL seg=1 trial=1 start_page=512 bytes=4096 sec=0.001 gib_per_sec=3.8 '
+               'minflt=2 majflt=1 checksum_errors=0\n'
+               'TRIAL seg=1 trial=2 start_page=768 bytes=4096 sec=0.003 gib_per_sec=1.3 '
+               'minflt=1 majflt=0 checksum_errors=0\n'
+               'TRIAL seg=4 trial=1 start_page=1024 bytes=16384 sec=0.004 gib_per_sec=3.8 '
+               'minflt=0 majflt=4 checksum_errors=0\n'
+               'DONE sec=0.008 trials=3 pages=6 checksum_errors=0\n')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'bench.log'
+            path.write_text(log)
+            result = shell(definition('emit_trials') + definition('trial_summary') + '''
+                emit_trials "$1" 64 policy 0xa3
+                trial_summary 1 "$1"
+                trial_summary 4 "$1"
+                trial_summary 16 "$1"
+            ''', path)
+            lines = result.stdout.splitlines()
+        self.assertIn('minflt,majflt,checksum_errors,swapped\\n', source)
+        self.assertEqual(lines[0], '64,policy,0xa3,1,1,512,4096,0.001,3.8,2,1,0,1')
+        self.assertEqual(lines[1], '64,policy,0xa3,1,2,768,4096,0.003,1.3,1,0,0,0')
+        self.assertEqual(lines[2], '64,policy,0xa3,4,1,1024,16384,0.004,3.8,0,4,0,1')
+        # trial_summary prints faults,checksum_errors,seconds,bytes per segment.
+        self.assertEqual(lines[3], '4,0,0.004000,8192')
+        self.assertEqual(lines[4], '4,0,0.004000,16384')
+        self.assertEqual(lines[5], '0,0,0.000000,0')
+
+    def test_swapin_granularity_interleave_and_unaligned_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory)/'swapin-granularity'
+            subprocess.run(['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror',
+                            '-Wno-unused-parameter', '-o', str(binary),
+                            str(COMMON.parent/'bench'/'swapin_granularity.c')], check=True)
+            out = subprocess.check_output([
+                str(binary), '--size-mib', '32', '--segments', '1,4,16',
+                '--trials', '3', '--seed', '7', '--interleave', '--max-offset', '15',
+                '--no-wait', '--no-cost'], text=True)
+            trials = [dict(tok.split('=', 1) for tok in line.split()[1:])
+                      for line in out.splitlines() if line.startswith('TRIAL ')]
+            self.assertEqual(len(trials), 9)
+            segs = [int(t['seg']) for t in trials]
+            # Shuffled order should differ from grouped [1,1,1,4,4,4,16,16,16].
+            self.assertNotEqual(segs, [1, 1, 1, 4, 4, 4, 16, 16, 16])
+            self.assertEqual(sorted(segs), [1, 1, 1, 4, 4, 4, 16, 16, 16])
+            offsets = [int(t['start_page']) % 512 for t in trials]
+            self.assertTrue(any(o > 0 for o in offsets))
+            self.assertTrue(all(0 <= o <= 15 for o in offsets))
+            self.assertTrue(all(int(t['checksum_errors']) == 0 for t in trials))
+
+    def test_wr_totals_delta_and_round4_dry_run(self):
+        runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
+        source = runner.read_text()
+        start = source.index('wr_totals_delta() {')
+        func = source[start:source.index('\n}\n', start)+3]
+        with tempfile.TemporaryDirectory() as directory:
+            b, a = Path(directory)/'b', Path(directory)/'a'
+            b.write_text('order write_wrs read_wrs write_bytes read_bytes\n'
+                         '0 1 2 4096 8192\n'
+                         'pages batch_write_wrs batch_read_wrs batch_write_bytes batch_read_bytes\n'
+                         '4 0 1 0 16384\n')
+            a.write_text('order write_wrs read_wrs write_bytes read_bytes\n'
+                         '0 3 5 12288 20480\n'
+                         'pages batch_write_wrs batch_read_wrs batch_write_bytes batch_read_bytes\n'
+                         '4 2 4 32768 65536\n')
+            delta = shell(func + 'wr_totals_delta "$1" "$2"', b, a).stdout.strip()
+            self.assertEqual(delta, ',6,61440,4,40960')
+        dry = subprocess.check_output(['bash', str(COMMON.parent/'run_round4_suite.sh'),
+                                       '--dry-run', '--out', '/tmp/hermit-r4-dry'], text=True)
+        self.assertIn('=== DONE exp1 ===', dry)
+        self.assertIn('=== DONE exp4e ===', dry)
 
 
 if __name__ == '__main__':

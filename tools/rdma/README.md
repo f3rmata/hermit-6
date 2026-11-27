@@ -8,6 +8,7 @@
 | `common.sh`、`create_cgroup.sh` | 共享配置、结果根目录与 cgroup 支持 |
 | `anon_seq_workset.c`、`redis_bench.py`、`xgboost_train.py` | 负载程序，供基准脚本调用 |
 | [pebs/](pebs/) | PEBS 开关、频率矩阵与正式结果汇总 |
+| [bench/](bench/) | 换入粒度微基准（S 页段、逐 order 缺页成本）与驱动脚本 |
 | [baseline/](baseline/) | native local/cgroup-linux sweep、PEBS 前基线、续跑与恢复检查 |
 | [tests/](tests/) | 无需 RDMA 服务器的源码回归测试 |
 | [results/](results/README.md) | 历次测量、构建日志、图表和归档 |
@@ -20,6 +21,26 @@
 - Memcached 采样开销：`pebs/run_memcached_sampling_cost.py`，固定并发，比较同页大小的采样开关。
 - 多负载矩阵：`pebs/run_workload_matrix.py`，默认 1323 个样本（去掉 XGBoost 为 1134），PEBS 按工作负载 pid 启用。`--pages` 表示每轮**最大分配页大小**，保留全部较小 THP 档位。
 - 页面选择微基准：`pebs/run_page_selection_microbench.py`。
+- 换入粒度微基准：`bench/run_swapin_granularity.sh`，逐 trial 报告 S 页段的墙钟、缺页和校验，逐单元差分 `swapin_cost_stats`；`--policy-features` 接受 `off` 及消融预设。
+
+两个矩阵入口都支持 `--policy-features`：给 policy 单元指定 `policy_features` 消融预设
+`default`（`0xa3`）、`no-pebs`（`0xa1`）、`no-batch`（`0x83`）、
+`medium-on`（`0x2a3`）、`fitstart-on`（`0x4a3`）、`ptebatch-on`（`0x8a3`）、
+`fitpte`（默认 + FITSTART + PTEBATCH，`0xca3`）、`fitpte-medium`（再加 MEDIUM，
+`0xea3`）或原始掩码（有效位掩码 `0x7ee3`）。Hermit 内核始终启用 MGLRU。
+预设在同一矩阵内各自成为一个带标签的 case，与同一块的 `off`/`static` 共享 baseline；
+不传该参数时保持原行为（不改写 `policy_features`）。详见
+[策略内核集成](../../docs/pebs/kernel-policy-integration.org)。
+
+两个矩阵都可加 `--adc`。每格的 `adc.csv` 按阶段列出实测窗口的次数、总纳秒、
+平均纳秒（次数为零时留空）。多负载矩阵取应用阶段的 `order-{before,after}-swapin.txt.adc`
+差值；Memcached 在预热之后取 `adc-before.txt` / `adc-after.txt`，只包围实测客户端。
+各格在 `case.json` / `config.json` 记录 `adc`，退出该格时恢复原始 `adc_enable`。
+
+```sh
+python3 tools/rdma/pebs/run_workload_matrix.py --dry-run --suites anon-1t-full \
+  --pages 64 2048 --periods 1999 --repeats 1 --policy-features default no-pebs no-batch
+```
 
 Memcached 使用 `pebs/pebs_perf_matrix.py`；加 `--pages` 后按相同的最大分配页口径扫描。
 默认每档为 `off` 加三个周期的 static/policy，`off` 仅关闭 PEBS，所有 case 保持同一后端掩码。

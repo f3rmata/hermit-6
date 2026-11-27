@@ -184,11 +184,14 @@ def test_folio_selection():
     """Production allocation loop: legal candidates, failed allocation/charge."""
     root = Path(__file__).resolve().parents[3]
     source = (root / 'linux-stable/mm/memory.c').read_text()
-    start = source.index('static inline unsigned long thp_swap_suitable_orders(')
+    header = (root / 'linux-stable/include/linux/hermit_policy.h').read_text()
+    extent_enum = header[header.index('enum swapin_extent {'):header.index('struct hermit_reclaim_hint {')]
+    start = source.index('static enum swapin_extent swapin_thp_check(')
     end = source.index('#else /* !CONFIG_TRANSPARENT_HUGEPAGE */', start)
     functions = source[start:end]
-    start = source.index('static bool hermit_swapin_large_allowed(')
-    end = source.index('\n}\n', start) + 3
+    start = source.index('static unsigned long hermit_swapin_orders(')
+    end = source.index('\n#endif\n\n#ifdef CONFIG_HERMIT\nstatic int hermit_direct_swapin(',
+                        start)
     functions += '#define CONFIG_TRANSPARENT_HUGEPAGE 1\n' + source[start:end] + '\n'
     page_io = (root / 'linux-stable/mm/page_io.c').read_text()
     start = page_io.index('int hermit_swapout_order(')
@@ -211,6 +214,9 @@ def test_folio_selection():
 #define TVA_PAGEFAULT 0
 #define MTHP_STAT_SWPIN_FALLBACK_CHARGE 0
 #define MTHP_STAT_SWPIN_FALLBACK 1
+#define __GFP_DIRECT_RECLAIM 0x400000u
+#define __GFP_NORETRY 0x4000u
+#define __GFP_NOWARN 0x200u
 typedef unsigned long pgoff_t;
 typedef unsigned long swp_entry_t;
 typedef unsigned int gfp_t;
@@ -223,11 +229,22 @@ struct vm_fault {
     unsigned long address, hermit_fault_pc;
     pte_t orig_pte;
     void *pmd;
+    int hermit_folio_order;
 };
 struct folio { unsigned int order; };
 static unsigned long wr_mask, enabled_orders, alloc_fail, charge_fail;
 static unsigned int extent, valid_order, allocs, frees;
 static bool uffd, zswap, map_fail;
+static unsigned int pte_maps, gfp_orders;
+static gfp_t last_gfp;
+static unsigned int medium_used[10], medium_alloc_fallbacks, min_order = 2;
+static unsigned int hermit_policy_medium_min_order(void) { return min_order; }
+static unsigned int medium_extent_fallbacks, policy_calls;
+static enum swapin_extent last_reason;
+static unsigned int zeromap_limit = 512, cache_limit = 512;
+static bool remote_hole, remote_gap;
+static int policy_order = -1;
+static bool policy_medium;
 static pte_t ptes[512];
 static struct folio result;
 static unsigned int folio_order(struct folio *f) { return f->order; }
@@ -235,6 +252,20 @@ static int fls_long(unsigned long x) { return x ? 64 - __builtin_clzl(x) : 0; }
 static int highest_order(unsigned long x) { return fls_long(x) - 1; }
 static int next_order(unsigned long *x, int order)
 { *x &= ~BIT(order); return highest_order(*x); }
+/* Stand-in for hermit_policy_swapin_order(): @policy_order/@policy_medium are
+ * set by each test and the mask is recorded so the caller can be checked. */
+static unsigned long policy_orders;
+static int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
+                                      bool *medium)
+{
+    (void)vmf; policy_calls++; policy_orders = orders;
+    *medium = policy_medium;
+    return policy_order;
+}
+static void hermit_policy_medium_used(unsigned int order)
+{ if (order) medium_used[order]++; else medium_alloc_fallbacks++; }
+static void hermit_policy_medium_extent(enum swapin_extent reason)
+{ medium_extent_fallbacks++; last_reason = reason; }
 static bool userfaultfd_armed(struct vm_area_struct *vma) { (void)vma; return uffd; }
 static bool zswap_never_enabled(void) { return !zswap; }
 static swp_entry_t pte_to_swp_entry(pte_t pte) { return pte; }
@@ -252,21 +283,40 @@ static pte_t *pte_offset_map_lock(struct mm_struct *mm, void *pmd,
 {
     static spinlock_t lock;
     (void)mm; (void)pmd; (void)addr; *ptl = &lock;
+    pte_maps++;
     return map_fail ? NULL : ptes;
 }
 static unsigned int pte_index(unsigned long addr) { return (addr >> 12) & 511; }
-static bool can_swapin_thp(struct vm_fault *vmf, pte_t *pte, unsigned int nr)
+static pte_t ptep_get(pte_t *p) { return *p; }
+static pte_t pte_move_swp_offset(pte_t p, int delta) { return p + delta; }
+static bool pte_same(pte_t a, pte_t b) { return a == b; }
+static int swap_zeromap_batch(swp_entry_t entry, int nr, void *arg)
+{ (void)entry; (void)arg; return min_t(int, nr, zeromap_limit); }
+static int non_swapcache_batch(swp_entry_t entry, int nr)
+{ (void)entry; return min_t(int, nr, cache_limit); }
+#define swp_entry(type, offset) (offset)
+#define ilog2(n) highest_order(n)
+static bool hermit_backend_entry_remote(swp_entry_t entry) { (void)entry; return true; }
+static bool hermit_backend_range_remote(swp_entry_t entry, int order)
+{ (void)entry; (void)order; return !remote_hole; }
+static int hermit_backend_offset(swp_entry_t entry, unsigned long *offset)
+{ *offset = entry + (remote_gap && (entry & 1)); return 0; }
+static int swap_pte_batch(pte_t *pte, int nr, pte_t first)
 {
     assert(pte >= ptes && pte + nr <= ptes + 512);
     assert(!((pte - ptes) % nr));
-    (void)vmf; return nr <= (1U << valid_order);
+    for (int i = 0; i < nr; i++)
+        if (first + i != pte[i] || i == (1 << valid_order)) return i;
+    return nr;
 }
 static void pte_unmap_unlock(pte_t *pte, spinlock_t *ptl) { (void)pte; (void)ptl; }
-static gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma) { (void)vma; return 0; }
+static gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
+{ (void)vma; return __GFP_DIRECT_RECLAIM | __GFP_NOWARN; }
 static struct folio *vma_alloc_folio(gfp_t gfp, unsigned int order,
     struct vm_area_struct *vma, unsigned long addr)
 {
-    (void)gfp; (void)vma; assert(!(addr % (PAGE_SIZE << order)));
+    (void)vma; assert(!(addr % (PAGE_SIZE << order)));
+    last_gfp = gfp; gfp_orders++;
     allocs++; result.order = order; return alloc_fail & BIT(order) ? NULL : &result;
 }
 static int mem_cgroup_swapin_charge_folio(struct folio *f, struct mm_struct *mm,
@@ -287,8 +337,130 @@ static void check(unsigned int expected)
     struct folio *f = alloc_swap_folio(&vmf);
     assert(f && f->order == expected);
 }
+
+/* Phase B: a validated MEDIUM order reaches alloc_swap_folio() in
+ * vmf->hermit_folio_order. It restricts the candidates, skips the PTE scan that
+ * do_swap_page() already did, and must not ask for synchronous compaction. */
+static void medium_alloc_tests(void)
+{
+    struct mm_struct mm;
+    struct vm_area_struct vma = { .vm_mm = &mm };
+    struct vm_fault vmf = { .vma = &vma, .address = 0x2000000 + 5 * PAGE_SIZE,
+        .orig_pte = 1024 + 5, .hermit_fault_pc = 0x1000 };
+    struct folio *f;
+
+    wr_mask = 0x3fd; enabled_orders = 0x3fc; extent = valid_order = 9;
+    alloc_fail = charge_fail = 0; uffd = zswap = map_fail = false;
+    /* The hint caps the order even though order 9 is legal, and the range is
+     * not scanned again. */
+    pte_maps = 0; medium_used[2] = 0;
+    vmf.hermit_folio_order = 2;
+    f = alloc_swap_folio(&vmf);
+    assert(f && f->order == 2 && pte_maps == 0 && medium_used[2] == 1);
+    assert((last_gfp & __GFP_NORETRY) && !(last_gfp & __GFP_DIRECT_RECLAIM));
+    /* Without a hint the production scan runs and no medium counter moves. */
+    vmf.hermit_folio_order = 0; pte_maps = 0; medium_used[2] = 0;
+    f = alloc_swap_folio(&vmf);
+    assert(f && f->order == 9 && pte_maps == 1 && !medium_used[2]);
+    assert(!(last_gfp & __GFP_NORETRY) && (last_gfp & __GFP_DIRECT_RECLAIM));
+    /* A failed charge at the hinted order walks down to the next one. */
+    vmf.hermit_folio_order = 4; medium_used[3] = 0;
+    charge_fail = BIT(4);
+    f = alloc_swap_folio(&vmf);
+    assert(f->order == 3 && medium_used[3] == 1);
+    min_order = 4;
+    assert(alloc_swap_folio(&vmf)->order == 0 && medium_used[3] == 1);
+    min_order = 2;
+    charge_fail = 0; medium_alloc_fallbacks = 0;
+    /* Every candidate order fails: one alloc fallback, base page. */
+    alloc_fail = BIT(2) | BIT(3) | BIT(4);
+    f = alloc_swap_folio(&vmf);
+    assert(f->order == 0 && medium_alloc_fallbacks == 1);
+    alloc_fail = 0;
+    /* A uniform batch can pass the PTE scan and still fail swap alignment. */
+    vmf.orig_pte++;
+    assert(alloc_swap_folio(&vmf)->order == 0 && last_reason == SWAPIN_EXTENT_ALIGN);
+    vmf.hermit_folio_order = 0;
+}
+
+/* The path decision: LARGE keeps phase-A behaviour, MEDIUM is validated here
+ * so that a misaligned or fragmented extent keeps the 4 KiB SG batches. */
+static void medium_decision_tests(void)
+{
+    struct mm_struct mm;
+    struct vm_area_struct vma = { .vm_mm = &mm };
+    struct vm_fault vmf = { .vma = &vma, .address = 0x2000000 + 3 * PAGE_SIZE,
+        .orig_pte = 1024 + 3, .hermit_fault_pc = 0x1000 };
+
+    wr_mask = 0x3fd; enabled_orders = 0x3fc; extent = valid_order = 9;
+    alloc_fail = charge_fail = 0; uffd = zswap = map_fail = false;
+    /* No suggestion: the 4 KiB SG batches stay. */
+    policy_order = -1; policy_medium = false; policy_calls = 0;
+    assert(!hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(policy_calls == 1 && policy_orders == 0x3fc);
+    /* LARGE: alloc_swap_folio() validates, so no order is fixed here. */
+    policy_order = 9; pte_maps = 0;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(pte_maps == 0);
+    /* MEDIUM: the aligned range is checked before any folio is allocated. */
+    policy_order = 4; policy_medium = true; medium_extent_fallbacks = 0;
+    pte_maps = 0;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 4);
+    assert(!medium_extent_fallbacks && pte_maps == 1);
+    /* A fragmented extent keeps the highest legal order below the hint. */
+    valid_order = 2;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 2);
+    min_order = 4;
+    assert(!hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(last_reason == SWAPIN_EXTENT_SWPBATCH);
+    min_order = 2; medium_extent_fallbacks = 0;
+    /* A ceiling above the legal mask never validates an illegal order. */
+    valid_order = 9; enabled_orders = BIT(2) | BIT(3) | BIT(4);
+    policy_order = 6;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 4);
+    enabled_orders = 0x3fc;
+    /* No legal order >= 2 at all: counted, and the SG batches stay. */
+    valid_order = 1;
+    assert(!hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 0);
+    assert(medium_extent_fallbacks == 1);
+    assert(last_reason == SWAPIN_EXTENT_SWPBATCH);
+    valid_order = 9;
+    /* A PTE map failure must keep the SG path too. */
+    map_fail = true;
+    assert(!hermit_swapin_folio(&vmf) && medium_extent_fallbacks == 2);
+    assert(last_reason == SWAPIN_EXTENT_SWPBATCH);
+    map_fail = false;
+    /* Retain the first candidate's reason even if smaller orders fail later
+     * in the check. A successful lower order is not an extent fallback. */
+    zeromap_limit = 8; remote_gap = true;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_CACHE);
+    remote_gap = false;
+    assert(hermit_swapin_folio(&vmf) && vmf.hermit_folio_order == 3);
+    assert(medium_extent_fallbacks == 3);
+    zeromap_limit = 512; cache_limit = 1;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_CACHE);
+    cache_limit = 512; remote_hole = true;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_REMOTE);
+    remote_hole = false; remote_gap = true;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_REMOTE);
+    vmf.orig_pte++;
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_ALIGN);
+    vmf.orig_pte--; remote_gap = false;
+    /* No eligible order below the hint never reached an extent check. */
+    enabled_orders = BIT(7);
+    assert(!hermit_swapin_folio(&vmf) && last_reason == SWAPIN_EXTENT_NO_ORDER);
+    /* A 4 KiB ceiling, uffd and zswap never consult the policy. */
+    enabled_orders = BIT(0); policy_calls = 0;
+    assert(!hermit_swapin_folio(&vmf) && policy_calls == 0);
+    enabled_orders = 0x3fc; uffd = true; policy_calls = 0;
+    assert(!hermit_swapin_folio(&vmf) && policy_calls == 0); uffd = false;
+    zswap = true; assert(!hermit_swapin_folio(&vmf) && policy_calls == 0);
+    zswap = false;
+    policy_order = -1; policy_medium = false;
+}
 int main(void)
 {
+    for (int i = 0; i < 512; i++) ptes[i] = 1024 + i;
     wr_mask = 0x3fd; enabled_orders = 0x3fc;
     extent = valid_order = 9;
     check(9);
@@ -310,13 +482,13 @@ int main(void)
         struct mm_struct mm;
         struct vm_area_struct vma = { .vm_mm = &mm };
         struct vm_fault vmf = { .vma = &vma, .address = 0x2000000 };
-        enabled_orders = 0x3fc; assert(hermit_swapin_large_allowed(&vmf));
-        enabled_orders = 0;     assert(!hermit_swapin_large_allowed(&vmf));
-        enabled_orders = BIT(0); assert(!hermit_swapin_large_allowed(&vmf));
-        enabled_orders = BIT(4); assert(hermit_swapin_large_allowed(&vmf));
+        enabled_orders = 0x3fc; assert(hermit_swapin_orders(&vmf) & BIT(4));
+        enabled_orders = 0;     assert(!hermit_swapin_orders(&vmf));
+        enabled_orders = BIT(0); assert(!(hermit_swapin_orders(&vmf) & ~BIT(0)));
+        enabled_orders = BIT(4); assert(hermit_swapin_orders(&vmf) == BIT(4));
         enabled_orders = 0x3fc;
-        uffd = true;  assert(!hermit_swapin_large_allowed(&vmf)); uffd = false;
-        zswap = true; assert(!hermit_swapin_large_allowed(&vmf)); zswap = false;
+        uffd = true;  assert(!hermit_swapin_orders(&vmf)); uffd = false;
+        zswap = true; assert(!hermit_swapin_orders(&vmf)); zswap = false;
     }
     uffd = true; check(0); uffd = false;
     zswap = true; check(0); zswap = false;
@@ -327,100 +499,16 @@ int main(void)
     wr_mask |= BIT(9); assert(hermit_swapout_order(&f) == 9);
     f.order = 0; assert(hermit_swapout_order(&f) == 0);
     f.order = 4; wr_mask = BIT(9); assert(hermit_swapout_order(&f) == 0);
+    medium_alloc_tests();
+    medium_decision_tests();
     puts("Swap-in allocation and max-granularity swap-out tests: PASS");
 }
 '''
     with tempfile.TemporaryDirectory(prefix='hermit-allocation-test-') as tmp:
         cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
-        cfile.write_text(harness + functions + tests)
+        cfile.write_text(extent_enum + harness + functions + tests)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
                         '-Werror', '-fsanitize=address,undefined', '-g',
-                        str(cfile), '-o', str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
-
-
-def test_reclaim_sort():
-    """Production ranking: shrink_folio_list() consumes the list tail."""
-    root = Path(__file__).resolve().parents[3]
-    source = (root / 'linux-stable/mm/hermit_policy.c').read_text()
-    start = source.index('struct policy_rank {')
-    end = source.index('/* Drop per-page state', start)
-    harness = r'''
-#include <assert.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <linux/list.h>
-#define POLICY_SCAN 32
-#define HERMIT_POLICY_SORT 4
-#define HERMIT_POLICY_MGLRU 256
-#define atomic_long_inc(p) (++(p)->counter)
-#define atomic_long_add(n, p) ((p)->counter += (n))
-static atomic_long_t ranked_pages, sorted_lists, mglru_sort_bypasses;
-struct folio { struct list_head lru; unsigned int heat; bool dirty, locked; u64 age; };
-struct hermit_reclaim_hint { u64 age; unsigned int heat; };
-static bool mode = true, feature = true, mglru, cooperative = true;
-static bool policy_mode(void) { return mode; }
-static bool lru_gen_enabled(void) { return mglru; }
-static bool hermit_policy_feature(unsigned int f)
-{ return f == HERMIT_POLICY_SORT ? feature : f == HERMIT_POLICY_MGLRU && cooperative; }
-static bool folio_trylock(struct folio *f) { return !f->locked; }
-static void folio_unlock(struct folio *f) { (void)f; }
-static bool folio_test_dirty(struct folio *f) { return f->dirty; }
-static void hermit_policy_hint(struct folio *f, struct hermit_reclaim_hint *h)
-{ h->heat = f->heat; h->age = f->age; }
-'''
-    tests = r'''
-static struct folio *tail(struct list_head *l) { return list_entry(l->prev, struct folio, lru); }
-int main(void)
-{
-    struct folio f[40] = {};
-    LIST_HEAD(list);
-    for (unsigned int i = 0; i < 40; i++) {
-        f[i].heat = 2; f[i].age = i;
-        list_add_tail(&f[i].lru, &list);
-    }
-    /* The tail window (last 32) holds a dirty cold, a clean cold page and a
-     * locked clean cold page. The clean cold page goes to the tail, then the
-     * dirty cold one. A cold page outside the window is left alone. */
-    f[35].heat = 0; f[35].dirty = true;
-    f[20].heat = 0;
-    f[38].heat = 0; f[38].locked = true;
-    f[2].heat = 0;
-    hermit_policy_sort(&list, false);
-    assert(tail(&list) == &f[20]);
-    assert(list_entry(list.prev->prev, struct folio, lru) == &f[35]);
-    assert(list.next == &f[0].lru && f[2].lru.prev == &f[1].lru);
-    /* 32 lockable folios are ranked; the locked one is skipped, not counted. */
-    assert(sorted_lists.counter == 1 && ranked_pages.counter == 32);
-    /* Order is stable among equal scores: older age first at the tail. */
-    unsigned int n = 0;
-    for (struct list_head *p = list.next; p != &list; p = p->next) n++;
-    assert(n == 40);
-    /* MGLRU preserves the native candidate order, including an in-flight
-     * list isolated before the runtime switch was disabled. */
-    struct list_head *saved_next[40], *saved_prev[40];
-    for (unsigned int i = 0; i < 40; i++) {
-        saved_next[i] = f[i].lru.next; saved_prev[i] = f[i].lru.prev;
-    }
-    mglru = true; hermit_policy_sort(&list, true);
-    mglru = false; hermit_policy_sort(&list, true);
-    assert(sorted_lists.counter == 1 && mglru_sort_bypasses.counter == 2);
-    for (unsigned int i = 0; i < 40; i++)
-        assert(saved_next[i] == f[i].lru.next && saved_prev[i] == f[i].lru.prev);
-    cooperative = false; mglru = true; hermit_policy_sort(&list, true);
-    assert(sorted_lists.counter == 2); /* ablation restores ranking */
-    feature = false; hermit_policy_sort(&list, false); assert(sorted_lists.counter == 2);
-    feature = true; mode = false; hermit_policy_sort(&list, false); assert(sorted_lists.counter == 2);
-    puts("Reclaim tail ranking tests: PASS");
-}
-'''
-    with tempfile.TemporaryDirectory(prefix='hermit-sort-test-') as tmp:
-        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
-        cfile.write_text(harness + source[start:end] + tests)
-        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
-                        '-Werror', '-fsanitize=address,undefined', '-g',
-                        '-I', str(root / 'linux-stable/tools/include'),
                         str(cfile), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
@@ -432,8 +520,10 @@ def test_swapin_pages():
     start = source.index('static unsigned int hermit_swap_ptes(')
     end = source.index('#endif', source.index('struct folio *hermit_swapin_pages('))
     harness = r'''
+#define HERMIT_ADC_SCOPE(which)
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -448,19 +538,29 @@ typedef int spinlock_t;
 #define PMD_SIZE (1UL << 21)
 #define HERMIT_BATCH_MAX 16
 #define HERMIT_SWAPIN_MAX 64
+#define HMT_BPS_SCACHE 0
 #define GFP_NOIO 1
 #define __GFP_NOWARN 2
 #define __GFP_DIRECT_RECLAIM 4
 #define __GFP_NORETRY 8
 #define DIV_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
 #define min3(a, b, c) ((a) < (b) ? ((a) < (c) ? (a) : (c)) : ((b) < (c) ? (b) : (c)))
 #define clamp_t(t, v, lo, hi) ((t)(v) < (t)(lo) ? (t)(lo) : (t)(v) > (t)(hi) ? (t)(hi) : (t)(v))
+#define unlikely(x) (x)
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
 typedef struct { unsigned long val; } swp_entry_t;
 typedef struct { unsigned long v; } pte_t;
 #define __pte(x) ((pte_t){ x })
-struct folio { int id; bool locked, uptodate, readahead, in_cache; int refs; };
+struct page { int idx; };
+struct folio {
+    struct page page;
+    union { void *private; swp_entry_t swap; };
+    int id; bool locked, uptodate, readahead, in_cache, swapbacked, on_lru; int refs;
+};
 struct mm_struct { int unused; };
-struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end; };
+struct swap_info_struct { int type; };
+struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end; void *anon_vma; };
 struct vm_fault { struct vm_area_struct *vma; unsigned long address; void *pmd; pte_t orig_pte;
                   unsigned int hermit_batch_pages; };
 struct hermit_backend_ops;
@@ -470,15 +570,28 @@ struct hermit_batch {
     int status[HERMIT_BATCH_MAX]; unsigned int nr; int cpu, srcu_idx; bool write;
     void *private; const struct hermit_backend_ops *backend;
 };
-struct mempolicy { int unused; };
+struct hermit_direct_batch {
+    struct folio *folios[HERMIT_SWAPIN_MAX];
+    swp_entry_t entries[HERMIT_SWAPIN_MAX];
+    pte_t snapshots[HERMIT_SWAPIN_MAX];
+    bool ok[HERMIT_SWAPIN_MAX];
+    unsigned int nr;
+    unsigned int installed;
+};
+struct mempolicy { int mode; };
+#define MPOL_DEFAULT 0
 /* PTE value: 0 = none, otherwise swap entry offset + 1 (type 0). */
 static pte_t ptes[512];
 static unsigned long base = 0x40000000;
 static int lock_depth, lock_calls, submits, polls, outstanding, max_outstanding;
-static unsigned int predicted, not_allocated_at = ~0U, mutate_at = ~0U;
+static unsigned int not_allocated_at = ~0U, mutate_at = ~0U, shared_at = ~0U;
 static int poll_status;
-static bool fail_kmalloc;
+static bool fail_kmalloc, bypass_swapcache, pte_install_ready, uffd_armed;
+static unsigned int bulk_alloc_calls, batch_charge_calls, swapcache_adds, swapcache_clears;
+static unsigned int next_folio_idx;
 static struct folio pages[512];
+static struct swap_info_struct test_si;
+static struct folio *page_folio(struct page *p) { return container_of(p, struct folio, page); }
 static void *kmalloc(size_t n, int f) { (void)f; return fail_kmalloc ? NULL : malloc(n); }
 static void kfree(void *p) { free(p); }
 static pte_t *pte_offset_map_lock(struct mm_struct *mm, void *pmd, unsigned long a, spinlock_t **l)
@@ -491,10 +604,44 @@ static bool non_swap_entry(swp_entry_t e) { (void)e; return false; }
 static bool pte_same(pte_t a, pte_t b) { return a.v == b.v; }
 static unsigned int swp_type(swp_entry_t e) { (void)e; return 0; }
 static bool hermit_backend_entry_remote(swp_entry_t e) { (void)e; return true; }
-static unsigned int hermit_policy_predict(struct vm_fault *vmf) { (void)vmf; return predicted; }
+static bool hmt_ctl_flag(int f) { (void)f; return bypass_swapcache; }
+static bool userfaultfd_armed(struct vm_area_struct *v) { (void)v; return uffd_armed; }
+static bool hermit_policy_pte_install_ready(struct vm_fault *vmf, unsigned int p)
+{ (void)vmf; (void)p; return pte_install_ready; }
+static int __swap_count(swp_entry_t e) { return e.val == shared_at ? 2 : 1; }
+static int swapcache_prepare(swp_entry_t e, int nr)
+{ (void)nr; return e.val == not_allocated_at ? -17 : 0; }
+static void swapcache_clear(struct swap_info_struct *si, swp_entry_t e, int nr)
+{ (void)si; (void)e; (void)nr; swapcache_clears++; }
 static struct mempolicy *get_vma_policy(struct vm_area_struct *v, unsigned long a, int o, pgoff_t *i)
 { static struct mempolicy m; (void)v; (void)a; (void)o; *i = 0; return &m; }
 static void mpol_cond_put(struct mempolicy *m) { (void)m; }
+static int numa_node_id(void) { return 0; }
+static unsigned long alloc_pages_bulk(gfp_t g, unsigned long nr, struct page **arr)
+{
+    (void)g; bulk_alloc_calls++;
+    for (unsigned long i = 0; i < nr; i++) {
+        struct folio *f = &pages[next_folio_idx++ % 512];
+        f->refs = 1;
+        arr[i] = &f->page;
+    }
+    return nr;
+}
+static struct folio *folio_alloc_mpol(gfp_t g, unsigned int o, struct mempolicy *m, pgoff_t i, int n)
+{ struct page *p[1]; (void)o; (void)m; (void)i; (void)n; alloc_pages_bulk(g, 1, p); return page_folio(p[0]); }
+static unsigned int mem_cgroup_swapin_charge_batch(struct folio **f, const swp_entry_t *e,
+    unsigned int nr, struct mm_struct *mm, gfp_t g)
+{ (void)f; (void)e; (void)mm; (void)g; batch_charge_calls++; return nr; }
+static int mem_cgroup_swapin_charge_folio(struct folio *f, struct mm_struct *mm, gfp_t g, swp_entry_t e)
+{ (void)f; (void)mm; (void)g; (void)e; return 0; }
+static void __folio_set_locked(struct folio *f) { f->locked = true; }
+static void __folio_set_swapbacked(struct folio *f) { f->swapbacked = true; }
+static void swap_cache_add_folio(struct folio *f, swp_entry_t e, void **shadow)
+{ (void)e; *shadow = NULL; f->in_cache = true; swapcache_adds++; }
+static void *swap_cache_get_shadow(swp_entry_t e) { (void)e; return NULL; }
+static void memcg1_swapin(swp_entry_t e, int n) { (void)e; (void)n; }
+static void workingset_refault(struct folio *f, void *s) { (void)f; (void)s; }
+static void folio_add_lru(struct folio *f) { f->on_lru = true; }
 static struct folio *__read_swap_cache_async(swp_entry_t e, gfp_t g, struct mempolicy *m,
     pgoff_t i, bool *allocated, bool skip)
 {
@@ -513,11 +660,21 @@ static void swap_read_folio(struct folio *f, void *p) { (void)p; f->uptodate = t
 static int raw_smp_processor_id(void) { return 0; }
 static u64 ktime_get_ns(void) { return 1; }
 #define count_vm_event(x) ((void)0)
+#define count_vm_events(x, n) ((void)0)
 #define count_memcg_folio_events(f, e, n) ((void)0)
 #define hermit_stat_inc(x) ((void)0)
+#define hermit_stat_add(x, n) ((void)0)
 #define hermit_backend_account(a, b, c, d) ((void)0)
 static void hermit_latency_add(int kind, u64 ns) { (void)kind; (void)ns; }
 #define HMT_LAT_BACKEND_READ 0
+/* Swap-in cost instrumentation hooks, off unless a test enables them. */
+static bool cost_enabled;
+static unsigned long prefetched_entries[64];
+static unsigned int prefetched_calls, prefetched_total;
+static bool hermit_swapin_cost_enabled(void) { return cost_enabled; }
+static void hermit_policy_prefetched(struct mm_struct *mm, unsigned long entry)
+{ (void)mm; if (prefetched_calls < 64) prefetched_entries[prefetched_calls] = entry; prefetched_calls++; }
+static void hermit_swapin_cost_prefetched(unsigned int nr) { prefetched_total += nr; }
 static int hermit_backend_submit_batch(struct hermit_batch *b)
 {
     assert(b->nr >= 1 && b->nr <= HERMIT_BATCH_MAX);
@@ -535,52 +692,109 @@ static int hermit_backend_poll_batch(struct hermit_batch *b, bool wait)
 }
 '''
     tests = r'''
-static struct folio *run(unsigned int nr_ptes, unsigned int predict, unsigned int fault)
+static struct folio *run(unsigned int nr_ptes, unsigned int predict, unsigned int fault,
+                         struct hermit_direct_batch **db_out)
 {
     struct mm_struct mm;
-    struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = base, .vm_end = base + PMD_SIZE };
+    struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = base,
+        .vm_end = base + PMD_SIZE, .anon_vma = &mm };
     struct vm_fault vmf = { .vma = &vma, .address = base + fault * PAGE_SIZE + 123 };
+    struct hermit_direct_batch *local_db = NULL;
     memset(ptes, 0, sizeof(ptes)); memset(pages, 0, sizeof(pages));
+    next_folio_idx = 0;
     for (unsigned int i = 0; i < nr_ptes; i++) ptes[i].v = 1000 + i + 1;
     vmf.orig_pte = ptes[fault];
     submits = polls = outstanding = max_outstanding = lock_calls = 0;
-    predicted = predict;
-    return hermit_swapin_pages((swp_entry_t){ 1000 + fault }, 0, &vmf);
+    bulk_alloc_calls = batch_charge_calls = swapcache_adds = swapcache_clears = 0;
+    prefetched_calls = prefetched_total = 0;
+    struct folio *f = hermit_swapin_pages((swp_entry_t){ 1000 + fault }, 0, &vmf,
+                                          &test_si, predict, db_out ? db_out : &local_db);
+    if (!db_out && local_db)
+        hermit_direct_batch_free(local_db);
+    return f;
 }
 int main(void)
 {
-    /* 64 predicted pages: 4 batches all in flight; two PTE-lock passes. */
-    struct folio *d = run(512, 64, 0);
-    assert(d == &pages[1000 % 512] && d->uptodate && !d->locked && d->refs == 1);
+    /* Swapcache SG path (bypass_swapcache=false): 64 pages in 4 batches,
+     * bulk-allocated once and batch-charged once, with two PTE-lock passes. */
+    bypass_swapcache = false; pte_install_ready = false;
+    struct folio *d = run(512, 64, 0, NULL);
+    assert(d == &pages[0] && d->uptodate && !d->locked && d->refs == 1 && d->in_cache);
     assert(submits == 4 && polls == 4 && max_outstanding == 4 && lock_calls == 2);
+    assert(bulk_alloc_calls == 1 && batch_charge_calls == 1 && swapcache_adds == 64);
     for (unsigned int i = 1; i < 64; i++) {
-        struct folio *f = &pages[(1000 + i) % 512];
+        struct folio *f = &pages[i];
         assert(f->uptodate && f->readahead && !f->locked && f->refs == 0 && f->in_cache);
     }
     /* Prediction clipped by the PMD end and by the first hole. */
-    run(512, 64, 500); assert(submits == 1);
-    run(20, 64, 0); assert(submits == 2);
-    /* A page already in swapcache stops the run; demand stays referenced. */
-    not_allocated_at = 1005; d = run(512, 64, 0); not_allocated_at = ~0U;
-    assert(submits == 1 && pages[1005 % 512].refs == 0 && d->refs == 1);
+    run(512, 64, 500, NULL); assert(submits == 1);
+    run(20, 64, 0, NULL); assert(submits == 2);
+    /* A page already in swapcache stops the run; unused bulk pages are freed. */
+    not_allocated_at = 1005; d = run(512, 64, 0, NULL); not_allocated_at = ~0U;
+    assert(submits == 1 && swapcache_adds == 5 && d->refs == 1);
+    for (unsigned int i = 5; i < 64; i++) assert(pages[i].refs == 0);
     /* A PTE changed during I/O is dropped from swapcache, others survive. */
-    mutate_at = 10; run(512, 32, 0); mutate_at = ~0U;
-    assert(!pages[1010 % 512].in_cache && !pages[1010 % 512].locked);
-    assert(pages[1009 % 512].in_cache && pages[1009 % 512].uptodate);
+    mutate_at = 10; run(512, 32, 0, NULL); mutate_at = ~0U;
+    assert(!pages[10].in_cache && !pages[10].locked);
+    assert(pages[9].in_cache && pages[9].uptodate);
     /* Read error: every page falls back to the per-page read path. */
-    poll_status = -5; d = run(512, 16, 0); poll_status = 0;
+    poll_status = -5; d = run(512, 16, 0, NULL); poll_status = 0;
     assert(d->uptodate && !d->locked);
     /* Demand PTE replaced before the snapshot: NULL lets the fault retry. */
     {
         struct mm_struct mm;
-        struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = base, .vm_end = base + PMD_SIZE };
+        struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = base,
+            .vm_end = base + PMD_SIZE, .anon_vma = &mm };
         struct vm_fault vmf = { .vma = &vma, .address = base };
-        memset(ptes, 0, sizeof(ptes)); ptes[0].v = 7; predicted = 8; submits = 0;
-        assert(!hermit_swapin_pages((swp_entry_t){ 1000 }, 0, &vmf) && !submits);
+        struct hermit_direct_batch *db = NULL;
+        memset(ptes, 0, sizeof(ptes)); ptes[0].v = 7; submits = 0;
+        assert(!hermit_swapin_pages((swp_entry_t){ 1000 }, 0, &vmf, &test_si, 8, &db) && !submits && !db);
     }
     /* No memory for the work area: demand page still read alone. */
-    fail_kmalloc = true; d = run(512, 64, 0); fail_kmalloc = false;
+    fail_kmalloc = true; d = run(512, 64, 0, NULL); fail_kmalloc = false;
     assert(d->uptodate && submits == 1);
+    /* Cost instrumentation is inert until debugfs enables it. */
+    assert(!prefetched_calls && !prefetched_total);
+    cost_enabled = true; run(512, 16, 0, NULL);
+    assert(prefetched_calls == 15 && prefetched_total == 15);
+    assert(prefetched_entries[0] == 1001 && prefetched_entries[14] == 1015);
+    cost_enabled = false;
+
+    /* Direct-bypass SG path (bypass_swapcache=true + pte_install_ready=true):
+     * 1 bulk alloc, 1 batch memcg charge, 0 swapcache inserts, 1 PTE lock only,
+     * demand unlocked for folio_lock_or_retry, tail folios locked & private. */
+    bypass_swapcache = true; pte_install_ready = true;
+    {
+        struct hermit_direct_batch *db = NULL;
+        d = run(512, 32, 0, &db);
+        assert(db != NULL && db->nr == 32 && db->installed == 0);
+        assert(d == db->folios[0] && d->uptodate && !d->locked && !d->in_cache && d->on_lru);
+        assert(bulk_alloc_calls == 1 && batch_charge_calls == 1);
+        assert(swapcache_adds == 0 && lock_calls == 1 && submits == 2 && polls == 2);
+        for (unsigned int i = 1; i < 32; i++) {
+            struct folio *f = db->folios[i];
+            assert(db->ok[i] && f->uptodate && f->locked && !f->in_cache && f->on_lru && !f->private);
+        }
+        hermit_direct_batch_free(db);
+    }
+    /* Shared swap entry stops the direct prefix cleanly; unused pages are released. */
+    shared_at = 1004;
+    {
+        struct hermit_direct_batch *db = NULL;
+        d = run(512, 16, 0, &db);
+        assert(db != NULL && db->nr == 4 && swapcache_adds == 0);
+        for (unsigned int i = 4; i < 16; i++) assert(pages[i].refs == 0);
+        hermit_direct_batch_free(db);
+    }
+    shared_at = ~0U;
+    /* If slot 1 is shared (only 1 exclusive page), falls back to swapcache SG path. */
+    shared_at = 1001;
+    {
+        struct hermit_direct_batch *db = NULL;
+        d = run(512, 16, 0, &db);
+        assert(db == NULL && swapcache_adds == 16 && swapcache_clears == 1);
+    }
+    shared_at = ~0U;
     puts("4 KiB batched swap-in tests: PASS");
 }
 '''
@@ -593,11 +807,11 @@ int main(void)
         subprocess.run([str(binary)], check=True)
 
 
-def test_cold_observe():
-    """Production aging, MGLRU provenance, first-eviction ghosts and refaults."""
+def test_mglru_policy():
+    """Production MGLRU batch keys, shadow refault feedback and swap-in prediction."""
     root = Path(__file__).resolve().parents[3]
     source = (root / 'linux-stable/mm/hermit_policy.c').read_text()
-    start = source.index('#define POLICY_BUCKET_BITS')
+    start = source.index('#define POLICY_STREAM_SET_BITS')
     end = source.index('static bool policy_stream_match(')
     harness = r'''
 #include <assert.h>
@@ -625,11 +839,8 @@ typedef struct { u64 counter; } atomic64_t;
 #define NSEC_PER_USEC 1000ULL
 #define NSEC_PER_MSEC 1000000ULL
 #define HERMIT_SWAPIN_MAX 64
-#define HERMIT_POLICY_OBSERVE 8
-#define HERMIT_POLICY_FLUSH 16
-#define HERMIT_POLICY_RESERVE 64
-#define HERMIT_POLICY_MGLRU 256
-#define HERMIT_POLICY_DEFAULT 0x1bf
+#define PMD_ORDER 9
+#define BIT(n) (1UL << (n))
 #define HERMIT_PEBS_MODE_POLICY 1
 #define GFP_NOWAIT 0
 #define __GFP_NOWARN 0
@@ -641,21 +852,20 @@ typedef struct { u64 counter; } atomic64_t;
 #define spin_lock(p) (locks++, assert(!(*(p))++))
 #define spin_unlock(p) assert((*(p))-- == 1)
 static unsigned int locks;
+static int policy_ilog2(unsigned long v) { return v ? 63 - __builtin_clzl(v) : 0; }
+#define ilog2(v) policy_ilog2((unsigned long)(v))
 struct hermit_policy_state;
 struct mm_struct { struct hermit_policy_state *hermit_policy; atomic64_t hermit_vma_generation; bool hermit_pebs_enabled; };
 struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end; };
 struct vm_fault { struct vm_area_struct *vma; unsigned long address, hermit_fault_pc; bool hermit_refault;
                   unsigned int hermit_batch_pages; };
-struct folio { unsigned long pfn; bool large, anon, ksm; int mapcount; };
+struct folio { bool large, anon, ksm; int mapcount; };
 struct task_struct { u64 start_time; int pid; } task = { 1, 123 }, *current = &task;
 static int task_pid_nr(struct task_struct *t) { return t->pid; }
 static u32 hermit_pebs_enabled = 1, hermit_pebs_mode = 1, hermit_pebs_all = 1;
-static u64 hermit_pebs_fixed_cost_ns = 7000;
 static u64 hermit_pebs_epoch = 1, clock_ns = 1000;
-static int flushes;
 static unsigned int live;
-static bool mglru, notifier, contended, fail_alloc;
-static bool lru_gen_enabled(void) { return mglru; }
+static bool notifier, contended, fail_alloc;
 static struct vm_area_struct *mapped_vma;
 static unsigned long mapped_addr;
 static unsigned int mappings = 1, walks;
@@ -674,18 +884,14 @@ static void rmap_walk(struct folio *f, struct rmap_walk_control *rwc)
 static u64 ktime_get_ns(void) { return clock_ns; }
 static unsigned long hash_long(unsigned long x, unsigned int bits) { return (x * 0x61c8864680b583ebUL) >> (64 - bits); }
 static void *kzalloc(size_t n, int f) { (void)f; if (fail_alloc) return NULL; live++; return calloc(1, n); }
-static void *kcalloc(size_t n, size_t s, int f) { (void)f; if (fail_alloc) return NULL; live++; return calloc(n, s); }
 static void kfree(void *p) { if (p) live--; free(p); }
 static bool folio_test_anon(struct folio *f) { return f->anon; }
 static bool folio_test_large(struct folio *f) { return f->large; }
 static bool folio_test_ksm(struct folio *f) { return f->ksm; }
 static int folio_mapcount(struct folio *f) { return f->mapcount; }
-static unsigned long folio_pfn(struct folio *f) { return f->pfn; }
 static bool mm_has_notifiers(struct mm_struct *mm) { (void)mm; return notifier; }
-static void hermit_policy_defer_flush(struct vm_area_struct *v, unsigned long a) { (void)v; (void)a; flushes++; }
 /* hermit_policy_predict() dependencies. PEBS adds no pages here, so the
  * prediction is the stream's own doubling and run-length cap. */
-#define HERMIT_POLICY_PEBS 2
 #define atomic_long_add(n, p) ((p)->counter += (n))
 static unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf) { (void)vmf; return 1; }
 #undef roundup_pow_of_two
@@ -702,7 +908,7 @@ static void fault(struct vm_area_struct *vma, unsigned int t, unsigned long a, u
 {
     struct vm_fault vmf = { .vma = vma, .address = a, .hermit_fault_pc = pc };
     current = &threads[t]; clock_ns += 1000;
-    hermit_policy_installed(&vmf, 7000 + (a >> PAGE_SHIFT) % 1000, a, 1);
+    hermit_policy_installed(&vmf, a, 1);
 }
 static unsigned int run_at(struct vm_area_struct *vma, unsigned int t, unsigned long a, unsigned long pc)
 {
@@ -722,8 +928,7 @@ static void stream_tests(void)
     struct vm_area_struct vma2 = vma; vma2.vm_mm = &mm2;
     struct task_struct *saved = current;
     unsigned int pair[2] = { 0, 0 }, q[9], n = 0, i, j;
-    fail_alloc = false; mglru = false; policy_features = HERMIT_POLICY_DEFAULT;
-    policy_pages_max = 32768;
+    fail_alloc = false; policy_features = HERMIT_POLICY_DEFAULT;
     for (i = 0; i < 256; i++) threads[i] = (struct task_struct){ .start_time = 1, .pid = 1000 + i };
     /* Two threads that shared one of the old 64 direct-mapped slots. 256
      * threads in 64 slots must collide somewhere (pigeonhole), independent of
@@ -793,7 +998,7 @@ static unsigned int replay_run(struct vm_area_struct *vma, unsigned long base,
             read_to = page + nr;
             (*faults)++;
         }                                   /* else a swapcache hit on a prefetched page */
-        hermit_policy_installed(&vmf, 9000 + page, a, 1);
+        hermit_policy_installed(&vmf, a, 1);
     }
     if (read_to > len) wasted = read_to - len;
     return wasted;
@@ -834,152 +1039,407 @@ static void fit_tests(void)
     current = saved;
 }
 
+/* Replay one segment of @len pages the way do_swap_page() does after Phase B:
+ * ask the policy for a folio order first, and only fall back to the 4 KiB
+ * predictor when it has no suggestion. Each read counts as one fault. */
+struct medium_walk {
+    unsigned int max_order, suggestions, reads;
+};
+
+static void replay_medium(struct vm_area_struct *vma, unsigned long base,
+                          unsigned int len, unsigned long pc, struct medium_walk *walk)
+{
+    unsigned int page = 0, read_to = 0;
+
+    while (page < len) {
+        unsigned long a = base + page * PAGE_SIZE;
+        struct vm_fault vmf = { .vma = vma, .address = a, .hermit_fault_pc = pc };
+        bool medium = false;
+        int order;
+
+        clock_ns += 1000;
+        if (page < read_to) {           /* swapcache hit on a read-ahead page */
+            hermit_policy_installed(&vmf, a, 1);
+            page++;
+            continue;
+        }
+        order = hermit_policy_swapin_order(&vmf, 0x3fc, &medium);
+        if (order >= 0) {
+            unsigned int nr = 1U << order;
+
+            /* A MEDIUM folio must never read past the learned segment. */
+            assert(!medium || page + nr <= len);
+            if (medium) {
+                walk->suggestions++;
+                if ((unsigned int)order > walk->max_order)
+                    walk->max_order = order;
+            }
+            walk->reads++;
+            hermit_policy_installed(&vmf, a, nr);
+            page += nr;
+            read_to = page;
+        } else {
+            unsigned int nr = hermit_policy_predict(&vmf);
+
+            vmf.hermit_batch_pages = nr;
+            walk->reads++;
+            read_to = page + nr;
+            hermit_policy_installed(&vmf, a, 1);
+            page++;
+        }
+    }
+}
+
+static void medium_tests(void)
+{
+    const unsigned long base = 0x60000000UL, stride = 2UL << 20, pc = 0x403000;
+    struct mm_struct mm = { .hermit_vma_generation = { 1 } };
+    struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = base,
+                                 .vm_end = base + 64 * stride };
+    struct task_struct *saved = current;
+    unsigned int i, order4 = 0;
+    long suggested;
+
+    current = &threads[1];
+    fail_alloc = false; policy_swapin_max = 64;
+    policy_features = HERMIT_POLICY_DEFAULT;
+    policy_medium_max_order = 4; policy_medium_stable = 3;
+    /* The new bit is off by default: the 0xa3 baseline is unchanged. */
+    assert(!(HERMIT_POLICY_DEFAULT & HERMIT_POLICY_MEDIUM));
+    /* No suggestion without the bit, without a fault PC, or when the VMA
+     * cannot hold a >4 KiB folio at all. */
+    {
+        struct vm_fault vmf = { .vma = &vma, .address = base,
+                                .hermit_fault_pc = pc };
+        bool medium = true;
+
+        assert(hermit_policy_swapin_order(&vmf, 0x3fc, &medium) == -1);
+        assert(!medium);
+        policy_features |= HERMIT_POLICY_MEDIUM;
+        assert(hermit_policy_swapin_order(&vmf, BIT(0), &medium) == -1);
+        vmf.hermit_fault_pc = 0;
+        assert(hermit_policy_swapin_order(&vmf, 0x3fc, &medium) == -1);
+    }
+    /* Length and alignment arithmetic: only a stable, repeating segment that
+     * still has room for an aligned order is read as one folio. */
+    {
+        struct policy_stream s = {};
+        unsigned long last = base;
+
+        s.fit = 16; s.fit_stable = 3; s.last = last;
+        assert(policy_medium_min_order == 4);
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, BIT(3)) == -1);
+        assert(medium_below_min.counter == 1);
+        policy_medium_min_order = 0;
+        assert(hermit_policy_medium_min_order() == 2);
+        /* A new segment starts at page 0: the whole 64 KiB. */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 4);
+        /* A continuation is at page sequential + 1 and must be aligned to the
+         * order, because the folio is allocated at ALIGN_DOWN(fault, 1<<order). */
+        s.sequential = 0;
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == -1);
+        s.sequential = 3;               /* position 4: order 2 */
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == 2);
+        s.sequential = 7;               /* position 8: order 3 */
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == 3);
+        s.sequential = 11;              /* position 12: four pages left */
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == 2);
+        s.sequential = 12;              /* position 13: three pages left */
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == -1);
+        s.sequential = 15;              /* the run already reached the length */
+        assert(policy_medium_order(&s, last + PAGE_SIZE, 0x3fc) == -1);
+        s.fit_stable = 2;               /* not stable yet */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == -1);
+        s.fit_stable = 3; s.fit = 6;    /* rounded down to four pages */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 2);
+        s.fit = 3;                      /* shorter than the smallest order */
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == -1);
+        s.fit = 16; policy_medium_min_order = 9; policy_medium_max_order = 2;
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 2);
+        policy_medium_min_order = 4; policy_medium_max_order = 6;
+        assert(policy_medium_order(&s, last + 4 * PAGE_SIZE, 0x3fc) == 4);
+        policy_medium_max_order = 4;
+    }
+    /* Repeated 16-page segments: the first segments only teach the length (fit
+     * comes from the 4 KiB batches and is recorded at the next run break), then
+     * one order-4 folio per segment. */
+    suggested = medium_suggested.counter;
+    for (i = 0; i < 5; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + i * stride, 16, pc, &walk);
+        if (i < 4) {
+            assert(walk.suggestions == 0);
+        } else {
+            assert(walk.suggestions == 1 && walk.max_order == 4);
+            assert(walk.reads == 1);
+            order4 = walk.max_order;
+        }
+    }
+    assert(order4 == 4);
+    assert(medium_suggested.counter == suggested + 1);
+    /* The next segment keeps the order: the learned length is stable. */
+    {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + 5 * stride, 16, pc, &walk);
+        assert(walk.suggestions == 1 && walk.max_order == 4 && walk.reads == 1);
+    }
+    /* Mixed lengths never look stable, so no order is suggested: each stream
+     * below starts empty, which is the ablation-relevant guarantee. */
+    for (i = 0; i < 6; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (8 + i) * stride, i % 2 ? 32 : 16,
+                      pc + PAGE_SIZE, &walk);
+        assert(walk.suggestions == 0);
+    }
+    /* Replaying a six-page stream keeps SG at the default minimum. */
+    for (i = 0; i < 6; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (16 + i) * stride, 6, pc + 4 * PAGE_SIZE, &walk);
+        assert(walk.suggestions == 0);
+    }
+    assert(medium_below_min.counter > 1);
+    policy_medium_min_order = 2;
+    /* A six-page segment allows only what fits: order 2, never order 3. */
+    for (i = 0; i < 6; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (16 + i) * stride, 6, pc + 2 * PAGE_SIZE,
+                      &walk);
+        assert(walk.max_order <= 2);
+        if (i < 4) {
+            assert(walk.suggestions == 0);
+        } else {
+            assert(walk.suggestions > 0 && walk.max_order == 2);
+            assert(walk.reads == 2);    /* one order-2 folio and one batch */
+        }
+    }
+    /* Ablation: with the bit off, a stable stream keeps the 4 KiB path. */
+    policy_features = HERMIT_POLICY_DEFAULT;
+    for (i = 0; i < 7; i++) {
+        struct medium_walk walk = {};
+
+        replay_medium(&vma, base + (24 + i) * stride, 16, pc + 3 * PAGE_SIZE,
+                      &walk);
+        assert(walk.suggestions == 0);
+    }
+    policy_features = HERMIT_POLICY_DEFAULT | HERMIT_POLICY_MEDIUM;
+    hermit_policy_mm_exit(&mm);
+    assert(live == 0);
+    current = saved;
+}
+
+/* Phase C: the first fault of a repeating segment starts at the length the
+ * stream already learned instead of ramping 1 -> 2 -> 4 -> ... again. */
+static void fitstart_tests(void)
+{
+    const unsigned long base = 0x68000000UL, region = 2UL << 20, pc = 0x405000;
+    struct mm_struct mm = { .hermit_vma_generation = { 1 } };
+    struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = base,
+                                 .vm_end = base + 32 * region };
+    struct task_struct *saved = current;
+    unsigned int faults[12] = { 0 }, i, f;
+    long batches, pages;
+
+    current = &threads[2];
+    fail_alloc = false;
+    policy_swapin_max = 64; policy_fitstart_stable = 3;
+    policy_features = HERMIT_POLICY_DEFAULT | HERMIT_POLICY_FITSTART;
+    /* 32-page segments, one per 2 MiB region: before the change every
+     * segment pays the whole 1,2,4,8,16,32 ramp (seven 4 KiB faults). */
+    for (i = 0; i < 12; i++) {
+        f = 0;
+        replay_run(&vma, base + i * region, 32, pc, &f);
+        faults[i] = f;
+    }
+    /* The length is learned at the first run break and trusted after three
+     * completed segments; until then the old doubling applies. The segment
+     * that learns to trust it still starts at page 1, so it takes what is
+     * left of the learned length (31 pages) and two faults. */
+    for (i = 0; i < 3; i++) assert(faults[i] > 2);
+    assert(faults[3] == 2);
+    for (i = 4; i < 12; i++) assert(faults[i] == 1);
+    /* One 31-page start and eight 32-page starts, never past the fit. */
+    assert(fitstart_batches.counter == 9);
+    assert(fitstart_pages.counter == 8 * 32 + 31);
+    batches = fitstart_batches.counter;
+    pages = fitstart_pages.counter;
+    policy_features = HERMIT_POLICY_DEFAULT;
+    for (i = 12; i < 16; i++) {
+        f = 0;
+        replay_run(&vma, base + i * region, 32, pc, &f);
+        assert(f > 1);                  /* ablation: the ramp comes back */
+    }
+    assert(fitstart_batches.counter == batches &&
+           fitstart_pages.counter == pages);
+    /* Mixed segment lengths never look stable, so no confident start size. */
+    policy_features = HERMIT_POLICY_DEFAULT | HERMIT_POLICY_FITSTART;
+    for (i = 16; i < 26; i++) {
+        f = 0;
+        replay_run(&vma, base + i * region, i % 2 ? 32 : 16,
+                   pc + PAGE_SIZE, &f);
+        assert(f > 1);
+    }
+    assert(fitstart_batches.counter == batches);
+
+    /* Start size arithmetic: the learned length and the SG limit clamp it, and
+     * a contiguous fault starts with what is left of the segment. */
+    hermit_policy_mm_exit(&mm);
+    assert(live == 0);
+    {
+        struct hermit_policy_state *st;
+        struct policy_stream *s;
+        struct vm_fault vmf = { .vma = &vma, .hermit_fault_pc = pc + 2 * PAGE_SIZE };
+
+        vmf.address = base;
+        clock_ns += 1000;
+        hermit_policy_installed(&vmf, base, 1);
+        st = mm.hermit_policy;
+        s = policy_stream(st, &vmf, false);
+        assert(st && s);
+        s->fit = 32; s->fit_stable = 3; s->last = base; s->sequential = 0;
+        vmf.address = base + 4 * PAGE_SIZE;         /* first fault, page 0 */
+        assert(hermit_policy_predict(&vmf) == 32);
+        policy_swapin_max = 8;                      /* SG budget wins */
+        assert(hermit_policy_predict(&vmf) == 8);
+        policy_swapin_max = 64;
+        vmf.address = base + PAGE_SIZE;             /* page sequential + 1 */
+        assert(hermit_policy_predict(&vmf) == 31);
+        s->fit_stable = 2;                          /* not trusted yet */
+        assert(hermit_policy_predict(&vmf) == 1);
+        s->fit_stable = 3;
+        s->fit = 1;                                 /* no batch at all */
+        assert(hermit_policy_predict(&vmf) == 1);
+
+        /* PTEBATCH gate: the whole batch must lie inside a trusted segment. */
+        policy_features |= HERMIT_POLICY_PTEBATCH;
+        s->fit = 32; s->fit_stable = 3; s->last = base; s->sequential = 0;
+        vmf.address = base;
+        assert(hermit_policy_pte_install(&vmf, 32));
+        assert(!hermit_policy_pte_install(&vmf, 33));
+        assert(!hermit_policy_pte_install(&vmf, 1));
+        vmf.address = base + PAGE_SIZE;             /* one page used */
+        assert(hermit_policy_pte_install(&vmf, 31));
+        assert(!hermit_policy_pte_install(&vmf, 32));
+        s->fit_stable = 2;
+        assert(!hermit_policy_pte_install(&vmf, 2));
+        s->fit_stable = 3;
+        policy_features &= ~HERMIT_POLICY_PTEBATCH;
+        assert(!hermit_policy_pte_install(&vmf, 2));
+        policy_features |= HERMIT_POLICY_PTEBATCH;
+        vmf.hermit_fault_pc = 0;                    /* no policy stream */
+        assert(!hermit_policy_pte_install(&vmf, 2));
+        vmf.hermit_fault_pc = pc + 2 * PAGE_SIZE;
+        {
+            struct vm_fault other = { .vma = &vma,
+                .address = base + PAGE_SIZE, .hermit_fault_pc = pc + 3 * PAGE_SIZE };
+
+            assert(!hermit_policy_pte_install(&other, 2));
+        }
+        st->refault = 256;                          /* refault gate */
+        assert(!hermit_policy_pte_install(&vmf, 2));
+        st->refault = 0;
+        assert(hermit_policy_pte_install(&vmf, 2));
+        assert(ptebatch_gate_rejects.counter == 7);
+        hermit_policy_pte_installed(7);
+        hermit_policy_pte_skipped(3);
+        assert(ptebatch_installed.counter == 7 &&
+               ptebatch_skipped.counter == 3);
+    }
+    hermit_policy_mm_exit(&mm);
+    assert(live == 0);
+    policy_features = HERMIT_POLICY_DEFAULT;
+    current = saved;
+}
+
 int main(void)
 {
     struct mm_struct mm = { .hermit_vma_generation = { 1 } };
     struct vm_area_struct vma = { .vm_mm = &mm, .vm_start = addr(0), .vm_end = addr(4096) };
-    struct folio base[4], huge = { .pfn = 9000, .large = true, .anon = true, .mapcount = 1 };
-    policy_pages_max = 4;
-    for (unsigned int i = 0; i < 4; i++) {
-        base[i] = (struct folio){ .pfn = 100 + i, .anon = true, .mapcount = 1 };
-        hermit_policy_observe(&base[i], &vma, addr(i), false, true);
-    }
-    struct hermit_policy_state *st = mm.hermit_policy;
-    assert(st && st->nr == 4 && started_epochs.counter == 4 && flushes == 4);
-    /* 512 PTEs of a 2 MiB folio: no entry created, none of the four evicted. */
-    for (unsigned int i = 0; i < 512; i++)
-        hermit_policy_observe(&huge, &vma, addr(1024 + i), false, true);
-    assert(st->nr == 4 && evicted_pages.counter == 0 && invalid_epochs.counter == 512);
-    for (unsigned int i = 0; i < 4; i++) assert(policy_lookup(st, addr(i)));
-    assert(!policy_lookup(st, addr(1024)) && flushes == 4);
-    /* A shared mapping of a tracked address resets that entry in place. */
-    struct folio shared = base[2]; shared.mapcount = 2;
-    hermit_policy_observe(&shared, &vma, addr(2), false, true);
-    assert(!policy_lookup(st, addr(2))->valid && st->nr == 4 && invalid_epochs.counter == 513);
-    /* Valid base pages still complete an empty interval and become cold. */
-    clock_ns += 2 * NSEC_PER_SEC / 1000;
-    hermit_policy_observe(&base[0], &vma, addr(0), false, true);
-    assert(observed_pages.counter == 1 && cold_pages.counter == 1);
-    /* MGLRU skips observation and flushes. A round trip cannot reuse the
-     * old cold interval, even if this page was never visited by MGLRU. */
+    struct folio base = { .anon = true, .mapcount = 1 };
+    struct folio huge = { .anon = true, .large = true, .mapcount = 1 };
+    struct folio shared = { .anon = true, .mapcount = 2 };
     struct hermit_reclaim_hint hint;
+
+    /* The first MGLRU eviction can batch before any swap-in has occurred. */
     mapped_vma = &vma; mapped_addr = addr(0);
-    hermit_policy_hint(&base[0], &hint); assert(hint.cold);
-    hermit_policy_lru_changed(); mglru = true;
-    int old_flushes = flushes;
-    hermit_policy_observe(&base[0], &vma, addr(0), false, true);
-    hermit_policy_observe(&base[1], &vma, addr(2000), false, true);
-    assert(flushes == old_flushes && st->nr == 4 && !policy_lookup(st, addr(2000)));
-    hermit_policy_hint(&base[0], &hint); assert(!hint.cold && !hint.mglru);
-    mglru = false; hermit_policy_lru_changed();
-    hermit_policy_hint(&base[0], &hint); assert(!hint.cold);
-    clock_ns += 2 * NSEC_PER_MSEC;
-    hermit_policy_observe(&base[0], &vma, addr(0), false, true);
-    assert(policy_lookup(st, addr(0))->empty == 0);
-    hermit_policy_hint(&base[0], &hint); assert(!hint.cold);
-    clock_ns += 2 * NSEC_PER_MSEC;
-    hermit_policy_observe(&base[0], &vma, addr(0), false, true);
-    hermit_policy_hint(&base[0], &hint); assert(hint.cold);
-    /* A fifth base page still evicts normally through the LRU. */
-    struct folio extra = { .pfn = 200, .anon = true, .mapcount = 1 };
-    hermit_policy_observe(&extra, &vma, addr(4), false, true);
-    assert(st->nr == 4 && evicted_pages.counter == 1);
-    /* Observation off: nothing is touched. */
-    long before = invalid_epochs.counter;
-    policy_features &= ~HERMIT_POLICY_OBSERVE;
-    hermit_policy_observe(&huge, &vma, addr(2000), false, true);
-    assert(invalid_epochs.counter == before);
-    hermit_policy_mm_exit(&mm);
-    assert(live == 0);
-    /* Native MGLRU selection can batch first-eviction pages without a
-     * pre-existing PTE observation. Generic reclaim cannot manufacture it. */
-    policy_features = HERMIT_POLICY_DEFAULT;
-    mglru = true; mapped_addr = addr(0);
-    hermit_policy_observe(&base[0], &vma, addr(0), false, true);
-    assert(!mm.hermit_policy && live == 0);
-    hermit_policy_eviction(&base[0], &hint, false);
-    assert(!hint.owner && !hint.mglru && !mm.hermit_policy);
-    hermit_policy_eviction(&base[0], &hint, true);
-    st = mm.hermit_policy;
-    assert(hint.mglru && !hint.cold && hint.owner == st->id);
+    unsigned int locks_before = locks;
+    hermit_policy_eviction(&base, &hint);
+    struct hermit_policy_state *st = mm.hermit_policy;
+    assert(st && hint.owner == st->id && live == 1 && locks == locks_before);
     assert(hint.start == vma.vm_start && hint.end == vma.vm_end);
     assert(hint.address == addr(0) && hint.generation == 1);
-    /* MGLRU eviction builds the batch key from the VMA: no table entry and
-     * no ghost. The swap shadow, read by do_swap_page(), reports refaults. */
-    assert(!policy_lookup(st, addr(0)) && st->nr == 0 && mglru_candidates.counter == 1);
+    assert(mglru_candidates.counter == 1);
+
+    /* The swap shadow supplies refault evidence via the fault context. */
     struct vm_fault vmf = { .vma = &vma, .address = addr(0), .hermit_fault_pc = 1234 };
-    clock_ns += 100;
-    hermit_policy_installed(&vmf, 500, addr(0), 1);
-    assert(refault_pages.counter == 0 && st->refault == 0 && st->nr == 0);
+    hermit_policy_installed(&vmf, addr(0), 1);
+    assert(refault_pages.counter == 0 && st->refault == 0);
     vmf.hermit_refault = true; clock_ns += 100;
-    hermit_policy_installed(&vmf, 501, addr(0), 1);
-    assert(refault_pages.counter == 1 && st->refault == 128 && st->nr == 0);
-    /* PEBS samples feed only negative-observation evidence: under MGLRU
-     * they take no lock and touch no counter; classic LRU still records. */
-    unsigned int locks_before = locks;
-    long late_before = late_samples.counter;
-    hermit_policy_sample(&mm, addr(7), clock_ns);
-    assert(locks == locks_before && late_samples.counter == late_before);
-    mglru = false;
-    hermit_policy_sample(&mm, addr(7), clock_ns);
-    assert(locks == locks_before + 1 && late_samples.counter == late_before + 1);
-    mglru = true;
-    /* Large/shared/KSM/file pages and notifier mappings remain excluded. */
+    hermit_policy_installed(&vmf, addr(0), 1);
+    assert(refault_pages.counter == 1 && st->refault == 128);
+
+    /* Exclude large, shared, KSM and file folios before walking rmap. */
     unsigned int before_walks = walks;
-    hermit_policy_eviction(&huge, &hint, true); assert(!hint.mglru && !hint.owner);
-    hermit_policy_eviction(&shared, &hint, true); assert(!hint.mglru && !hint.owner);
-    struct folio rejected = base[0]; rejected.ksm = true;
-    hermit_policy_eviction(&rejected, &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&huge, &hint); assert(!hint.owner);
+    hermit_policy_eviction(&shared, &hint); assert(!hint.owner);
+    struct folio rejected = base; rejected.ksm = true;
+    hermit_policy_eviction(&rejected, &hint); assert(!hint.owner);
     rejected.ksm = false; rejected.anon = false;
-    hermit_policy_eviction(&rejected, &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&rejected, &hint); assert(!hint.owner);
     assert(walks == before_walks);
     notifier = true;
-    hermit_policy_eviction(&base[0], &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&base, &hint); assert(!hint.owner);
     notifier = false; contended = true;
-    hermit_policy_eviction(&base[0], &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&base, &hint); assert(!hint.owner);
     contended = false; mappings = 0;
-    hermit_policy_eviction(&base[0], &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&base, &hint); assert(!hint.owner);
     mappings = 2;
-    hermit_policy_eviction(&base[0], &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&base, &hint); assert(!hint.owner);
     mappings = 1;
     assert(mglru_candidates.counter == 1);
-    /* In-flight provenance survives disabling MGLRU after isolation. */
-    mglru = false; hermit_policy_lru_changed(); mm.hermit_vma_generation.counter++;
-    hermit_policy_eviction(&base[0], &hint, true);
-    assert(hint.mglru && !hint.cold && hint.generation == 2);
-    policy_features &= ~HERMIT_POLICY_MGLRU;
-    hermit_policy_eviction(&base[0], &hint, true); assert(!hint.mglru);
-    policy_features |= HERMIT_POLICY_MGLRU;
+
+    mm.hermit_vma_generation.counter++;
+    hermit_policy_eviction(&base, &hint);
+    assert(hint.owner == st->id && hint.generation == 2);
     hermit_pebs_enabled = 0;
-    hermit_policy_eviction(&base[0], &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&base, &hint); assert(!hint.owner);
     hermit_pebs_enabled = 1; hermit_pebs_all = 0;
-    hermit_policy_eviction(&base[0], &hint, true); assert(!hint.mglru && !hint.owner);
+    hermit_policy_eviction(&base, &hint); assert(!hint.owner);
     hermit_pebs_all = 1;
     hermit_policy_mm_exit(&mm);
     fail_alloc = true;
-    hermit_policy_eviction(&base[0], &hint, true);
-    assert(!hint.mglru && !hint.owner && !mm.hermit_policy && live == 0);
-    puts("Cold observation and MGLRU cooperation tests: PASS");
+    hermit_policy_eviction(&base, &hint);
+    assert(!hint.owner && !mm.hermit_policy && live == 0);
+    puts("MGLRU batch key and refault feedback tests: PASS");
     stream_tests();
     assert(live == 0);
     puts("Set-associative stream state tests: PASS");
     fit_tests();
     assert(live == 0);
     puts("Run-length fit tests: PASS");
+    medium_tests();
+    assert(live == 0);
+    puts("Fit-driven medium-order tests: PASS");
+    fitstart_tests();
+    assert(live == 0);
+    puts("Fit-sized first batch and PTE-batch gate tests: PASS");
 }
 '''
     exit_start = source.index('void hermit_policy_mm_exit(')
-    exit_end = source.index('/* The first seven fields', exit_start)
+    exit_end = source.index('static int policy_stats_show(', exit_start)
     hint_start = source.index('struct hint_walk {')
-    hint_end = source.index('struct policy_rank {', hint_start)
-    # The first slice now ends where this one begins, so hermit_policy_sample()
-    # is compiled too.
+    hint_end = source.index('unsigned long hermit_policy_reserve(', hint_start)
     installed_start = end
-    # Through hermit_policy_predict(), so run-length feedback is exercised end to end.
-    installed_end = source.index('bool hermit_policy_large(', installed_start)
+    # Through hermit_policy_predict() and the Phase B order suggestion, so
+    # run-length feedback and fit stability are exercised end to end.
+    installed_end = source.index('/* Record one page read speculatively', installed_start)
     header = (root / 'linux-stable/include/linux/hermit_policy.h').read_text()
-    hint_struct = header[header.index('struct hermit_reclaim_hint {'):header.index('/* debugfs')]
-    with tempfile.TemporaryDirectory(prefix='hermit-observe-test-') as tmp:
+    hint_struct = header[header.index('enum swapin_extent {'):header.index('#ifdef CONFIG_HERMIT')]
+    with tempfile.TemporaryDirectory(prefix='hermit-mglru-test-') as tmp:
         cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
         cfile.write_text(harness + hint_struct + source[start:end] +
                         source[installed_start:installed_end] + source[hint_start:hint_end] +
@@ -989,6 +1449,67 @@ int main(void)
                         '-fsanitize=address,undefined', '-g',
                         '-I', str(root / 'linux-stable/tools/include'),
                         str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+def test_mglru_runtime_guard():
+    root = Path(__file__).resolve().parents[3] / 'linux-stable'
+    kconfig = (root / 'mm/Kconfig').read_text().split('config HERMIT\n', 1)[1]
+    hermit = kconfig.split('\thelp', 1)[0]
+    assert '\tselect LRU_GEN\n' in hermit
+    assert '\tselect LRU_GEN_ENABLED\n' in hermit
+    vmscan = (root / 'mm/vmscan.c').read_text()
+    start = vmscan.index('static ssize_t enabled_store(')
+    store = vmscan[start:vmscan.index('\n}\n', start) + 3]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <sys/types.h>
+struct kobject;
+struct kobj_attribute;
+#define CONFIG_HERMIT hermit
+#define IS_ENABLED(x) (x)
+#define BIT(i) (1U << (i))
+enum { LRU_GEN_CORE, LRU_GEN_MM_WALK, LRU_GEN_NONLEAF_YOUNG, NR_LRU_GEN_CAPS };
+static bool hermit = true;
+static bool lru_gen_caps[] = { true, true, true };
+#define static_branch_enable(p) (*(p) = true)
+#define static_branch_disable(p) (*(p) = false)
+static void lru_gen_change_state(bool enabled) { lru_gen_caps[LRU_GEN_CORE] = enabled; }
+static int kstrtouint(const char *str, int base, unsigned int *val)
+{
+    char *end;
+    *val = strtoul(str, &end, base);
+    return end == str || (*end != '\n' && *end != '\0');
+}
+'''
+    tests = r'''
+int main(void)
+{
+    assert(enabled_store(NULL, NULL, "n", 1) == -EPERM);
+    assert(enabled_store(NULL, NULL, "0", 1) == -EPERM);
+    assert(enabled_store(NULL, NULL, "0x6", 3) == -EPERM);
+    assert(lru_gen_caps[0] && lru_gen_caps[1] && lru_gen_caps[2]);
+    assert(enabled_store(NULL, NULL, "0x1", 3) == 3);
+    assert(lru_gen_caps[0] && !lru_gen_caps[1] && !lru_gen_caps[2]);
+    assert(enabled_store(NULL, NULL, "0x6", 3) == -EPERM);
+    assert(lru_gen_caps[0] && !lru_gen_caps[1] && !lru_gen_caps[2]);
+    assert(enabled_store(NULL, NULL, "Y", 1) == 1);
+    assert(lru_gen_caps[0] && lru_gen_caps[1] && lru_gen_caps[2]);
+    hermit = false;
+    assert(enabled_store(NULL, NULL, "n", 1) == 1);
+    assert(!lru_gen_caps[0] && !lru_gen_caps[1] && !lru_gen_caps[2]);
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='hermit-mglru-guard-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + store + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
+                        '-Werror', '-Wno-unused-parameter', str(cfile), '-o', str(binary)],
+                       check=True)
         subprocess.run([str(binary)], check=True)
 
 
@@ -1046,12 +1567,1150 @@ int main(void)
                         '-fsanitize=address,undefined', '-g', str(cfile), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
+def test_swapin_cost():
+    """Per-order swap-in cost counters and the prefetch-hit set."""
+    root = Path(__file__).resolve().parents[3]
+    stats = (root / 'linux-stable/mm/hermit_stats.c').read_text()
+    policy = (root / 'linux-stable/mm/hermit_policy.c').read_text()
+    counters = stats[stats.index('struct hermit_time_stat {'):
+                     stats.index('static const char * const hermit_counter_names')]
+    reset = stats[stats.index('void hermit_stats_reset(void)'):
+                  stats.index('void hermit_stats_report(void)')]
+    prefetch = policy[policy.index('/* Record one page read speculatively'):
+                      policy.index('struct hint_walk {')]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef uint64_t u64;
+#define HERMIT_COST_ORDERS 10
+#define HMT_STAT_NR 1
+#define HMT_LAT_NR 1
+#define POLICY_TTL 1000ULL
+#define POLICY_PREFETCH_BITS 8
+#define POLICY_PREFETCH_SLOTS (1U << POLICY_PREFETCH_BITS)
+typedef struct { long long counter; } atomic64_t;
+typedef struct { long counter; } atomic_long_t;
+#define atomic64_add(v, p) ((p)->counter += (long long)(v))
+#define atomic64_inc(p) ((p)->counter++)
+#define atomic64_read(p) ((p)->counter)
+#define atomic64_set(p, v) ((p)->counter = (long long)(v))
+#define atomic_long_set(p, v) ((p)->counter = (long)(v))
+static atomic_long_t hermit_counters[HMT_STAT_NR];
+#define DEFINE_STATIC_KEY_FALSE(name) static int name##_defined __attribute__((unused))
+/* The lock is a real counter so the tests can prove the set is entered once. */
+typedef int spinlock_t;
+static unsigned int lock_depth;
+#define spin_lock_irqsave(p, flags) do { assert(!(*(p))++); flags = 0; lock_depth++; } while (0)
+#define spin_unlock_irqrestore(p, flags) do { assert((*(p))-- == 1); (void)(flags); lock_depth--; } while (0)
+static unsigned long policy_hash(unsigned long v, unsigned int bits)
+{ return ((v * 0x61c8864680b583ebUL) >> (64 - bits)) & ((1U << bits) - 1); }
+#define hash_long(v, bits) policy_hash((v), (bits))
+static u64 clock_ns = 5000;
+static u64 ktime_get_ns(void) { return clock_ns; }
+struct hermit_policy_state {
+    spinlock_t lock;
+    unsigned int nr, refault;
+    u64 id;
+    struct {
+        unsigned long entry;
+        u64 time;
+    } prefetch[POLICY_PREFETCH_SLOTS];
+};
+struct mm_struct { struct hermit_policy_state *hermit_policy; };
+#define READ_ONCE(x) (x)
+'''
+    # Declared after the extracted struct: hermit_stats_reset() resets it.
+    mid = r'''
+static struct hermit_time_stat hermit_latencies[HMT_LAT_NR];
+'''
+    tests = r'''
+static struct hermit_policy_state state;
+static struct mm_struct mm;
+
+int main(void)
+{
+    unsigned int i;
+
+    /* Per-order counters: out-of-range orders are ignored, reset clears. */
+    hermit_swapin_cost_add(0, 1000);
+    hermit_swapin_cost_add(0, 500);
+    hermit_swapin_cost_add(4, 7000);
+    hermit_swapin_cost_add(9, 1);
+    hermit_swapin_cost_add(HERMIT_COST_ORDERS, 42);
+    assert(atomic64_read(&hermit_swapin_cost[0].count) == 2);
+    assert(atomic64_read(&hermit_swapin_cost[0].total_ns) == 1500);
+    assert(atomic64_read(&hermit_swapin_cost[4].count) == 1);
+    assert(atomic64_read(&hermit_swapin_cost[4].total_ns) == 7000);
+    assert(atomic64_read(&hermit_swapin_cost[9].count) == 1);
+    for (i = 1; i < HERMIT_COST_ORDERS; i++)
+        if (i != 4 && i != 9)
+            assert(atomic64_read(&hermit_swapin_cost[i].count) == 0);
+    hermit_swapin_cost_prefetched(7);
+    hermit_swapin_cost_hit(200);
+    hermit_swapin_cost_hit(300);
+    assert(atomic64_read(&hermit_prefetched_pages) == 7);
+    assert(atomic64_read(&hermit_prefetch_hits) == 2);
+    assert(atomic64_read(&hermit_prefetch_hit_ns) == 500);
+    hermit_stats_reset();
+    assert(atomic64_read(&hermit_swapin_cost[0].count) == 0);
+    assert(atomic64_read(&hermit_swapin_cost[4].total_ns) == 0);
+    assert(atomic64_read(&hermit_prefetched_pages) == 0);
+    assert(atomic64_read(&hermit_prefetch_hits) == 0);
+    assert(atomic64_read(&hermit_prefetch_hit_ns) == 0);
+
+    /* Prefetch set: a recorded entry is consumed by exactly one hit. */
+    memset(&state, 0, sizeof(state));
+    mm.hermit_policy = &state;
+    hermit_policy_prefetched(&mm, 0x1234);
+    assert(lock_depth == 0);
+    assert(hermit_policy_prefetch_hit(&mm, 0x1234));
+    assert(!hermit_policy_prefetch_hit(&mm, 0x1234));
+    /* An unrelated entry is never a hit. */
+    hermit_policy_prefetched(&mm, 0x2000);
+    assert(!hermit_policy_prefetch_hit(&mm, 0x2001));
+    assert(hermit_policy_prefetch_hit(&mm, 0x2000));
+    /* Expired entries are ignored. */
+    hermit_policy_prefetched(&mm, 0x3000);
+    clock_ns += POLICY_TTL;
+    assert(!hermit_policy_prefetch_hit(&mm, 0x3000));
+    /* Direct-mapped collisions keep the newest entry only, and a miss for the
+     * evicted one is harmless: it is a lost hit count, never a policy input. */
+    clock_ns += POLICY_TTL;
+    hermit_policy_prefetched(&mm, 0x4100);
+    hermit_policy_prefetched(&mm, 0x4100 + (1UL << (64 - POLICY_PREFETCH_BITS)) * 0);
+    assert(hermit_policy_prefetch_hit(&mm, 0x4100));
+    assert(lock_depth == 0);
+    /* No per-mm state: the instrumentation is a no-op. */
+    mm.hermit_policy = NULL;
+    hermit_policy_prefetched(&mm, 0x5555);
+    assert(!hermit_policy_prefetch_hit(&mm, 0x5555));
+    /* The unrelated counter arrays stay untouched by the cost table. */
+    assert(hermit_counters[0].counter == 0);
+    assert(hermit_latencies[0].count.counter == 0);
+    puts("swap-in cost instrumentation tests: PASS");
+
+    return 0;
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='hermit-cost-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + counters + mid + reset + prefetch + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                        '-Wno-unused-parameter', '-fsanitize=address,undefined', '-g',
+                        str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+def test_pte_batch_install():
+    """Production batch PTE install: revalidation, folio checks, counters."""
+    root = Path(__file__).resolve().parents[3]
+    source = (root / 'linux-stable/mm/memory.c').read_text()
+    start = source.index('static unsigned int hermit_batch_ptes(')
+    end = source.index('\n/*\n * Direct-bypass variant of hermit_batch_ptes(', start)
+    adc = (root / 'linux-stable/include/linux/hermit_adc.h').read_text()
+    timing = adc[adc.index('enum hermit_adc_stage {'):adc.index('/* Each invocation')]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint64_t u64;
+static u64 clock_reads, tick_reads;
+#define DECLARE_STATIC_KEY_FALSE(key) static bool key
+#define static_branch_unlikely(key) (*(key))
+#define ktime_get_ns() (++clock_reads)
+#define boot_cpu_has(feature) true
+#define check_tsc_unstable() false
+#define rdtsc_ordered() (++tick_reads * 2)
+#define barrier() ((void)0)
+#define PAGE_SHIFT 12
+#define PAGE_SIZE 4096UL
+#define PAGE_MASK (~(PAGE_SIZE - 1))
+#define PMD_SIZE (1UL << 21)
+#define PMD_MASK (~(PMD_SIZE - 1))
+#define VM_WRITE 0x2UL
+#define SWP_STABLE_WRITES 0x8UL
+#define FAULT_FLAG_WRITE 0x1U
+#define FAULT_FLAG_VMA_LOCK 0x800U
+#define MM_ANONPAGES 2
+#define MM_SWAPENTS 3
+#define RMAP_NONE 0
+#define RMAP_EXCLUSIVE 1
+#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define unlikely(x) (x)
+#define data_race(x) (x)
+#define BUG_ON(x) assert(!(x))
+/* Swap PTE: bit 63 tags swap, bits 40..47 encode the type, bits 8..39
+ * encode the offset, and the low byte carries per-PTE flags.
+ */
+#define SWAP_TYPE 3U
+#define SPECIAL_SWAP_TYPE 32U
+typedef struct { unsigned long v; } pte_t;
+typedef struct { unsigned long val; } swp_entry_t;
+/* Present-PTE markers, clear of the swap entry encoding in bits 0..39. */
+#define PTE_PRESENT (1UL << 62)
+#define PTE_WRITE (1UL << 61)
+#define PTE_YOUNG (1UL << 60)
+#define PTE_SOFT (1UL << 59)
+#define PTE_UFFD (1UL << 58)
+struct page { unsigned long pfn; bool poisoned; };
+struct folio { struct page page; unsigned int order; int refs;
+	unsigned long rmap_addr;
+	bool locked, uptodate, ksm, anon, mappedtodisk, writeback, dropped; };
+struct mm_struct { int unused; };
+struct swap_info_struct { unsigned long flags; signed char type; };
+typedef int rmap_t;
+struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end, vm_flags;
+	unsigned long vm_page_prot; void *anon_vma; };
+struct vm_fault { struct vm_area_struct *vma; unsigned int flags;
+	unsigned long address, hermit_fault_pc; unsigned int hermit_batch_pages; };
+
+static pte_t ptes[512];
+static unsigned long base = 0x40000000UL;
+static struct folio folios[16];
+static bool registered[16];
+static bool policy_ok, policy_called, uffd;
+static unsigned int installed_pages, skipped_pages, folio_puts, unlocks, set_calls, frees;
+static unsigned int swap_frees, anon_delta, swpent_delta, rmap_exclusive, icache;
+static unsigned int mkwrite, mkuffd, mksoft, free_swap_calls;
+static unsigned int arch_updates, mmu_updates, cache_lookups;
+static bool free_swap_result;
+
+static pte_t typed_swap_pte(unsigned int type, unsigned int off, unsigned int extra)
+{ return (pte_t){ (1UL << 63) | ((unsigned long)type << 40) | ((unsigned long)off << 8) | extra }; }
+static pte_t swap_pte(unsigned int off, unsigned int extra)
+{ return typed_swap_pte(SWAP_TYPE, off, extra); }
+static bool is_swap_pte(pte_t p) { return p.v && !(p.v & PTE_PRESENT); }
+static swp_entry_t pte_to_swp_entry(pte_t p)
+{
+	assert(is_swap_pte(p));
+	return (swp_entry_t){ (p.v >> 8) & 0xffffffffffUL };
+}
+static unsigned int swp_type(swp_entry_t e) { return e.val >> 32; }
+static bool non_swap_entry(swp_entry_t e) { return swp_type(e) >= SPECIAL_SWAP_TYPE; }
+static bool pte_same(pte_t a, pte_t b) { return a.v == b.v; }
+static pte_t ptep_get(pte_t *p) { return *p; }
+static unsigned long pmd_addr_end(unsigned long addr, unsigned long end)
+{
+	unsigned long boundary = (addr + PMD_SIZE) & PMD_MASK;
+
+	return boundary < end ? boundary : end;
+}
+static bool userfaultfd_armed(struct vm_area_struct *vma)
+{ (void)vma; return uffd; }
+static bool hermit_policy_pte_install(struct vm_fault *vmf, unsigned int pages)
+{ (void)vmf; policy_called = true; assert(pages >= 2); return policy_ok; }
+static void hermit_policy_pte_installed(unsigned int pages) { installed_pages += pages; }
+static void hermit_policy_pte_skipped(unsigned int pages) { skipped_pages += pages; }
+static struct folio *swap_cache_get_folio(swp_entry_t e)
+{
+	unsigned int off = (uint32_t)e.val;
+
+	cache_lookups++;
+	assert(swp_type(e) == SWAP_TYPE && off < 16);
+
+	if (!registered[off])
+		return NULL;
+	folios[off].refs++;
+	return &folios[off];
+}
+static unsigned int folio_order(struct folio *f) { return f->order; }
+static bool folio_test_uptodate(struct folio *f) { return f->uptodate; }
+static bool folio_test_ksm(struct folio *f) { return f->ksm; }
+static bool folio_test_anon(struct folio *f) { return f->anon; }
+static bool folio_test_mappedtodisk(struct folio *f) { return f->mappedtodisk; }
+static bool folio_test_writeback(struct folio *f) { return f->writeback; }
+static bool folio_trylock(struct folio *f)
+{ if (f->locked) return false; f->locked = true; return true; }
+static void folio_unlock(struct folio *f) { assert(f->locked); f->locked = false; unlocks++; }
+static void folio_put(struct folio *f) { f->refs--; folio_puts++; }
+/* Reclaim may drop the folio from swapcache between the lockless lookup and
+ * the trylock; .dropped models that window.
+ */
+static bool folio_matches_swap_entry(const struct folio *f, swp_entry_t e)
+{ assert(f->locked); (void)e; return !f->dropped; }
+static int folio_ref_count(struct folio *f) { return f->refs; }
+static bool PageHWPoison(struct page *p) { return p->poisoned; }
+static unsigned long page_address_in_vma(struct folio *f, struct page *p,
+		struct vm_area_struct *vma)
+{ assert(f->locked && p == &f->page); return f->rmap_addr; }
+static bool PageAnonExclusive(struct page *p) { (void)p; return false; }
+static bool pte_swp_exclusive(pte_t p) { return p.v & 1; }
+static bool pte_swp_soft_dirty(pte_t p) { return p.v & 2; }
+static bool pte_swp_uffd_wp(pte_t p) { return p.v & 4; }
+static swp_entry_t folio_swap(swp_entry_t e, struct folio *f) { (void)f; return e; }
+static void arch_swap_restore(swp_entry_t e, struct folio *f) { (void)e; (void)f; }
+static void swap_free(swp_entry_t e) { (void)e; swap_frees++; }
+static bool should_try_to_free_swap(struct folio *f, struct vm_area_struct *v,
+		unsigned int flags)
+{ (void)f; (void)v; (void)flags; free_swap_calls++; return free_swap_result; }
+static bool folio_free_swap(struct folio *f) { assert(f->locked); f->refs--; frees++; return true; }
+static void add_mm_counter(struct mm_struct *mm, int member, long value)
+{
+	(void)mm;
+	if (member == MM_ANONPAGES) anon_delta += value;
+	if (member == MM_SWAPENTS) swpent_delta += value;
+}
+static pte_t mk_pte(struct page *p, unsigned long prot)
+{ (void)prot; return (pte_t){ PTE_PRESENT | (p->pfn << 20) }; }
+static pte_t pte_mksoft_dirty(pte_t p) { mksoft++; return (pte_t){ p.v | PTE_SOFT }; }
+static pte_t pte_mkuffd_wp(pte_t p) { mkuffd++; return (pte_t){ p.v | PTE_UFFD }; }
+static bool userfaultfd_pte_wp(struct vm_area_struct *v, pte_t p) { (void)v; (void)p; return false; }
+static bool pte_needs_soft_dirty_wp(struct vm_area_struct *v, pte_t p)
+{ (void)v; (void)p; return false; }
+static pte_t pte_mkwrite(pte_t p, struct vm_area_struct *v)
+{ (void)v; mkwrite++; return (pte_t){ p.v | PTE_WRITE }; }
+static pte_t pte_mkyoung(pte_t p) { return (pte_t){ p.v | PTE_YOUNG }; }
+static void flush_icache_pages(struct vm_area_struct *v, struct page *p, unsigned int n)
+{ (void)v; (void)p; (void)n; icache++; }
+static unsigned int new_rmaps;
+static void folio_add_anon_rmap_pte(struct folio *f, struct page *p,
+		struct vm_area_struct *v, unsigned long addr, int flags)
+{
+	(void)p; (void)v; (void)addr; assert(f->anon);
+	rmap_exclusive += !!(flags & RMAP_EXCLUSIVE);
+}
+/* A fresh swapcache page becomes anon here, exactly as in do_swap_page(). */
+static void folio_add_new_anon_rmap(struct folio *f, struct vm_area_struct *v,
+		unsigned long addr, int flags)
+{
+	assert(!f->anon && f->locked && v->anon_vma); (void)addr;
+	f->anon = true; new_rmaps++;
+	rmap_exclusive += !!(flags & RMAP_EXCLUSIVE);
+}
+static void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep, pte_t pte,
+		unsigned int nr)
+{
+	(void)mm; assert(nr == 1); assert((addr & PAGE_MASK) == addr);
+	*ptep = pte; set_calls++;
+}
+static void arch_do_swap_page_nr(struct mm_struct *mm, struct vm_area_struct *vma,
+		unsigned long addr, pte_t pte, pte_t old, int nr)
+{
+	unsigned long pfn = (pte.v & ((1UL << 40) - 1)) >> 20;
+	unsigned long off = (pfn - 5000) / 3;
+	unsigned int i = ++arch_updates;
+
+	assert(nr == 1 && off < 16 && folios[off].page.pfn == pfn);
+	assert(folios[off].locked && addr == folios[off].rmap_addr);
+	assert(pte_same(pte, ptes[i]) && pte_same(old, pte));
+}
+static void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+		unsigned long addr, pte_t *ptep, int nr)
+{
+	unsigned int i = ++mmu_updates;
+	assert(nr == 1 && ptep == &ptes[i] && (ptep->v & PTE_PRESENT));
+	assert(addr == vmf->address + i * PAGE_SIZE && arch_updates == i);
+}
+'''
+    tests = r'''
+static unsigned int samples[ADC_STAGE_NR];
+void hermit_adc_record(enum hermit_adc_stage stage, u64 ns, u64 ticks)
+{
+    assert(ns == 1 && ticks == 2);
+    samples[stage]++;
+}
+static struct mm_struct mm;
+static struct swap_info_struct si;
+static struct vm_area_struct vma;
+
+static void reset(void)
+{
+	memset(ptes, 0, sizeof(ptes));
+	memset(folios, 0, sizeof(folios));
+	si = (struct swap_info_struct){ .type = SWAP_TYPE };
+	vma = (struct vm_area_struct){ .vm_mm = &mm, .vm_start = base,
+		.vm_end = base + PMD_SIZE, .vm_flags = VM_WRITE, .anon_vma = &mm };
+	policy_ok = true; policy_called = false; uffd = false; free_swap_result = false;
+	installed_pages = skipped_pages = folio_puts = unlocks = set_calls = frees = 0;
+	swap_frees = anon_delta = swpent_delta = rmap_exclusive = icache = 0;
+	mkwrite = mkuffd = mksoft = free_swap_calls = 0;
+	arch_updates = mmu_updates = cache_lookups = 0;
+	for (unsigned int i = 0; i < 16; i++) {
+		folios[i] = (struct folio){ .page = { .pfn = 5000 + 3 * i }, .order = 0,
+			.rmap_addr = base + i * PAGE_SIZE,
+			.refs = 0, .uptodate = true, .anon = true };
+		registered[i] = true;
+	}
+}
+
+/* A batch of @pages swap entries from offset 0, all with the same markers. */
+static void fill(unsigned int pages, unsigned int extra)
+{
+	for (unsigned int i = 0; i < pages; i++)
+		ptes[i] = swap_pte(i, extra);
+}
+
+static unsigned int run(unsigned int pages)
+{
+	struct vm_fault vmf = { .vma = &vma, .address = base,
+		.hermit_batch_pages = pages };
+
+	return hermit_batch_ptes(&vmf, &si, ptes, base);
+}
+
+int main(void)
+{
+	/* Happy path: three prefetched pages of a four-page batch are mapped,
+	 * young, and the swap entry is released exactly as do_swap_page does it. */
+	reset(); fill(4, 1);
+	for (unsigned int i = 1; i < 4; i++) folios[i].refs = 1;   /* swapcache */
+	assert(run(4) == 3 && policy_called);
+	assert(installed_pages == 3 && skipped_pages == 0);
+	assert(!clock_reads && !tick_reads && !samples[ADC_PTEBATCH_INSTALL]);
+	hermit_adc_key = true;
+	assert(swap_frees == 3 && anon_delta == 3 && swpent_delta == (unsigned int)-3);
+	assert(mkwrite == 3 && rmap_exclusive == 3 && icache == 3);
+	assert(set_calls == 3 && unlocks == 3 && free_swap_calls == 3);
+	assert(arch_updates == 3 && mmu_updates == 3);
+	for (unsigned int i = 1; i < 4; i++) {
+		assert(ptes[i].v & PTE_PRESENT);    /* present */
+		assert(ptes[i].v & PTE_YOUNG);      /* young, never old */
+		assert(ptes[i].v & PTE_WRITE);      /* writable: the PTE said exclusive */
+		/* The swapcache lookup reference became the PTE reference: one
+		 * for the cache and one for the mapping, as in do_swap_page. */
+		assert(folios[i].refs == 2 && !folios[i].locked);
+	}
+	/* A read-only VMA maps the same pages read-only. As in do_swap_page(),
+	 * the rmap is still exclusive; only the PTE is not writable. */
+	reset(); fill(4, 1); vma.vm_flags = 0;
+	for (unsigned int i = 1; i < 4; i++) folios[i].refs = 1;
+	assert(run(4) == 3);
+	assert(mkwrite == 0 && rmap_exclusive == 3);
+	assert(samples[ADC_PTEBATCH_INSTALL] == 1 && !samples[ADC_PTEBATCH_SKIP]);
+	for (unsigned int i = 1; i < 4; i++)
+		assert(!(ptes[i].v & PTE_WRITE) && (ptes[i].v & PTE_YOUNG));
+
+	/* Scattered swap slots keep their own flags and map the right folios. */
+	reset(); fill(4, 7);
+	{
+		const unsigned int offsets[] = { 9, 4, 12 };
+		const unsigned int flags[] = { 1, 2, 4 };
+		const unsigned long markers[] = { PTE_WRITE, PTE_SOFT, PTE_UFFD };
+
+		for (unsigned int i = 0; i < 3; i++) {
+			unsigned int off = offsets[i];
+
+			ptes[i + 1] = swap_pte(off, flags[i]);
+			folios[off].refs = 1;
+			folios[off].rmap_addr = base + (i + 1) * PAGE_SIZE;
+		}
+		assert(run(4) == 3 && installed_pages == 3 && skipped_pages == 0);
+		assert(rmap_exclusive == 1 && swap_frees == 3 && cache_lookups == 3);
+		for (unsigned int i = 0; i < 3; i++)
+			assert(ptes[i + 1].v == (PTE_PRESENT | PTE_YOUNG | markers[i] |
+						(folios[offsets[i]].page.pfn << 20)));
+	}
+
+	/* A rejected PTE leaves the tail untouched, even with a valid next slot. */
+	{
+		const pte_t rejected[] = {
+			typed_swap_pte(SWAP_TYPE + 1, 2, 1),
+			{ 0 }, { PTE_PRESENT }, typed_swap_pte(SPECIAL_SWAP_TYPE, 2, 1),
+		};
+
+		for (unsigned int i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+			reset(); fill(4, 1);
+			ptes[2] = rejected[i];
+			assert(run(4) == 1);
+			assert(installed_pages == 1 && skipped_pages == 2 && swap_frees == 1);
+			assert(cache_lookups == 1 && set_calls == 1);
+			assert(pte_same(ptes[2], rejected[i]) && pte_same(ptes[3], swap_pte(3, 1)));
+		}
+	}
+	assert(samples[ADC_PTEBATCH_INSTALL] == 6 && samples[ADC_PTEBATCH_SKIP] == 4);
+
+	/* A scattered slot can miss swapcache or fail folio revalidation. */
+	for (unsigned int i = 0; i < 2; i++) {
+		reset(); fill(4, 1);
+		ptes[2] = swap_pte(9, 1);
+		folios[9].refs = 1;
+		folios[9].rmap_addr = base + 2 * PAGE_SIZE;
+		folios[9].dropped = true;
+		registered[9] = i != 0;
+		assert(run(4) == 1);
+		assert(installed_pages == 1 && skipped_pages == 2 && swap_frees == 1);
+		assert(cache_lookups == 2 && folio_puts == i && unlocks == 1 + i);
+		assert(folios[9].refs == 1 && !folios[9].locked);
+		assert(pte_same(ptes[2], swap_pte(9, 1)) && pte_same(ptes[3], swap_pte(3, 1)));
+	}
+
+	/* VMA boundary: the batch is clipped, so pages outside it are not counted. */
+	reset(); fill(8, 1);
+	for (unsigned int i = 1; i < 8; i++) folios[i].refs = 1;
+	vma.vm_end = base + 3 * PAGE_SIZE;
+	assert(run(8) == 2);
+	assert(installed_pages == 2 && skipped_pages == 0);
+	/* PMD boundary, same rule inside a 2 MiB region. */
+	reset(); fill(8, 1);
+	for (unsigned int i = 1; i < 8; i++) folios[i].refs = 1;
+	{
+		struct vm_fault vmf = { .vma = &vma,
+			.address = base + PMD_SIZE - 2 * PAGE_SIZE,
+			.hermit_batch_pages = 8 };
+
+		ptes[0] = swap_pte(0, 1); ptes[1] = swap_pte(1, 1);
+		ptes[2] = swap_pte(2, 1);
+		vma.vm_end = base + 2 * PMD_SIZE;
+		folios[1].rmap_addr = vmf.address + PAGE_SIZE;
+		assert(hermit_batch_ptes(&vmf, &si, ptes, vmf.address) == 1);
+	}
+
+	/* A folio that is not uptodate, not in swapcache, not order 0, not anon,
+	 * KSM, or locked cannot be mapped. */
+	reset(); fill(4, 1);
+	for (unsigned int i = 1; i < 4; i++) folios[i].refs = 1;
+	folios[1].uptodate = false;
+	assert(run(4) == 0 && skipped_pages == 3 && swap_frees == 0);
+	assert(folio_puts == 1 && unlocks == 1 && !folios[1].locked);
+	reset(); fill(4, 1); registered[1] = false;
+	assert(run(4) == 0 && skipped_pages == 3 && folio_puts == 0);
+	reset(); fill(4, 1); folios[1].order = 2;  /* a large folio maps too much */
+	assert(run(4) == 0 && skipped_pages == 3);
+	/* A freshly read, not-yet-anon page is mapped with a new anon rmap... */
+	reset(); fill(4, 1); for (unsigned int i = 1; i < 4; i++) folios[i].anon = false;
+	new_rmaps = 0;
+	assert(run(4) == 3 && installed_pages == 3 && new_rmaps == 3);
+	assert(folios[1].anon && folios[3].anon);
+	/* ...but only if the VMA already has an anon_vma, and never a file page. */
+	reset(); fill(4, 1); folios[1].anon = false; vma.anon_vma = NULL;
+	assert(run(4) == 0 && skipped_pages == 3);
+	reset(); fill(4, 1); folios[1].anon = false; folios[1].mappedtodisk = true;
+	assert(run(4) == 0 && skipped_pages == 3);
+	reset(); fill(4, 1); folios[1].ksm = true;
+	assert(run(4) == 0 && skipped_pages == 3);
+	reset(); fill(4, 1);
+	folios[1].refs = 1; folios[1].locked = true;   /* someone else owns it */
+	assert(run(4) == 0 && skipped_pages == 3 && folio_puts == 1);
+	/* Removed from swapcache after the lookup: unlocked, put, nothing mapped. */
+	reset(); fill(4, 1);
+	folios[1].refs = 1; folios[1].dropped = true;
+	assert(run(4) == 0 && skipped_pages == 3 && swap_frees == 0);
+	assert(folio_puts == 1 && unlocks == 1 && !folios[1].locked);
+
+	reset(); fill(4, 1); folios[1].page.poisoned = true;
+	assert(run(4) == 0 && skipped_pages == 3 && !swap_frees);
+	reset(); fill(4, 1); folios[1].rmap_addr = base;
+	assert(run(4) == 0 && skipped_pages == 3 && !swap_frees);
+
+	/* The policy gate, uffd and a single-page batch install
+	 * nothing and touch no PTE. */
+	reset(); fill(4, 1); policy_ok = false;
+	assert(run(4) == 0 && installed_pages == 0 && skipped_pages == 0);
+	assert(swap_frees == 0 && mksoft == 0);
+	reset(); fill(4, 1); uffd = true;
+	assert(run(4) == 0 && !policy_called); uffd = false;
+	reset(); fill(4, 1);
+	{
+		struct vm_fault vmf = { .vma = &vma, .address = base,
+			.hermit_batch_pages = 4, .flags = FAULT_FLAG_VMA_LOCK };
+
+		assert(hermit_batch_ptes(&vmf, &si, ptes, base) == 3);
+		assert(policy_called && arch_updates == 3 && mmu_updates == 3);
+		reset(); fill(4, 1);
+		vmf.flags = 0; vmf.hermit_batch_pages = 1;
+		assert(hermit_batch_ptes(&vmf, &si, ptes, base) == 0);
+		assert(!policy_called);
+	}
+
+	/* Soft-dirty and uffd-wp markers survive (bits 1 and 2 of the swap PTE). */
+	reset(); fill(4, 7);
+	for (unsigned int i = 1; i < 4; i++) folios[i].refs = 1;
+	assert(run(4) == 3);
+	assert(mksoft == 3 && mkuffd == 3 && rmap_exclusive == 3);
+	for (unsigned int i = 1; i < 4; i++)
+		assert((ptes[i].v & PTE_SOFT) && (ptes[i].v & PTE_UFFD));
+
+	/* Freeing the swapcache (last user) is taken from do_swap_page: the cache
+	 * reference goes away and the page becomes exclusive. */
+	reset(); fill(2, 0);
+	folios[1].refs = 1; free_swap_result = true;
+	assert(run(2) == 1);
+	assert(frees == 1 && mkwrite == 1 && rmap_exclusive == 1);
+	assert(folios[1].refs == 1);            /* the PTE reference */
+	/* Without the PTE exclusive bit and with another user, the page stays
+	 * read-only and the swapcache is kept. */
+	reset(); fill(2, 0); folios[1].refs = 2;
+	assert(run(2) == 1 && frees == 0 && mkwrite == 0 && rmap_exclusive == 0);
+
+	/* A backend that cannot take concurrent writes under writeback drops
+	 * exclusivity even though the PTE says so. */
+	reset(); fill(2, 1);
+	folios[1].refs = 2; folios[1].writeback = true;
+	si.flags = SWP_STABLE_WRITES;
+	assert(run(2) == 1 && mkwrite == 0 && rmap_exclusive == 0);
+	struct hermit_adc_interval medium = hermit_adc_begin(ADC_TOTAL_PF);
+	medium.subtype = ADC_MEDIUM_SWAPIN;
+	hermit_adc_finish(&medium);
+	assert(samples[ADC_TOTAL_PF] == 1 && samples[ADC_MEDIUM_SWAPIN] == 1);
+	assert(samples[ADC_SWAP_MAJOR] == 1 && !samples[ADC_SWAP_MINOR]);
+	puts("Batch PTE install and ADC accounting tests: PASS");
+	return 0;
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='hermit-ptebatch-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + timing + source[start:end] + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
+                        '-Werror', '-Wno-unused-parameter', '-Wno-unused-function',
+                        '-fsanitize=address,undefined', '-g',
+                        str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+def test_split_select():
+    """Hot subrange / split order selection over synthetic heat histograms."""
+    ROOT = Path(__file__).resolve().parents[3]
+    source = (ROOT / 'linux-stable/mm/hermit_split.c').read_text()
+    start = source.index('/* hermit_split:begin pure */')
+    end = source.index('/* hermit_split:end pure */')
+    min_samples = next(line for line in source.splitlines()
+                       if line.startswith('static u32 hermit_split_min_samples ='))
+    function = min_samples + '\n' + source[start:end]
+    harness = r"""
+    #include <assert.h>
+    #include <stdbool.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <string.h>
+    typedef uint8_t u8;
+    typedef uint32_t u32;
+    #define U8_MAX 255
+    #define test_bit(nr, addr) \
+        (!!(((const unsigned long *)(addr))[(nr) / 64] & (1UL << ((nr) % 64))))
+    """
+    tests = r"""
+    #define NR 512
+    static unsigned long young[NR / 64];
+    static u8 heat[NR];
+    static struct hermit_split_rule rule = {
+        .hot_cov = 80, .hot_pct = 75, .min_cold = 25,
+    };
+    static unsigned int order;
+
+    static int pick(void)
+    {
+        order = 99;
+        return hermit_split_select(heat, NR, 9, young, &rule, &order);
+    }
+
+    static void reset(void)
+    {
+        memset(heat, 0, sizeof(heat));
+        memset(young, 0, sizeof(young));
+    }
+
+    static void set_young(unsigned int page)
+    {
+        young[page / 64] |= 1UL << (page % 64);
+    }
+
+    static void hot(unsigned int from, unsigned int nr, u8 count)
+    {
+        for (unsigned int i = 0; i < nr; i++)
+            heat[from + i] = count;
+    }
+
+    int main(void)
+    {
+        rule.min_samples = hermit_split_min_samples;
+        assert(rule.min_samples == 4);
+        /* An 8-page (32 KiB) hot block inside a 2 MiB folio is the largest
+         * aligned block that is >=75% hot, so the folio splits to order 3. */
+        reset(); hot(128, 8, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 3);
+        /* One page off the aligned boundary, 7 of the 8 pages of the order-3
+         * block are still hot, which is above the 75% bar. */
+        reset(); hot(129, 8, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 3);
+        /* Two pages inside a 16 KiB block are not enough for any block above
+         * order 0. */
+        reset(); hot(133, 2, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 0);
+        /* 80% coverage: a count-90 page and a count-10 page leave the
+         * count-10 page outside the hot set, so it is not protected. */
+        reset(); hot(0, 1, 90); hot(300, 1, 10);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 0);
+        /* Coverage follows the tail of the histogram: 8 of 10 samples on one
+         * page still leave it alone in the hot set. */
+        reset(); hot(64, 1, 80); hot(65, 1, 20);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 0);
+        /* No samples at all is unknown, never cold. */
+        reset();
+        assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
+        /* Too few samples for the configured evidence threshold. */
+        reset(); hot(128, 3, 1);
+        assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
+        hot(131, 1, 1);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 2);
+        set_young(200);
+        assert(pick() == HERMIT_SPLIT_COLD_YOUNG);
+        rule.min_samples = 16;
+        reset(); hot(128, 15, 1);
+        assert(pick() == HERMIT_SPLIT_FEWSAMPLES);
+        rule.min_samples = hermit_split_min_samples;
+        /* A 256 KiB half is hot: the largest qualifying block is order 8. */
+        reset(); hot(256, 256, 4);
+        assert(pick() == HERMIT_SPLIT_PICK && order == 8);
+        /* Every page hot -> nothing cold to evict. */
+        reset(); hot(0, NR, 7);
+        assert(pick() == HERMIT_SPLIT_ALL_HOT);
+        /* Cold pages below min_cold are not worth a split. */
+        reset(); hot(0, 500, 10);
+        assert(pick() == HERMIT_SPLIT_ALL_HOT);
+        /* A cold subpage that the MMU still marks accessed vetoes the split. */
+        reset(); hot(128, 8, 10);
+        set_young(192);                       /* a cold page */
+        assert(pick() == HERMIT_SPLIT_COLD_YOUNG);
+        /* ... but a young *hot* subpage is expected and harmless. */
+        reset(); hot(128, 8, 10);
+        set_young(128);                       /* a hot page */
+        assert(pick() == HERMIT_SPLIT_PICK && order == 3);
+        /* Order 1 anonymous folios cannot be split, so it is never returned:
+         * an order-2 folio with two hot and two cold pages goes to order 0. */
+        reset(); hot(0, 2, 10);
+        assert(hermit_split_select(heat, 4, 2, young, &rule, &order) ==
+               HERMIT_SPLIT_PICK && order == 0);
+        /* An order-1 folio is never a candidate: the split code does not
+         * support order-1 anonymous folios. */
+        reset(); hot(0, 2, 10);
+        assert(hermit_split_select(heat, 2, 1, young, &rule, &order) ==
+               HERMIT_SPLIT_NO_ORDER);
+        puts("Split selection tests: PASS");
+        return 0;
+    }
+    """
+    with tempfile.TemporaryDirectory(prefix='hermit-split-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + function + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall',
+                        '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                        '-g', str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+def test_heat_decay():
+    """Per-subpage PEBS heat counters: saturating add and halving decay."""
+    ROOT = Path(__file__).resolve().parents[3]
+    source = (ROOT / 'linux-stable/mm/hermit_pebs.c').read_text()
+    start = source.index('/* hermit_heat:begin */')
+    end = source.index('/* hermit_heat:end */')
+    function = source[start:end]
+    harness = r"""
+    #include <assert.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <string.h>
+    #include <time.h>
+    typedef uint8_t u8;
+    typedef uint64_t u64;
+    #define U8_MAX 255
+    #define HERMIT_REGION_NR_SUBPAGES 512
+    #define div_u64(a, b) ((a) / (b))
+    """
+    tests = r"""
+    static u8 heat[HERMIT_REGION_NR_SUBPAGES];
+    static u64 stamp;
+
+    static unsigned int total(void)
+    {
+        unsigned int i, sum = 0;
+
+        for (i = 0; i < HERMIT_REGION_NR_SUBPAGES; i++)
+            sum += heat[i];
+        return sum;
+    }
+
+    int main(void)
+    {
+        /* Counts accumulate per subpage; other subpages are untouched. */
+        memset(heat, 0, sizeof(heat)); stamp = 1000;
+        hermit_heat_add(heat, &stamp, 5, 1000, 1000);
+        hermit_heat_add(heat, &stamp, 5, 1200, 1000);
+        hermit_heat_add(heat, &stamp, 6, 1300, 1000);
+        assert(heat[5] == 2 && heat[6] == 1 && total() == 3);
+        assert(stamp == 1000);
+        /* Saturating counter. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        for (int i = 0; i < 1000; i++)
+            hermit_heat_add(heat, &stamp, 9, 1, 0);
+        assert(heat[9] == U8_MAX);
+        /* One period halves, three periods divide by eight. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        heat[1] = 200;
+        hermit_heat_decay(heat, &stamp, 999, 1000);
+        assert(heat[1] == 200 && stamp == 0);        /* not yet */
+        hermit_heat_decay(heat, &stamp, 1000, 1000);
+        assert(heat[1] == 100 && stamp == 1000);
+        heat[2] = 200;
+        hermit_heat_decay(heat, &stamp, 4000, 1000);
+        assert(heat[1] == 12 && heat[2] == 25 && stamp == 4000);
+        /* A long idle gap collapses to zero instead of shifting forever. */
+        heat[3] = 200;
+        hermit_heat_decay(heat, &stamp, 4000 + 8000, 1000);
+        assert(total() == 0 && stamp == 12000);
+        /* A timestamp from the future is pulled back, never used to decay. */
+        heat[4] = 9; stamp = 5000;
+        hermit_heat_add(heat, &stamp, 4, 4000, 1000);
+        assert(heat[4] == 10 && stamp == 4000);
+        /* Out-of-range subpage index is ignored, a zero period never decays. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        hermit_heat_add(heat, &stamp, HERMIT_REGION_NR_SUBPAGES, 10, 1000);
+        assert(total() == 0);
+        heat[7] = 100;
+        hermit_heat_decay(heat, &stamp, 100000, 0);
+        assert(heat[7] == 100);
+        /* Sample-path cost: the split policy adds one decay check and one
+         * increment per PEBS sample. */
+        memset(heat, 0, sizeof(heat)); stamp = 0;
+        struct timespec a, b;
+        const unsigned int n = 2000000;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        for (unsigned int i = 0; i < n; i++)
+            hermit_heat_add(heat, &stamp, i % HERMIT_REGION_NR_SUBPAGES,
+                            i / 8, 1000000000ULL);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        double ns = ((b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec)) / n;
+        printf("heat add: %.1f ns/sample\n", ns);
+        assert(ns < 1000.0);
+        puts("Heat decay tests: PASS");
+        return 0;
+    }
+    """
+    with tempfile.TemporaryDirectory(prefix='hermit-heat-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + function + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall',
+                        '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                        '-g', str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+def test_split_gates():
+    """Split budget (N per second) and memcg pressure/refault gate."""
+    ROOT = Path(__file__).resolve().parents[3]
+    source = (ROOT / 'linux-stable/mm/hermit_split.c').read_text()
+    budget = source[source.index('/* hermit_split:budget:begin */'):
+                    source.index('/* hermit_split:budget:end */')]
+    pressure = source[source.index('/* hermit_split:pressure:begin */'):
+                      source.index('/* hermit_split:pressure:end */')]
+    harness = r"""
+    #include <assert.h>
+    #include <stdbool.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    typedef uint32_t u32;
+    typedef struct { int counter; } atomic_t;
+    struct page_counter { unsigned long max; unsigned long usage; };
+    struct mem_cgroup { struct page_counter memory; atomic_t hermit_refault; };
+    #define CONFIG_MEMCG 1
+    #define HZ 100
+    #define PAGE_COUNTER_MAX LONG_MAX
+    #define READ_ONCE(x) (x)
+    #define time_after(a, b) ((long)((b) - (a)) < 0)
+    static unsigned long jiffies;
+    static u32 hermit_split_rate;
+    static u32 hermit_split_refault_max = 256;
+    static int atomic_read(atomic_t *v) { return v->counter; }
+    static int atomic_inc_return(atomic_t *v) { return ++v->counter; }
+    static void atomic_set(atomic_t *v, int n) { v->counter = n; }
+    static unsigned long harness_cmpxchg(unsigned long *p, unsigned long old,
+                                         unsigned long n)
+    { unsigned long o = *p; if (o == old) *p = n; return o; }
+    #define cmpxchg(p, o, n) harness_cmpxchg((unsigned long *)(p), (o), (n))
+    static unsigned long page_counter_read(struct page_counter *c)
+    { return c->usage; }
+    #include <limits.h>
+    """
+    tests = r"""
+    int main(void)
+    {
+        /* Two splits per second, then the budget refuses until the window
+         * rolls over. Zero means the policy is disabled. */
+        hermit_split_rate = 2; jiffies = 10 * HZ;
+        assert(hermit_split_budget());
+        assert(hermit_split_budget());
+        assert(!hermit_split_budget());
+        assert(!hermit_split_budget());
+        jiffies += HZ - 1;            /* still the same 1 s window */
+        assert(!hermit_split_budget());
+        jiffies += 2;                 /* the window expires strictly after 1 s */
+        assert(hermit_split_budget());
+        assert(hermit_split_budget());
+        assert(!hermit_split_budget());
+        hermit_split_rate = 0; jiffies += 10 * HZ;
+        assert(!hermit_split_budget());
+
+        /* No memcg (global reclaim) is always allowed. */
+        assert(hermit_split_under_pressure(NULL));
+        struct mem_cgroup memcg = {0};
+        /* Root memcg: no limit, so the refault score decides. */
+        memcg.memory.max = PAGE_COUNTER_MAX;
+        memcg.hermit_refault.counter = 0;
+        assert(hermit_split_under_pressure(&memcg));
+        memcg.hermit_refault.counter = 256;
+        assert(!hermit_split_under_pressure(&memcg));
+        memcg.hermit_refault.counter = 255;
+        assert(hermit_split_under_pressure(&memcg));
+        /* Near the limit, a high refault score no longer blocks the split. */
+        memcg.memory.max = 1000; memcg.memory.usage = 750;
+        memcg.hermit_refault.counter = 4096;
+        assert(hermit_split_under_pressure(&memcg));
+        memcg.memory.usage = 749;
+        assert(!hermit_split_under_pressure(&memcg));
+        memcg.memory.usage = 1000;
+        assert(hermit_split_under_pressure(&memcg));
+        puts("Split gate tests: PASS");
+        return 0;
+    }
+    """
+    with tempfile.TemporaryDirectory(prefix='hermit-splitgates-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + budget + pressure + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall',
+                        '-Wextra', '-Werror', '-Wno-unused-function',
+                        '-fsanitize=address,undefined', '-g',
+                        str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+
+def test_pte_batch_direct():
+    """Production direct-bypass batch PTE install and post-PTL cleanup."""
+    ROOT = Path(__file__).resolve().parents[3]
+    source = (ROOT / 'linux-stable/mm/memory.c').read_text()
+    start = source.index('static unsigned int hermit_batch_ptes_direct(')
+    end = source.index('\n#endif\n\n/*\n * We enter with non-exclusive mmap_lock', start)
+    func = source[start:end]
+    harness = r"""
+    #include <assert.h>
+    #include <stdbool.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <string.h>
+    typedef uint64_t u64;
+    #define PAGE_SHIFT 12
+    #define PAGE_SIZE (1UL << PAGE_SHIFT)
+    #define PMD_SIZE (512UL * PAGE_SIZE)
+    #define VM_WRITE 2UL
+    #define RMAP_EXCLUSIVE 1
+    #define MM_ANONPAGES 1
+    #define MM_SWAPENTS 2
+    #define HERMIT_SWAPIN_MAX 64
+    #define unlikely(x) (x)
+    #define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+    typedef struct { unsigned long v; } pte_t;
+    typedef struct { unsigned long val; } swp_entry_t;
+    #define PTE_PRESENT (1UL << 56)
+    #define PTE_WRITE   (1UL << 57)
+    #define PTE_YOUNG   (1UL << 58)
+    #define PTE_SOFT    (1UL << 59)
+    #define PTE_UFFD    (1UL << 60)
+    struct page { unsigned long pfn; bool poisoned; };
+    struct folio { struct page page; int refs; unsigned long rmap_addr;
+        bool locked, uptodate, anon; };
+    struct mm_struct { int unused; };
+    struct swap_info_struct { unsigned long flags; signed char type; };
+    struct vm_area_struct { struct mm_struct *vm_mm; unsigned long vm_start, vm_end, vm_flags;
+        unsigned long vm_page_prot; void *anon_vma; };
+    struct vm_fault { struct vm_area_struct *vma; unsigned long address; };
+    struct hermit_direct_batch {
+        struct folio *folios[HERMIT_SWAPIN_MAX];
+        swp_entry_t entries[HERMIT_SWAPIN_MAX];
+        pte_t snapshots[HERMIT_SWAPIN_MAX];
+        bool ok[HERMIT_SWAPIN_MAX];
+        unsigned int nr;
+        unsigned int installed;
+    };
+    enum { ADC_PTEBATCH_INSTALL = 1, ADC_PTEBATCH_SKIP = 2 };
+    struct hermit_adc_interval { unsigned int type, subtype; };
+    static unsigned int adc_installs, adc_skips;
+    static struct hermit_adc_interval hermit_adc_begin(unsigned int t)
+    { return (struct hermit_adc_interval){ .type = t }; }
+    static void hermit_adc_finish(struct hermit_adc_interval *iv)
+    { adc_installs++; if (iv->subtype == ADC_PTEBATCH_SKIP) adc_skips++; }
+
+    static const unsigned long base = 0x40000000UL;
+    static struct mm_struct mm;
+    static struct vm_area_struct vma;
+    static struct swap_info_struct si;
+    static pte_t ptes[16];
+    static struct folio folios[16];
+    static int swapcache_wq;
+    static bool policy_ok, uffd, wq_active;
+    static unsigned int installed_pages, skipped_pages, swap_frees, swap_clears;
+    static unsigned int anon_delta, swpent_delta, unlocks, folio_puts, freed_db, wakes;
+    static unsigned int mm_counter_calls, new_rmaps;
+
+    static pte_t swap_pte(unsigned int off, unsigned int extra)
+    { return (pte_t){ (1UL << 63) | ((unsigned long)off << 8) | extra }; }
+    static bool pte_same(pte_t a, pte_t b) { return a.v == b.v; }
+    static pte_t ptep_get(pte_t *p) { return *p; }
+    static unsigned long pmd_addr_end(unsigned long addr, unsigned long end)
+    { unsigned long b = (addr & ~(PMD_SIZE - 1)) + PMD_SIZE; return b - 1 < end - 1 ? b : end; }
+    static bool userfaultfd_armed(struct vm_area_struct *v) { (void)v; return uffd; }
+    static bool hermit_policy_pte_install(struct vm_fault *vmf, unsigned int p)
+    { (void)vmf; (void)p; return policy_ok; }
+    static void hermit_policy_pte_installed(unsigned int p) { installed_pages += p; }
+    static void hermit_policy_pte_skipped(unsigned int p) { skipped_pages += p; }
+    static bool folio_test_uptodate(struct folio *f) { return f->uptodate; }
+    static bool PageHWPoison(struct page *p) { return p->poisoned; }
+    static swp_entry_t folio_swap(swp_entry_t e, struct folio *f) { (void)f; return e; }
+    static void arch_swap_restore(swp_entry_t e, struct folio *f) { (void)e; (void)f; }
+    static void swap_free(swp_entry_t e) { (void)e; swap_frees++; }
+    static void swapcache_clear(struct swap_info_struct *s, swp_entry_t e, int n)
+    { assert(s == &si && n == 1); (void)e; swap_clears++; }
+    static bool waitqueue_active(int *q) { (void)q; return wq_active; }
+    static void wake_up(int *q) { (void)q; wakes++; }
+    static void hermit_direct_batch_free(struct hermit_direct_batch *db)
+    { (void)db; freed_db++; }
+    static void add_mm_counter(struct mm_struct *m, int k, long v)
+    { (void)m; mm_counter_calls++; if (k == MM_ANONPAGES) anon_delta += v;
+      else if (k == MM_SWAPENTS) swpent_delta -= v; }
+    static pte_t mk_pte(struct page *p, unsigned long prot)
+    { return (pte_t){ PTE_PRESENT | (p->pfn << 20) | prot }; }
+    static bool pte_swp_soft_dirty(pte_t p) { return p.v & 2; }
+    static bool pte_swp_uffd_wp(pte_t p) { return p.v & 4; }
+    static pte_t pte_mksoft_dirty(pte_t p) { p.v |= PTE_SOFT; return p; }
+    static pte_t pte_mkuffd_wp(pte_t p) { p.v |= PTE_UFFD; return p; }
+    static bool userfaultfd_pte_wp(struct vm_area_struct *v, pte_t p) { (void)v; return p.v & PTE_UFFD; }
+    static bool pte_needs_soft_dirty_wp(struct vm_area_struct *v, pte_t p) { (void)v; (void)p; return false; }
+    static pte_t pte_mkwrite(pte_t p, struct vm_area_struct *v) { (void)v; p.v |= PTE_WRITE; return p; }
+    static pte_t pte_mkyoung(pte_t p) { p.v |= PTE_YOUNG; return p; }
+    static void flush_icache_pages(struct vm_area_struct *v, struct page *p, unsigned int n)
+    { (void)v; (void)p; (void)n; }
+    static void folio_add_new_anon_rmap(struct folio *f, struct vm_area_struct *v,
+        unsigned long addr, int flags)
+    { (void)v; assert(f->locked && !f->anon && (flags & RMAP_EXCLUSIVE));
+      f->anon = true; f->rmap_addr = addr; new_rmaps++; }
+    static void set_ptes(struct mm_struct *m, unsigned long addr, pte_t *p, pte_t v, unsigned int n)
+    { (void)m; (void)addr; assert(n == 1); *p = v; }
+    static void arch_do_swap_page_nr(struct mm_struct *m, struct vm_area_struct *v,
+        unsigned long addr, pte_t p, pte_t o, int n)
+    { (void)m; (void)v; (void)addr; (void)p; (void)o; assert(n == 1); }
+    static void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *v,
+        unsigned long addr, pte_t *p, unsigned int n)
+    { (void)vmf; (void)v; (void)addr; (void)p; assert(n == 1); }
+    static void folio_unlock(struct folio *f) { assert(f->locked); f->locked = false; unlocks++; }
+    static void folio_put(struct folio *f) { assert(f->refs > 0); f->refs--; folio_puts++; }
+    """
+    tests = r"""
+    static void reset(void)
+    {
+        memset(ptes, 0, sizeof(ptes));
+        memset(folios, 0, sizeof(folios));
+        si = (struct swap_info_struct){ .type = 3 };
+        vma = (struct vm_area_struct){ .vm_mm = &mm, .vm_start = base,
+            .vm_end = base + PMD_SIZE, .vm_flags = VM_WRITE, .anon_vma = &mm };
+        policy_ok = true; uffd = false; wq_active = true;
+        installed_pages = skipped_pages = swap_frees = swap_clears = 0;
+        anon_delta = swpent_delta = unlocks = folio_puts = freed_db = wakes = 0;
+        mm_counter_calls = new_rmaps = adc_installs = adc_skips = 0;
+        for (unsigned int i = 0; i < 16; i++) {
+            folios[i] = (struct folio){ .page = { .pfn = 1000 + i }, .refs = 1,
+                .locked = true, .uptodate = true, .anon = false };
+        }
+    }
+
+    int main(void)
+    {
+        struct vm_fault vmf = { .vma = &vma, .address = base };
+        struct hermit_direct_batch db;
+        const unsigned int offs[4] = { 10, 42, 7, 99 };
+        const unsigned int flags[4] = { 1, 3, 5, 1 }; /* soft-dirty on 1, uffd-wp on 2 */
+
+        /* 1. Full scattered direct batch: installs all 3 tail pages, batches
+         * mm counters once, unlocks mapped folios, and clears SWAP_HAS_CACHE
+         * after PTL unlock without dropping the mapped PTE references. */
+        reset();
+        memset(&db, 0, sizeof(db));
+        db.nr = 4;
+        for (unsigned int i = 0; i < 4; i++) {
+            ptes[i] = swap_pte(offs[i], flags[i]);
+            db.folios[i] = &folios[i];
+            db.entries[i] = (swp_entry_t){ offs[i] };
+            db.snapshots[i] = ptes[i];
+            db.ok[i] = true;
+        }
+        assert(hermit_batch_ptes_direct(&vmf, ptes, base, &db) == 3);
+        assert(db.installed == 3 && installed_pages == 3 && skipped_pages == 0);
+        assert(mm_counter_calls == 2 && anon_delta == 3 && swpent_delta == 3);
+        assert(swap_frees == 3 && new_rmaps == 3 && unlocks == 3 && folio_puts == 0);
+        assert((ptes[1].v & (PTE_PRESENT | PTE_WRITE | PTE_SOFT | PTE_YOUNG)) ==
+               (PTE_PRESENT | PTE_WRITE | PTE_SOFT | PTE_YOUNG));
+        assert((ptes[2].v & (PTE_PRESENT | PTE_UFFD | PTE_YOUNG)) ==
+               (PTE_PRESENT | PTE_UFFD | PTE_YOUNG));
+        assert(!(ptes[2].v & PTE_WRITE));
+        hermit_direct_batch_finish(&db, &si);
+        assert(swap_clears == 3 && folio_puts == 0 && unlocks == 3 && freed_db == 1 && wakes == 1);
+        for (unsigned int i = 1; i < 4; i++)
+            assert(!folios[i].locked && folios[i].refs == 1);
+
+        /* 2. Early stop on failed I/O or stale PTE: mapped prefix keeps refs,
+         * unmapped tail is unlocked+put, and all tail slots clear cache pin. */
+        reset();
+        memset(&db, 0, sizeof(db));
+        db.nr = 4;
+        for (unsigned int i = 0; i < 4; i++) {
+            ptes[i] = swap_pte(offs[i], 1);
+            db.folios[i] = &folios[i];
+            db.entries[i] = (swp_entry_t){ offs[i] };
+            db.snapshots[i] = ptes[i];
+            db.ok[i] = true;
+        }
+        ptes[2] = (pte_t){ 0 }; /* concurrently zapped */
+        assert(hermit_batch_ptes_direct(&vmf, ptes, base, &db) == 1);
+        assert(db.installed == 1 && installed_pages == 1 && skipped_pages == 2);
+        assert(adc_skips == 1 && swap_frees == 1);
+        hermit_direct_batch_finish(&db, &si);
+        assert(swap_clears == 3 && unlocks == 3 && folio_puts == 2 && freed_db == 1);
+        assert(folios[1].refs == 1 && folios[2].refs == 0 && folios[3].refs == 0);
+
+        /* 3. Fault retry / out_nomap cleanup (installed == 0): unlocks and frees
+         * every tail folio and clears SWAP_HAS_CACHE on every tail entry. */
+        reset();
+        memset(&db, 0, sizeof(db));
+        db.nr = 4;
+        for (unsigned int i = 0; i < 4; i++) {
+            db.folios[i] = &folios[i];
+            db.entries[i] = (swp_entry_t){ offs[i] };
+            db.ok[i] = true;
+        }
+        hermit_direct_batch_finish(&db, &si);
+        assert(swap_clears == 3 && unlocks == 3 && folio_puts == 3 && freed_db == 1);
+        for (unsigned int i = 1; i < 4; i++)
+            assert(!folios[i].locked && folios[i].refs == 0);
+
+        puts("Direct PTE batch tests: PASS");
+        return 0;
+    }
+    """
+    with tempfile.TemporaryDirectory(prefix='hermit-ptebatch-direct-test-') as tmp:
+        cfile, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
+        cfile.write_text(harness + func + tests)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall',
+                        '-Wextra', '-Werror', '-Wno-unused-function',
+                        '-fsanitize=address,undefined', '-g',
+                        str(cfile), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
 
 if __name__ == '__main__':
     test_rdma_submission()
     test_remote_read()
     test_folio_selection()
-    test_reclaim_sort()
     test_swapin_pages()
-    test_cold_observe()
+    test_mglru_policy()
+    test_mglru_runtime_guard()
     test_shadow_refault()
+    test_swapin_cost()
+    test_pte_batch_install()
+    test_pte_batch_direct()
+    test_split_select()
+    test_heat_decay()
+    test_split_gates()

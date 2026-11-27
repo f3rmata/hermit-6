@@ -247,6 +247,8 @@ Hermit 控制项位于 =/sys/kernel/debug/hermit/=：
 | =remote_order_mask= | 可写的传输 order 位图，默认 =0x1= |
 | =effective_order_mask= | 只读的配置与 backend 能力交集 |
 | =order_stats= | 逐 order 的 store/load/4 KiB fallback/error 计数 |
+| =swapin_cost_stats= | 逐 order 的换入次数/总纳秒与策略预取命中计数（只读） |
+| =swapin_cost_enable= | =swapin_cost_stats= 的 static key 开关，默认 =0= |
 
 =remote_order_mask= 的 bit N 表示允许用 order N 的单个远端请求：bit 0 是
 4 KiB，bit 2 是 16 KiB，直到 bit 9 的 2 MiB。bit 0 必须始终置位，bit 1
@@ -266,6 +268,10 @@ cat /sys/kernel/debug/hermit/order_stats
 
 该位图只选择 Hermit 的传输粒度，不修改 Linux 的
 =/sys/kernel/mm/transparent_hugepage/= 分配策略。
+
+=swapin_cost_stats= 默认只累加 =0= 的静态字段；需要测量缺页成本时先写
+=swapin_cost_enable=1=，再读该文件。字段含义、开销和边界见
+[[file:docs/pebs/kernel-policy-integration.org][策略内核集成]]。
 
 RDMA 模块参数 =max_order= 决定单个 WR 支持的最大 order。它在模块加载时读取且
 为只读参数；需要修改时先 =swapoff=、卸载模块，再用
