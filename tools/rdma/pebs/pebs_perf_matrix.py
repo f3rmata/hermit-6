@@ -8,7 +8,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, PAGE_SIZES, counter_delta, wr_delta,
                             policy_delta, policy_activity, policy_masks, policy_suffix, apply_policy_mask,
-                            page_ceiling_settings, cell_adc, read_optional, write_adc_csv, write_comparisons)
+                            page_ceiling_settings, cell_adc, mglru_core_enabled, read_optional, write_adc_csv, write_comparisons,
+                            split_obs_delta)
 D = Path('/sys/kernel/debug/hermit')
 LIBC = ctypes.CDLL(None, use_errno=True)
 LIBC.syscall.restype = ctypes.c_long
@@ -61,6 +62,8 @@ def capture(folder, cg, pid):
         (folder/f).write_text(read(D/f))
     if (D/'policy_stats').exists():
         (folder/'policy_stats').write_text(read(D/'policy_stats'))
+    if (D/'split_obs_stats').exists():
+        (folder/'split_obs_stats').write_text(read(D/'split_obs_stats'))
     (folder/'mglru.json').write_text(json.dumps({name:read_optional(
         Path('/sys/kernel/mm/lru_gen')/name) for name in ('enabled','min_ttl_ms')}))
     for f in ['memory.current','memory.high','memory.max','memory.swap.current','memory.events','memory.stat']:
@@ -133,6 +136,22 @@ def matrix_cases(selected, fixed=True, presets=None):
         for label, period in periods:
             cases.append((f'policy-{label}{suffix}', 1, period, mask))
     names = selected.split(',') if selected else ['off', *(c[0] for c in cases if c[2] is not None)]
+    if len(names) != len(set(names)):
+        raise ValueError('unknown or duplicate case')
+    if selected and presets:
+        # Expand base policy case names (e.g. policy-medium) across every
+        # requested --policy-features preset unless the user already selected
+        # an explicit suffixed variant for that base name.
+        base_policy = {'policy-adaptive', *(f'policy-{label}' for label, _ in periods)}
+        expanded = []
+        for name in names:
+            if name in base_policy and not any(
+                    other != name and other.startswith(name + '-') for other in names):
+                for suffix_name, _ in presets:
+                    expanded.append(f'{name}{policy_suffix(suffix_name)}')
+            else:
+                expanded.append(name)
+        names = expanded
     if len(names) != len(set(names)) or set(names) - {c[0] for c in cases}:
         raise ValueError('unknown or duplicate case')
     return [c for c in cases if c[0] in names]
@@ -304,7 +323,7 @@ def main():
     ap.add_argument('--thp',choices=['preserve'],default='preserve',help='Compatibility option; allocation is preserved unless --pages is supplied')
     ap.add_argument('--pages', nargs='+', type=int, choices=PAGE_SIZES,
                     help='allocation ceilings in KiB, plus a 4KiB/off reference; smaller sizes stay eligible; omitted preserves THP')
-    ap.add_argument('--policy-features',nargs='+',default=None,help='policy_features ablations for policy cells: preset names (default, no-pebs, no-batch, medium-on), raw masks (0x1bd) or comma-separated lists; each preset becomes a labelled policy case; omitted preserves the kernel mask and is restored on exit')
+    ap.add_argument('--policy-features',nargs='+',default=None,help='policy_features ablations for policy cells: preset names (default, no-pebs, no-batch, medium-on, fitstart-on, ptebatch-on, fitpte, fitpte-medium, split-on, split-obs), raw masks (0xa1) or comma-separated lists; each preset becomes a labelled policy case (base names in --cases expand across all presets); omitted preserves the kernel mask and is restored on exit')
     ap.add_argument('--adc', action='store_true', help='capture measured-client Hermit ADC deltas')
     ap.add_argument('--dry-run', action='store_true', help='print matrix without sudo or host changes')
     ap.add_argument('--port',type=int,default=11329);ap.add_argument('--require-fixed',action='store_true')
@@ -326,6 +345,13 @@ def main():
         except ValueError as exc: ap.error(str(exc))
     try: cases = matrix_cases(args.cases, presets=presets)
     except ValueError as exc: ap.error(str(exc))
+    # A preset whose policy cases were all filtered out by --cases would run
+    # silently with no effect (e.g. --cases policy-medium with fitpte).
+    if presets:
+        for label, mask in presets:
+            if not any(c[3] == mask for c in cases):
+                ap.error(f'--policy-features {label} has no selected case; add e.g. '
+                         f'policy-medium{policy_suffix(label)} to --cases')
     if args.dry_run:
         plan = matrix_plan(args.pages, args.repeats, cases)
         print(json.dumps(dict(samples=len(plan), baseline_case='off', plan=plan,
@@ -339,6 +365,8 @@ def main():
     account=pwd.getpwnam(args.user);home=Path(account.pw_dir)
     if args.output.exists(): ap.error('output must be a new directory')
     if not (D/'pebs_enabled').exists(): ap.error('running kernel lacks PEBS interfaces, regardless of its release name')
+    if not mglru_core_enabled(read_optional('/sys/kernel/mm/lru_gen/enabled')):
+        ap.error('Hermit requires MGLRU with the core bit enabled')
     if read(D/'pebs_enabled').strip()!='0': ap.error('existing PEBS session; stop it before testing')
     if not Path('/sys/module/rswap_client').exists(): ap.error('RDMA backend is not loaded')
     if len(read('/proc/swaps').splitlines())<2: ap.error('no active swap device')
@@ -349,7 +377,7 @@ def main():
     if args.require_fixed and not fixed: ap.error('running kernel has no fixed-period controls; install the patched kernel first')
     if not fixed and any(c[2] is not None for c in cases): ap.error('fixed-period cases require fixed sampling controls')
     if fixed: controls+=['pebs_adaptive','pebs_load_period','pebs_store_period']
-    controls+=[f for f in ('policy_features','policy_cold_us','policy_cold_epochs','policy_swapin_max') if (D/f).exists()]
+    controls+=[f for f in ('policy_features','policy_swapin_max') if (D/f).exists()]
     if args.policy_features and 'policy_features' not in controls:
         ap.error('running kernel has no policy_features control')
     saved={f:read(D/f).strip() for f in controls}
@@ -399,6 +427,7 @@ def main():
               'records':args.records,'valuesize':1024,'memory_high':args.memory_mb*1024**2,'memory_max':max(2048,args.memory_mb)*1024**2,'sampling':'no NumaMMa'}
     manifest['connection_limits']=connection_limits
     manifest['policy_tunables']={k:read(D/k).strip() for k in ['pebs_fixed_cost_ns','pebs_region_max','pebs_pc_max','pebs_window_ms','pebs_history_ms','pebs_predict_regions','pebs_predict_samples']}
+    manifest['policy_tunables'].update({k:read(D/k).strip() for k in ['pebs_heat_ms','policy_split_min_samples','policy_split_rate','policy_medium_min_order','policy_medium_max_order'] if (D/k).exists()})
     (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
     for command,name in [(['lscpu','-e'],'cpu-topology.txt'),(['uname','-a'],'uname.txt')]:
         (out/name).write_text(subprocess.check_output(command,text=True))
@@ -561,6 +590,8 @@ def main():
             row['page_settings_unchanged']=int(pages_before['thp_settings']==expected_thp==pages_after['thp_settings'])
             policy=policy_delta(read_optional(run/'before/policy_stats'),read_optional(run/'after/policy_stats'))
             row.update({'policy_'+k:(policy or {}).get(k) for k in POLICY_FIELDS})
+            row.update(split_obs_delta(read_optional(run/'before/split_obs_stats'),
+                                       read_optional(run/'after/split_obs_stats')))
             vm=[]
             for tag in ('before','after'):
                 vm.append({k:int(v) for k,v in (line.split() for line in read(run/tag/'vmstat').splitlines())
@@ -585,10 +616,20 @@ def main():
             row['memcached_evictions']=int(re.search(r'STAT evictions (\d+)',read(run/'memcached.stats'))[1])
             row['workload_valid']=int(not any(row[k] for k in ['oom_kill_total','order_errors_delta','memcached_evictions','miss_pct','skipped_pct']))
             # Legacy kernels reported order decisions; current policy activity
-            # comes from policy_stats and batch WRs, with missing fields left empty.
+            # comes from policy_stats, predict_calls and batch WRs, with missing
+            # fields left empty.
             decisions=[row[f'decisions_order{i}'] for i in range(10)]
+            pred_vals=[]
+            for tag in ['before','after']:
+                m_pred=re.search(r'^\s*predict_calls:\s*(\d+)\s*$',read(run/tag/'pebs_order_stats'),re.M)
+                pred_vals.append(int(m_pred[1]) if m_pred else None)
+            predict_calls=pred_vals[1]-pred_vals[0] if None not in pred_vals and pred_vals[1]>=pred_vals[0] else 0
             activity,policy_issues=policy_activity(mode, (max_page_kb or 2048) if row['read_wrs']+row['write_wrs'] else 4,
-                sum(decisions) if None not in decisions else None,policy,wrs)
+                sum(decisions) if None not in decisions else None,policy,wrs,
+                predict_calls=predict_calls)
+            if cell['policy_features'] is not None and not (cell['policy_features'] & 0x1):
+                activity = activity | {'swapin_disabled': True, 'waived_issues': policy_issues}
+                policy_issues = []
             (run/'policy-activity.json').write_text(json.dumps(activity | {'validation_issues':policy_issues},indent=2)+'\n')
             row['valid']=row['workload_valid']*row['page_settings_unchanged']*int(mode is None or row['sampled_delta']>0)*int(not policy_issues)
             row['sampling_effective']=int(mode is not None and row['sampled_delta']>0)

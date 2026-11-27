@@ -159,13 +159,18 @@ int main(int argc, char **argv)
 	unsigned int trials = 5;
 	size_t region_pages = 2048 * 1024 / 4096, size_mib = 4096;
 	unsigned long seed = 1;
+	unsigned int max_offset = 0;
 	bool madv_pageout = false, no_wait = false, populate_only = false;
-	bool read_cost = true;
+	bool read_cost = true, interleave = false;
 	unsigned long long checksum_errors = 0, trial_pages = 0;
 	struct sigaction sa;
 	struct rusage stamp;
 	double started_at, total_seconds;
-	size_t regions, next_region = 0, *order;
+	size_t regions, next_region = 0, *order, total_trials, t;
+	struct {
+		unsigned int seg;
+		unsigned int trial;
+	} *schedule;
 	unsigned int i;
 	int argi;
 
@@ -191,10 +196,15 @@ int main(int argc, char **argv)
 			read_cost = false;
 			continue;
 		}
+		if (!strcmp(arg, "--interleave")) {
+			interleave = true;
+			continue;
+		}
 		if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) {
 			printf("usage: %s [--size-gib N | --size-mib N] [--segments P[,P...]] [--trials N] "
-			       "[--seed N] [--region-kb N] [--cost-stats PATH|none] "
-			       "[--madv-pageout] [--no-wait] [--populate-only] [--no-cost]\n",
+			       "[--seed N] [--region-kb N] [--max-offset N] [--interleave] "
+			       "[--cost-stats PATH|none] [--madv-pageout] [--no-wait] "
+			       "[--populate-only] [--no-cost]\n",
 			       argv[0]);
 			return 0;
 		}
@@ -221,7 +231,17 @@ int main(int argc, char **argv)
 			seed = strtoul(value, NULL, 0);
 		else if (!strcmp(arg, "--region-kb"))
 			region_pages = strtoul(value, NULL, 0) * 1024 / 4096;
-		else if (!strcmp(arg, "--cost-stats"))
+		else if (!strcmp(arg, "--max-offset")) {
+			char *end;
+			unsigned long v;
+
+			errno = 0;
+			v = strtoul(value, &end, 0);
+			if (errno || *end || v >= MAX_SEGMENT_PAGES)
+				die("invalid --max-offset %s (must be 0..%u)",
+				    value, MAX_SEGMENT_PAGES - 1);
+			max_offset = (unsigned int)v;
+		} else if (!strcmp(arg, "--cost-stats"))
 			cost_path = strcmp(value, "none") ? value : NULL;
 		else if (!strcmp(arg, "--segments")) {
 			char *token, *save = NULL;
@@ -314,41 +334,71 @@ int main(int argc, char **argv)
 		order[j] = tmp;
 	}
 
-	/* The driver already quiesced stores; from here the reader only faults. */
-	total_seconds = monotonic_seconds();
-	started_at = total_seconds;
+	total_trials = (size_t)nr_segments * trials;
+	schedule = calloc(total_trials, sizeof(*schedule));
+	if (!schedule)
+		die("calloc %zu trial schedule entries", total_trials);
+	t = 0;
 	for (i = 0; i < nr_segments; i++) {
 		unsigned int trial;
 
 		for (trial = 1; trial <= trials; trial++) {
-			size_t start_page, page;
-			struct rusage_delta faults;
-			unsigned long long errors = 0;
-			double begin, seconds;
-
-			start_page = order[next_region++] * region_pages;
-
-			if (getrusage(RUSAGE_SELF, &stamp))
-				die("getrusage: %s", strerror(errno));
-			begin = monotonic_seconds();
-			for (page = start_page; page < start_page + segments[i]; page++)
-				if (*(volatile uint64_t *)(mapping + page * page_bytes) !=
-				    page_pattern(page))
-					errors++;
-			seconds = monotonic_seconds() - begin;
-			faults = usage_now(&stamp);
-			trial_pages += segments[i];
-			checksum_errors += errors;
-			log_line("TRIAL seg=%u trial=%u start_page=%zu bytes=%zu sec=%.9f "
-				 "gib_per_sec=%.6f minflt=%ld majflt=%ld checksum_errors=%llu",
-				 segments[i], trial, start_page,
-				 (size_t)segments[i] * page_bytes, seconds,
-				 seconds > 0 ? (double)segments[i] * page_bytes /
-					      1073741824.0 / seconds : 0.0,
-				 faults.minflt, faults.majflt, errors);
-			if (read_cost)
-				dump_cost_table("trial", segments[i], trial);
+			schedule[t].seg = segments[i];
+			schedule[t].trial = trial;
+			t++;
 		}
+	}
+	if (interleave) {
+		for (t = total_trials - 1; t > 0; t--) {
+			size_t j = (size_t)lrand48() % (t + 1);
+			unsigned int seg = schedule[t].seg;
+			unsigned int trial = schedule[t].trial;
+
+			schedule[t] = schedule[j];
+			schedule[j].seg = seg;
+			schedule[j].trial = trial;
+		}
+	}
+
+	/* The driver already quiesced stores; from here the reader only faults. */
+	total_seconds = monotonic_seconds();
+	started_at = total_seconds;
+	for (t = 0; t < total_trials; t++) {
+		unsigned int seg = schedule[t].seg, trial = schedule[t].trial;
+		size_t start_page, page, offset = 0;
+		struct rusage_delta faults;
+		unsigned long long errors = 0;
+		double begin, seconds;
+
+		if (max_offset > 0 && seg < region_pages) {
+			size_t bound = region_pages - seg;
+
+			if (max_offset < bound)
+				bound = max_offset;
+			offset = (size_t)lrand48() % (bound + 1);
+		}
+		start_page = order[next_region++] * region_pages + offset;
+
+		if (getrusage(RUSAGE_SELF, &stamp))
+			die("getrusage: %s", strerror(errno));
+		begin = monotonic_seconds();
+		for (page = start_page; page < start_page + seg; page++)
+			if (*(volatile uint64_t *)(mapping + page * page_bytes) !=
+			    page_pattern(page))
+				errors++;
+		seconds = monotonic_seconds() - begin;
+		faults = usage_now(&stamp);
+		trial_pages += seg;
+		checksum_errors += errors;
+		log_line("TRIAL seg=%u trial=%u start_page=%zu bytes=%zu sec=%.9f "
+			 "gib_per_sec=%.6f minflt=%ld majflt=%ld checksum_errors=%llu",
+			 seg, trial, start_page,
+			 (size_t)seg * page_bytes, seconds,
+			 seconds > 0 ? (double)seg * page_bytes /
+				      1073741824.0 / seconds : 0.0,
+			 faults.minflt, faults.majflt, errors);
+		if (read_cost)
+			dump_cost_table("trial", seg, trial);
 	}
 	if (read_cost)
 		dump_cost_table("cell", 0, 0);
@@ -360,6 +410,7 @@ int main(int argc, char **argv)
 		log_line("WAITING");
 		wait_for_signal(&finished);
 	}
+	free(schedule);
 	free(order);
 	if (munmap(mapping, nr_pages * page_bytes))
 		fprintf(stderr, "swapin_granularity: munmap: %s\n", strerror(errno));

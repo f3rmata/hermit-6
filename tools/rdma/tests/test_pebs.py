@@ -231,6 +231,15 @@ class MatrixTests(unittest.TestCase):
         for kernel in ('bfs', 'pr'):
             script, env = matrix.SUITES[f'gapbs-{kernel}']
             self.assertEqual((script, env['GAPBS_KERNEL']), ('run_gapbs_page_sweep.sh', kernel))
+        for threads in (4, 16):
+            script, env = matrix.SUITES[f'anon-{threads}t-full']
+            self.assertEqual(script, 'run_anon_swapout_sweep.sh')
+            self.assertEqual((env['BENCH_THREADS'], env['BENCH_CPUS'], env['ACCESS_RATIOS']),
+                             (threads, f'0-{threads - 1}', '100'))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(matrix.executable(d))
+            exe = Path(d)/'tool'; exe.write_text('#!/bin/sh\n'); exe.chmod(0o755)
+            self.assertTrue(matrix.executable(exe))
         out = subprocess.check_output(['python3', str(RDMA/'pebs/run_workload_matrix.py'), '--dry-run',
                                        '--suites', 'gapbs-bfs', 'anon-1t-d1p-high', '--pages', '64',
                                        '--periods', '1999', '--repeats', '1', '--gapbs-scale', '20'], text=True)

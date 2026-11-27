@@ -313,22 +313,24 @@ port = sys.argv[sys.argv.index('--port') + 1]
                                       check=False).returncode, 0)
 
     def test_policy_mask_names_match_the_python_presets(self):
-        expected = {'default': '0x1bf', 'no-pebs': '0x1bd', 'no-batch': '0x19f',
-                    'medium-on': '0x3bf', 'fitstart-on': '0x5bf',
-                    'ptebatch-on': '0x9bf', 'split-on': '0x11bf',
-                    'fitpte': '0xdbf', 'fitpte-medium': '0xfbf'}
+        expected = {'default': '0xa3', 'no-pebs': '0xa1', 'no-batch': '0x83',
+                    'medium-on': '0x2a3', 'fitstart-on': '0x4a3',
+                    'ptebatch-on': '0x8a3', 'split-on': '0x10a3',
+                    'split-obs': '0x40a3',
+                    'fitpte': '0xca3', 'fitpte-medium': '0xea3'}
         for name, mask in expected.items():
             with self.subTest(preset=name):
                 self.assertEqual(shell('policy_mask_of '+name).stdout.strip(), mask)
                 self.assertEqual(shell('valid_policy_mask '+mask).returncode, 0)
         self.assertEqual(shell('policy_mask_of 0x1ae').stdout.strip(), '0x1ae')
-        # Bits 0..12 are defined, so 0x200 (MEDIUM alone), 0xfff and 0x11bf
-        # (default|SPLIT) are legal raw masks.
+        # Surviving features retain their bit positions.
         self.assertEqual(shell('valid_policy_mask 0x200').returncode, 0)
-        self.assertEqual(shell('valid_policy_mask 0xfff').returncode, 0)
-        self.assertEqual(shell('valid_policy_mask 0x11bf').returncode, 0)
-        self.assertEqual(shell('valid_policy_mask 0x2fbf').returncode, 0)
-        for bad in ('0x4000', '16384', 'zz', ''):
+        self.assertEqual(shell('valid_policy_mask 0xee3').returncode, 0)
+        self.assertEqual(shell('valid_policy_mask 0x10a3').returncode, 0)
+        self.assertEqual(shell('valid_policy_mask 0x2ea3').returncode, 0)
+        self.assertEqual(shell('valid_policy_mask 0x4ea3').returncode, 0)
+        for bad in ('0x8000', '32768', '0x4', '0x8', '0x10', '0x100', '0x1bf', '09',
+                    '18446744073709551616', '0x10000000000000000', 'zz', ''):
             with self.subTest(mask=bad):
                 self.assertNotEqual(shell('valid_policy_mask "$1"', bad, check=False).returncode, 0)
 
@@ -338,14 +340,14 @@ port = sys.argv[sys.argv.index('--port') + 1]
         start = source.index('apply_policy_mask() {')
         definition = source[start:source.index('\n}\n', start)+3]
         script = definition + '''
-            policy_features_saved=0x000001bd
+            policy_features_saved=0x000000a1
             sudo_write() { actual=$1; echo "$1"; }
             sudo_cat() { echo "${readback:-$actual}"; }
-            apply_policy_mask 0x11bf
+            apply_policy_mask 0x10a3
             apply_policy_mask ""
         '''
-        self.assertEqual(shell(script).stdout.splitlines(), ['0x11bf', '0x000001bd'])
-        self.assertNotEqual(shell(script + 'readback=0x11bf; apply_policy_mask ""',
+        self.assertEqual(shell(script).stdout.splitlines(), ['0x10a3', '0x000000a1'])
+        self.assertNotEqual(shell(script + 'readback=0x10a3; apply_policy_mask ""',
                                   check=False).returncode, 0)
 
     def test_granularity_swap_capacity_at_default_ratio(self):
@@ -408,20 +410,64 @@ swap partition $((free_mb * 1024)) 0 -2"; }
             path = Path(directory)/'bench.log'
             path.write_text(log)
             result = shell(definition('emit_trials') + definition('trial_summary') + '''
-                emit_trials "$1" 64 policy 0x1bf
+                emit_trials "$1" 64 policy 0xa3
                 trial_summary 1 "$1"
                 trial_summary 4 "$1"
                 trial_summary 16 "$1"
             ''', path)
             lines = result.stdout.splitlines()
         self.assertIn('minflt,majflt,checksum_errors,swapped\\n', source)
-        self.assertEqual(lines[0], '64,policy,0x1bf,1,1,512,4096,0.001,3.8,2,1,0,1')
-        self.assertEqual(lines[1], '64,policy,0x1bf,1,2,768,4096,0.003,1.3,1,0,0,0')
-        self.assertEqual(lines[2], '64,policy,0x1bf,4,1,1024,16384,0.004,3.8,0,4,0,1')
+        self.assertEqual(lines[0], '64,policy,0xa3,1,1,512,4096,0.001,3.8,2,1,0,1')
+        self.assertEqual(lines[1], '64,policy,0xa3,1,2,768,4096,0.003,1.3,1,0,0,0')
+        self.assertEqual(lines[2], '64,policy,0xa3,4,1,1024,16384,0.004,3.8,0,4,0,1')
         # trial_summary prints faults,checksum_errors,seconds,bytes per segment.
         self.assertEqual(lines[3], '4,0,0.004000,8192')
         self.assertEqual(lines[4], '4,0,0.004000,16384')
         self.assertEqual(lines[5], '0,0,0.000000,0')
+
+    def test_swapin_granularity_interleave_and_unaligned_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory)/'swapin-granularity'
+            subprocess.run(['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror',
+                            '-Wno-unused-parameter', '-o', str(binary),
+                            str(COMMON.parent/'bench'/'swapin_granularity.c')], check=True)
+            out = subprocess.check_output([
+                str(binary), '--size-mib', '32', '--segments', '1,4,16',
+                '--trials', '3', '--seed', '7', '--interleave', '--max-offset', '15',
+                '--no-wait', '--no-cost'], text=True)
+            trials = [dict(tok.split('=', 1) for tok in line.split()[1:])
+                      for line in out.splitlines() if line.startswith('TRIAL ')]
+            self.assertEqual(len(trials), 9)
+            segs = [int(t['seg']) for t in trials]
+            # Shuffled order should differ from grouped [1,1,1,4,4,4,16,16,16].
+            self.assertNotEqual(segs, [1, 1, 1, 4, 4, 4, 16, 16, 16])
+            self.assertEqual(sorted(segs), [1, 1, 1, 4, 4, 4, 16, 16, 16])
+            offsets = [int(t['start_page']) % 512 for t in trials]
+            self.assertTrue(any(o > 0 for o in offsets))
+            self.assertTrue(all(0 <= o <= 15 for o in offsets))
+            self.assertTrue(all(int(t['checksum_errors']) == 0 for t in trials))
+
+    def test_wr_totals_delta_and_round4_dry_run(self):
+        runner = COMMON.parent/'bench'/'run_swapin_granularity.sh'
+        source = runner.read_text()
+        start = source.index('wr_totals_delta() {')
+        func = source[start:source.index('\n}\n', start)+3]
+        with tempfile.TemporaryDirectory() as directory:
+            b, a = Path(directory)/'b', Path(directory)/'a'
+            b.write_text('order write_wrs read_wrs write_bytes read_bytes\n'
+                         '0 1 2 4096 8192\n'
+                         'pages batch_write_wrs batch_read_wrs batch_write_bytes batch_read_bytes\n'
+                         '4 0 1 0 16384\n')
+            a.write_text('order write_wrs read_wrs write_bytes read_bytes\n'
+                         '0 3 5 12288 20480\n'
+                         'pages batch_write_wrs batch_read_wrs batch_write_bytes batch_read_bytes\n'
+                         '4 2 4 32768 65536\n')
+            delta = shell(func + 'wr_totals_delta "$1" "$2"', b, a).stdout.strip()
+            self.assertEqual(delta, ',6,61440,4,40960')
+        dry = subprocess.check_output(['bash', str(COMMON.parent/'run_round4_suite.sh'),
+                                       '--dry-run', '--out', '/tmp/hermit-r4-dry'], text=True)
+        self.assertIn('=== DONE exp1 ===', dry)
+        self.assertIn('=== DONE exp4e ===', dry)
 
 
 if __name__ == '__main__':

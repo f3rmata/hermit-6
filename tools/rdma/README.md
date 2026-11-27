@@ -24,10 +24,10 @@
 - 换入粒度微基准：`bench/run_swapin_granularity.sh`，逐 trial 报告 S 页段的墙钟、缺页和校验，逐单元差分 `swapin_cost_stats`；`--policy-features` 接受 `off` 及消融预设。
 
 两个矩阵入口都支持 `--policy-features`：给 policy 单元指定 `policy_features` 消融预设
-`default`（`0x1bf`）、`no-pebs`（`0x1bd`）、`no-batch`（`0x19f`）、
-`medium-on`（`0x3bf`）、`fitstart-on`（`0x5bf`）、`ptebatch-on`（`0x9bf`）、
-`fitpte`（默认 + FITSTART + PTEBATCH，`0xdbf`）、`fitpte-medium`（再加 MEDIUM，
-`0xfbf`）或原始掩码（上限 `0x3fff`）。11 月 19 日粒度实验的 `0xcbf` 关闭了 MGLRU 位。
+`default`（`0xa3`）、`no-pebs`（`0xa1`）、`no-batch`（`0x83`）、
+`medium-on`（`0x2a3`）、`fitstart-on`（`0x4a3`）、`ptebatch-on`（`0x8a3`）、
+`fitpte`（默认 + FITSTART + PTEBATCH，`0xca3`）、`fitpte-medium`（再加 MEDIUM，
+`0xea3`）或原始掩码（有效位掩码 `0x7ee3`）。Hermit 内核始终启用 MGLRU。
 预设在同一矩阵内各自成为一个带标签的 case，与同一块的 `off`/`static` 共享 baseline；
 不传该参数时保持原行为（不改写 `policy_features`）。详见
 [策略内核集成](../../docs/pebs/kernel-policy-integration.org)。

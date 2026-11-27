@@ -83,6 +83,7 @@ struct perf_buffer { unsigned int nr_pages; void *data_pages[2]; };
     # Same predicate as mm/hermit_policy.c, defined after the PEBS globals.
     active = r'''
 #define HERMIT_POLICY_SPLIT (1U << 12)
+#define HERMIT_POLICY_SPLIT_OBS (1U << 14)
 static unsigned int hermit_policy_features;
 static bool hermit_policy_feature(unsigned int feature)
 {

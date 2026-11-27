@@ -54,29 +54,34 @@ elapsed_seconds() {
 }
 
 # policy_features ablations shared with the Python matrix runners
-# (tools/rdma/pebs/matrix_metrics.py POLICY_MASKS). Presets only clear bits of
-# the default mask; any other value is passed through as a raw mask.
+# (tools/rdma/pebs/matrix_metrics.py POLICY_MASKS). Other values are raw masks.
 policy_mask_of() {
   case "$1" in
-    default) printf '0x1bf' ;;
-    no-pebs) printf '0x1bd' ;;
-    no-batch) printf '0x19f' ;;
-    medium-on) printf '0x3bf' ;;
-    fitstart-on) printf '0x5bf' ;;
-    ptebatch-on) printf '0x9bf' ;;
-    fitpte) printf '0xdbf' ;;
-    fitpte-medium) printf '0xfbf' ;;
-    split-on) printf '0x11bf' ;;
+    default) printf '0xa3' ;;
+    no-pebs) printf '0xa1' ;;
+    no-batch) printf '0x83' ;;
+    medium-on) printf '0x2a3' ;;
+    fitstart-on) printf '0x4a3' ;;
+    ptebatch-on) printf '0x8a3' ;;
+    fitpte) printf '0xca3' ;;
+    fitpte-medium) printf '0xea3' ;;
+    split-on) printf '0x10a3' ;;
+    split-obs) printf '0x40a3' ;;
     *) printf '%s' "$1" ;;
   esac
 }
 
 valid_policy_mask() {
-  [[ "$1" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] || return 1
   local value
-  value=$(( $1 ))
-  # Bit 13 enables SLOTRUN diagnostics.
-  [ "$value" -ge 0 ] && [ "$value" -le 16383 ]
+  if [[ "$1" =~ ^0[xX]0*([0-9a-fA-F]{1,4})$ ]]; then
+    value=$((16#${BASH_REMATCH[1]}))
+  elif [[ "$1" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
+    value=$1
+  else
+    return 1
+  fi
+  # Bits 2–4 and 8 are retired.
+  (( (value & ~0x7ee3) == 0 ))
 }
 
 # Per-order swap-in cost table (debugfs swapin_cost_stats). Rows are
@@ -220,7 +225,11 @@ wait_for_stores_quiet() {
 }
 
 validate_sweep_host() {
-  local swap_count
+  local swap_count mglru
+  mglru=$(cat /sys/kernel/mm/lru_gen/enabled) || rdma_die "MGLRU control is unavailable"
+  if ! [[ "$mglru" =~ ^0x[0-9a-fA-F]+$ ]] || ! (( mglru & 1 )); then
+    rdma_die "Hermit requires MGLRU with the core bit enabled"
+  fi
   [ -r /sys/fs/cgroup/cgroup.controllers ] || rdma_die "cgroup v2 is required"
   mount_debugfs_if_needed
   sudo_test -r /sys/kernel/debug/hermit/order_stats || rdma_die "Hermit order_stats is unavailable"

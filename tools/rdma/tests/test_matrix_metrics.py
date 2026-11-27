@@ -85,6 +85,8 @@ class MatrixMetricsTests(unittest.TestCase):
             metrics.wr_delta(wr(), wr().split('pages')[0])
         with self.assertRaisesRegex(ValueError, 'missing'):
             metrics.policy_delta(policy(), None)
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            metrics.policy_counters('predicted_4k 0\nrefault_4k 0\n')
 
     def test_single_page_fallback_is_policy_activity(self):
         counters = metrics.policy_delta(policy(), policy())
@@ -96,19 +98,43 @@ class MatrixMetricsTests(unittest.TestCase):
         activity, issues = metrics.policy_activity(1, 2048, 0, counters, metrics.wr_delta(wr(), wr(1)))
         self.assertFalse(activity['path_exercised'])
         self.assertTrue(issues)
+        # Single-page direct bypass skips batch_read_wrs; predict_calls or
+        # order-0 actual swapins at a >4 KiB ceiling prove the policy ran.
+        activity, issues = metrics.policy_activity(1, 16, 0, counters, metrics.wr_delta(wr(), wr(1)),
+                                                   predict_calls=1)
+        self.assertTrue(activity['path_exercised'])
+        self.assertEqual(issues, [])
+        direct_wr = metrics.wr_delta(wr(), wr(1))
+        direct_wr[4]['pebs_actual_swapins'] = 1
+        activity, issues = metrics.policy_activity(1, 16, 0, counters, direct_wr)
+        self.assertTrue(activity['path_exercised'])
+        self.assertEqual(issues, [])
         activity, issues = metrics.policy_activity(1, 2048, 0, counters, metrics.wr_delta(wr(), wr()))
         self.assertFalse(activity['required'])
         self.assertEqual(issues, [])
 
     def test_mglru_selection_is_policy_activity_without_pte_observation(self):
-        counters = metrics.policy_delta(policy() + 'mglru_candidates 0\n',
-                                        policy() + 'mglru_candidates 3\n')
+        counters = metrics.policy_delta(policy(), policy(mglru_candidates=3))
         wrs = metrics.wr_delta(wr(), wr(1))
         activity, issues = metrics.policy_activity(1, 4, 0, counters, wrs)
         self.assertTrue(activity['path_exercised'])
         self.assertEqual(issues, [])
         activity, _ = metrics.policy_activity(None, 4, 0, counters, wrs)
         self.assertFalse(activity['path_exercised'])
+
+    def test_historical_policy_counters_remain_parseable(self):
+        classic = ('observed_4k 2\ncold_observations 0\ninvalid_epochs 0\n'
+                   'late_samples 0\npredicted_4k 1\nrefault_4k 0\nranked_candidates 0\n')
+        delta = metrics.policy_delta(classic, classic.replace('observed_4k 2', 'observed_4k 3'))
+        self.assertEqual(delta['observed_4k'], 1)
+        activity, _ = metrics.policy_activity(1, 4, 0, delta, metrics.wr_delta(wr(), wr(1)))
+        self.assertTrue(activity['path_exercised'])
+
+    def test_mglru_check_requires_core_bit(self):
+        for value in ('0x0001\n', '0x0007', '0x0003'):
+            self.assertTrue(metrics.mglru_core_enabled(value))
+        for value in (None, '', '0x0000', '0x0006'):
+            self.assertFalse(metrics.mglru_core_enabled(value))
 
     def test_application_measurement_keeps_non_power_of_two_wrs(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -176,44 +202,47 @@ class MatrixMetricsTests(unittest.TestCase):
 
 class PolicyPresetTests(unittest.TestCase):
     def test_preset_names_map_to_the_documented_masks(self):
-        self.assertEqual(metrics.policy_masks(['default']), [('default', 0x1bf)])
-        self.assertEqual(metrics.policy_masks(['no-pebs']), [('no-pebs', 0x1bd)])
-        self.assertEqual(metrics.policy_masks(['no-batch']), [('no-batch', 0x19f)])
+        self.assertEqual(metrics.policy_masks(['default']), [('default', 0xa3)])
+        self.assertEqual(metrics.policy_masks(['no-pebs']), [('no-pebs', 0xa1)])
+        self.assertEqual(metrics.policy_masks(['no-batch']), [('no-batch', 0x83)])
         # Phase B adds a bit instead of clearing one, so it is a separate
-        # preset: 0x1bf | MEDIUM. Its label cannot collide with a period name.
-        self.assertEqual(metrics.policy_masks(['medium-on']), [('medium-on', 0x3bf)])
-        self.assertEqual(0x3bf, metrics.DEFAULT_POLICY_MASK | 0x200)
+        # preset: 0xa3 | MEDIUM. Its label cannot collide with a period name.
+        self.assertEqual(metrics.policy_masks(['medium-on']), [('medium-on', 0x2a3)])
+        self.assertEqual(0x2a3, metrics.DEFAULT_POLICY_MASK | 0x200)
         # Phase C adds two more bits, again as separate presets.
-        self.assertEqual(metrics.policy_masks(['fitstart-on']), [('fitstart-on', 0x5bf)])
-        self.assertEqual(metrics.policy_masks(['ptebatch-on']), [('ptebatch-on', 0x9bf)])
-        self.assertEqual(0x5bf, metrics.DEFAULT_POLICY_MASK | 0x400)
-        self.assertEqual(0x9bf, metrics.DEFAULT_POLICY_MASK | 0x800)
+        self.assertEqual(metrics.policy_masks(['fitstart-on']), [('fitstart-on', 0x4a3)])
+        self.assertEqual(metrics.policy_masks(['ptebatch-on']), [('ptebatch-on', 0x8a3)])
+        self.assertEqual(0x4a3, metrics.DEFAULT_POLICY_MASK | 0x400)
+        self.assertEqual(0x8a3, metrics.DEFAULT_POLICY_MASK | 0x800)
         self.assertEqual(metrics.policy_masks(['fitpte', 'fitpte-medium']),
                          [('fitpte', metrics.DEFAULT_POLICY_MASK | 0xc00),
                           ('fitpte-medium', metrics.DEFAULT_POLICY_MASK | 0xe00)])
         # Phase D adds SPLIT, a reclaim-side bit that is again a new preset.
-        self.assertEqual(metrics.policy_masks(['split-on']), [('split-on', 0x11bf)])
-        self.assertEqual(0x11bf, metrics.DEFAULT_POLICY_MASK | 0x1000)
+        self.assertEqual(metrics.policy_masks(['split-on']), [('split-on', 0x10a3)])
+        self.assertEqual(0x10a3, metrics.DEFAULT_POLICY_MASK | 0x1000)
+        self.assertEqual(metrics.policy_masks(['split-obs']), [('split-obs', 0x40a3)])
+        self.assertEqual(0x40a3, metrics.DEFAULT_POLICY_MASK | 0x4000)
         # Ablations only clear bits of the default mask.
         for _, mask in metrics.policy_masks(['default', 'no-pebs', 'no-batch']):
             self.assertEqual(mask & ~metrics.DEFAULT_POLICY_MASK, 0)
-        self.assertEqual(0x1bf & ~0x2, 0x1bd)
-        self.assertEqual(0x1bf & ~0x20, 0x19f)
+        self.assertEqual(0xa3 & ~0x2, 0xa1)
+        self.assertEqual(0xa3 & ~0x20, 0x83)
 
     def test_raw_and_comma_separated_masks_are_accepted(self):
-        self.assertEqual(metrics.policy_masks(['0x1bd']), [('f1bd', 0x1bd)])
-        self.assertEqual(metrics.policy_masks(['445']), [('f1bd', 0x1bd)])
+        self.assertEqual(metrics.policy_masks(['0xa1']), [('fa1', 0xa1)])
+        self.assertEqual(metrics.policy_masks(['161']), [('fa1', 0xa1)])
         self.assertEqual(metrics.policy_masks(['default,no-pebs']),
-                         [('default', 0x1bf), ('no-pebs', 0x1bd)])
-        self.assertEqual(metrics.policy_masks(['default', 'default']), [('default', 0x1bf)])
-        # Bits 0..12 exist: 0x200 is MEDIUM alone, 0x5bf is default|FITSTART,
-        # 0x9bf is default|PTEBATCH and 0x11bf is default|SPLIT.
-        self.assertEqual(metrics.policy_masks(['0x3bf']), [('f3bf', 0x3bf)])
+                         [('default', 0xa3), ('no-pebs', 0xa1)])
+        self.assertEqual(metrics.policy_masks(['default', 'default']), [('default', 0xa3)])
+        # Surviving bits retain their positions: 0x200 is MEDIUM alone, 0x4a3 is default|FITSTART,
+        # 0x8a3 is default|PTEBATCH and 0x10a3 is default|SPLIT.
+        self.assertEqual(metrics.policy_masks(['0x2a3']), [('f2a3', 0x2a3)])
         self.assertEqual(metrics.policy_masks(['512']), [('f200', 0x200)])
-        self.assertEqual(metrics.policy_masks(['0xfff']), [('ffff', 0xfff)])
-        self.assertEqual(metrics.policy_masks(['0x11bf']), [('f11bf', 0x11bf)])
-        self.assertEqual(metrics.policy_masks(['0x2fbf']), [('f2fbf', 0x2fbf)])
-        for bad in (['bogus'], ['0x4000'], ['16384'], ['-1'], []):
+        self.assertEqual(metrics.policy_masks(['0xee3']), [('fee3', 0xee3)])
+        self.assertEqual(metrics.policy_masks(['0x10a3']), [('f10a3', 0x10a3)])
+        self.assertEqual(metrics.policy_masks(['0x2ea3']), [('f2ea3', 0x2ea3)])
+        self.assertEqual(metrics.policy_masks(['0x4ea3']), [('f4ea3', 0x4ea3)])
+        for bad in (['bogus'], ['0x1bf'], ['0x4'], ['0x8'], ['0x10'], ['0x100'], ['0x8000'], ['32768'], ['-1'], []):
             with self.subTest(value=bad), self.assertRaises(ValueError):
                 metrics.policy_masks(bad)
 
@@ -227,9 +256,9 @@ class PolicyPresetTests(unittest.TestCase):
         cases = memcached.matrix_cases('', presets=presets)
         plan = memcached.matrix_plan([64], 1, cases)
         labels = {row['case']: row['policy_features'] for row in plan}
-        self.assertEqual(labels['policy-medium'], 0x1bf)
-        self.assertEqual(labels['policy-medium-no-pebs'], 0x1bd)
-        self.assertEqual(labels['policy-medium-no-batch'], 0x19f)
+        self.assertEqual(labels['policy-medium'], 0xa3)
+        self.assertEqual(labels['policy-medium-no-pebs'], 0xa1)
+        self.assertEqual(labels['policy-medium-no-batch'], 0x83)
         self.assertIsNone(labels['off'])
         self.assertIsNone(labels['static-medium'])
         # One shared off/static set per block, plus the separate 4 KiB-only off.
@@ -244,9 +273,9 @@ class PolicyPresetTests(unittest.TestCase):
         args = SimpleNamespace(**base, policy_features=['default', 'no-pebs', 'no-batch'])
         rows = workloads.plan(args)
         labels = {row['case']: row['policy_features'] for row in rows}
-        self.assertEqual(labels['policy-1999'], 0x1bf)
-        self.assertEqual(labels['policy-1999-no-pebs'], 0x1bd)
-        self.assertEqual(labels['policy-1999-no-batch'], 0x19f)
+        self.assertEqual(labels['policy-1999'], 0xa3)
+        self.assertEqual(labels['policy-1999-no-pebs'], 0xa1)
+        self.assertEqual(labels['policy-1999-no-batch'], 0x83)
         self.assertEqual(labels['off'], None)
         self.assertEqual(labels['static-1999'], None)
         # With no presets every cell requests the saved baseline.
@@ -254,19 +283,64 @@ class PolicyPresetTests(unittest.TestCase):
         self.assertEqual({r['case'] for r in rows}, {'off', 'static-1999', 'policy-1999'})
         self.assertTrue(all(r['policy_features'] is None for r in rows))
 
+    def test_base_policy_case_names_expand_across_presets(self):
+        # Selecting a base policy name expands across every requested preset.
+        presets = metrics.policy_masks(['default', 'fitpte'])
+        cases = memcached.matrix_cases('off,policy-medium', presets=presets)
+        self.assertEqual([(c[0], c[3]) for c in cases], [
+            ('off', None), ('policy-medium', 0xa3), ('policy-medium-fitpte', 0xca3)])
+        # Presets without 'default' also expand cleanly.
+        obs = metrics.policy_masks(['split-obs'])
+        cases = memcached.matrix_cases('policy-high,policy-medium', presets=obs)
+        self.assertEqual([(c[0], c[3]) for c in cases], [
+            ('policy-medium-split-obs', 0x40a3), ('policy-high-split-obs', 0x40a3)])
+        # Raw hex masks expand cleanly too.
+        raw = metrics.policy_masks(['0xca3', '0xca1'])
+        cases = memcached.matrix_cases('off,static-medium,policy-medium', presets=raw)
+        self.assertEqual([(c[0], c[3]) for c in cases], [
+            ('off', None), ('static-medium', None),
+            ('policy-medium-fca3', 0xca3), ('policy-medium-fca1', 0xca1)])
+        # Explicit suffixed selection stays exact.
+        cases = memcached.matrix_cases('off,policy-medium-fitpte', presets=presets)
+        self.assertEqual([(c[0], c[3]) for c in cases], [
+            ('off', None), ('policy-medium-fitpte', 0xca3)])
+
+    def test_split_obs_delta_and_swapin_disabled_waiver(self):
+        before = 'aged_total 10\naged_skew_lt12 2\n'
+        after = 'aged_total 15\naged_skew_lt12 5\n'
+        self.assertEqual(metrics.split_obs_delta(before, after),
+                         {'split_obs_aged_total': 5, 'split_obs_aged_skew_lt12': 3})
+        self.assertEqual(metrics.split_obs_delta(None, after), {})
+        measurement = {
+            'granularity': [dict(phase='application', order=0, size_kib=4,
+                                 read_wrs=10, write_wrs=0, batch_read_wrs=0,
+                                 pebs_decisions=0, pebs_actual_swapins=0)],
+            'policy': {'application': dict.fromkeys(metrics.POLICY_FIELDS, 0)},
+            'pebs_predict': {'application': 0},
+        }
+        # Mask 0x80 clears SWAPIN (bit 0): zero base-page swap-in activity is expected.
+        activity, issues = workloads.check_policy_activity(
+            dict(mode=1, page_kb=64, policy_features=0x80), measurement)
+        self.assertTrue(activity['swapin_disabled'])
+        self.assertEqual(issues, [])
+        # Mask 0xa3 sets SWAPIN: zero activity is still rejected.
+        _, issues = workloads.check_policy_activity(
+            dict(mode=1, page_kb=64, policy_features=0xa3), measurement)
+        self.assertTrue(issues)
+
     def test_policy_mask_is_written_and_verified_even_for_baselines(self):
-        baseline = '0x000001bd'
-        for requested in (0x11bf, None, 0, None):
+        baseline = '0x000000a1'
+        for requested in (0x10a3, None, 0, None):
             writes = []
             actual = metrics.apply_policy_mask('control', requested, baseline,
                                                lambda p, v: writes.append(v),
                                                lambda p: str(int(writes[-1], 0)))
-            expected = 0x1bd if requested is None else requested
+            expected = 0xa1 if requested is None else requested
             self.assertEqual(writes, [hex(expected)])
             self.assertEqual(int(actual), expected)
-        with self.assertRaisesRegex(RuntimeError, 'expected 0x1bd'):
+        with self.assertRaisesRegex(RuntimeError, 'expected 0xa1'):
             metrics.apply_policy_mask('control', None, baseline, lambda p, v: None,
-                                      lambda p: '0x11bf')
+                                      lambda p: '0x10a3')
 
 
 if __name__ == '__main__':

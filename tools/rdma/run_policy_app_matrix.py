@@ -21,6 +21,7 @@ import sys
 import time
 from pathlib import Path
 
+from pebs.matrix_metrics import mglru_core_enabled, read_optional
 from policy_app_worker import create_database
 
 HERE = Path(__file__).resolve().parent
@@ -314,6 +315,8 @@ def check_result(config, app, run, expected=None):
 def require_host(config):
     if os.geteuid() != 0:
         raise PermissionError('prepare/calibration and run require root for cgroup and Hermit controls')
+    if not mglru_core_enabled(read_optional('/sys/kernel/mm/lru_gen/enabled')):
+        raise RuntimeError('Hermit requires MGLRU with the core bit enabled')
     if os.sysconf('SC_PAGE_SIZE') != PAGE:
         raise RuntimeError('this matrix requires a 4 KiB base-page kernel')
     if not set(cpulist(config['cpus'])).issubset(os.sched_getaffinity(0)):

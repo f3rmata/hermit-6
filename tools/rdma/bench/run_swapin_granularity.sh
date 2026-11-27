@@ -16,7 +16,7 @@
 #
 # Options (or the matching environment variables):
 #   --pages "4 64 2048"        PAGE_SIZES_KB
-#   --policy-features "0x1bf"  POLICY_FEATURES  ("off" adds a PEBS-disabled cell;
+#   --policy-features "0xa3"  POLICY_FEATURES  ("off" adds a PEBS-disabled cell;
 #                              also accepts default/no-pebs/no-batch/medium-on and
 #                              commas)
 #   --segments "1 4 16 32 64 128"  SEGMENT_PAGES
@@ -27,6 +27,10 @@
 #   --ratio PCT                LOCAL_RATIO_PCT
 #   --result-dir PATH          RESULT_DIR
 #   --adc                     capture inclusive Hermit ADC phase deltas
+#   --interleave              shuffle segment sizes across trials
+#   --max-offset N            random 0..N page offset inside each 2 MiB region
+#   --bypass-swapcache Y|N    override bypass_swapcache and restore on exit
+#   --remote-order-mask MASK  override remote_order_mask and restore on exit
 #   --no-cost                  do not enable the kernel cost counters
 #
 # Requirements: cgroup v2, active Hermit RDMA backend, debugfs, zswap disabled,
@@ -46,7 +50,7 @@ SIZE_GIB=${SIZE_GIB:-8}
 SEGMENT_PAGES=${SEGMENT_PAGES:-"1 4 16 32 64 128"}
 TRIALS=${TRIALS:-50}
 PAGE_SIZES_KB=${PAGE_SIZES_KB:-"4 64 2048"}
-POLICY_FEATURES=${POLICY_FEATURES:-"off 0x1bf"}
+POLICY_FEATURES=${POLICY_FEATURES:-"off 0xa3"}
 LOCAL_RATIO_PCT=${LOCAL_RATIO_PCT:-10}
 BENCH_CPU=${BENCH_CPU:-0}
 SWAPOUT_TRIGGER=${SWAPOUT_TRIGGER:-cgroup}
@@ -55,6 +59,12 @@ READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-300}
 ADC_STATS=${ADC_STATS:-0}
 ADC_DIR=/sys/kernel/debug/hermit
 adc_enabled_saved=
+INTERLEAVE=${INTERLEAVE:-0}
+MAX_OFFSET=${MAX_OFFSET:-0}
+BYPASS_SWAPCACHE=${BYPASS_SWAPCACHE:-}
+REMOTE_ORDER_MASK=${REMOTE_ORDER_MASK:-}
+bypass_swapcache_saved=
+remote_order_mask_saved=
 COST_STATS=${COST_STATS:-1}
 CGROUP=${PEBS_CGROUP:-/sys/fs/cgroup/hermit-swapin-granularity}
 current_pid=
@@ -72,6 +82,10 @@ while [ $# -gt 0 ]; do
     --ratio) LOCAL_RATIO_PCT=$2; shift 2 ;;
     --result-dir) RESULT_DIR=$2; shift 2 ;;
     --adc) ADC_STATS=1; shift ;;
+    --interleave) INTERLEAVE=1; shift ;;
+    --max-offset) MAX_OFFSET=$2; shift 2 ;;
+    --bypass-swapcache) BYPASS_SWAPCACHE=$2; shift 2 ;;
+    --remote-order-mask) REMOTE_ORDER_MASK=$2; shift 2 ;;
     --no-cost) COST_STATS=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) rdma_die "unknown argument: $1" ;;
@@ -99,6 +113,13 @@ for page in $SEGMENT_PAGES; do
 done
 
 case "$ADC_STATS" in 0|1) ;; *) rdma_die "ADC_STATS must be 0 or 1" ;; esac
+case "$INTERLEAVE" in 0|1) ;; *) rdma_die "INTERLEAVE must be 0 or 1" ;; esac
+[[ "$MAX_OFFSET" =~ ^[0-9]+$ ]] && [ "$MAX_OFFSET" -lt 512 ] || \
+  rdma_die "MAX_OFFSET must be an integer in 0..511"
+case "$BYPASS_SWAPCACHE" in ""|Y|N) ;; *) rdma_die "BYPASS_SWAPCACHE must be Y or N" ;; esac
+if [ -n "$REMOTE_ORDER_MASK" ] && ! [[ "$REMOTE_ORDER_MASK" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]]; then
+  rdma_die "invalid REMOTE_ORDER_MASK: $REMOTE_ORDER_MASK"
+fi
 validate_sweep_host
 if [ "$ADC_STATS" = 1 ]; then
   sudo_test -r "$ADC_DIR/adc_stats" || rdma_die "running kernel lacks Hermit adc_stats"
@@ -148,6 +169,12 @@ restore_controls() {
   if [ -n "$adc_enabled_saved" ]; then
     sudo_write "$adc_enabled_saved" "$ADC_DIR/adc_enable" || true
   fi
+  if [ -n "$bypass_swapcache_saved" ] && sudo_test -e "$ADC_DIR/bypass_swapcache"; then
+    sudo_write "$bypass_swapcache_saved" "$ADC_DIR/bypass_swapcache" || true
+  fi
+  if [ -n "$remote_order_mask_saved" ] && sudo_test -e "$REMOTE_MASK_FILE"; then
+    sudo_write "$remote_order_mask_saved" "$REMOTE_MASK_FILE" || true
+  fi
   if [ -n "$policy_features_saved" ] && sudo_test -e /sys/kernel/debug/hermit/policy_features; then
     sudo_write "$policy_features_saved" /sys/kernel/debug/hermit/policy_features || true
   fi
@@ -161,8 +188,9 @@ apply_policy_mask() {
   [ -n "$mask" ] || return 0
   sudo_write "$mask" "$path"
   actual=$(sudo_cat "$path")
-  [[ "$actual" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] && (( actual == mask )) ||
+  if ! [[ "$actual" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] || ! (( actual == mask )); then
     rdma_die "policy_features read back '$actual', expected $mask"
+  fi
 }
 
 cleanup() {
@@ -219,6 +247,25 @@ snapshot_policy_stats() {
   else
     : > "$1"
   fi
+}
+
+# Total RDMA WR counts and bytes across both order and batch tables.
+wr_totals_delta() {
+  local before=$1 after=$2
+  awk '
+    FNR == 1 { section = "" }
+    $1 == "order" || $1 == "pages" { section = $1; next }
+    NF == 5 && section != "" {
+      key = section ":" $1
+      if (NR == FNR) {
+        bw[key] = $2; br[key] = $3; bwb[key] = $4; brb[key] = $5
+      } else {
+        ww += $2 - bw[key]; rw += $3 - br[key]
+        wb += $4 - bwb[key]; rb += $5 - brb[key]
+      }
+    }
+    END { printf ",%.0f,%.0f,%.0f,%.0f", rw, rb, ww, wb }
+  ' "$before" "$after"
 }
 
 # Policy counters that say whether the new paths ran, as read-phase deltas.
@@ -303,23 +350,43 @@ if [ "$ADC_STATS" = 1 ]; then
   adc_enabled_saved=$(sudo_cat "$ADC_DIR/adc_enable")
   sudo_write 1 "$ADC_DIR/adc_enable"
 fi
+if [ -n "$BYPASS_SWAPCACHE" ]; then
+  sudo_test -e "$ADC_DIR/bypass_swapcache" || rdma_die "kernel lacks bypass_swapcache control"
+  bypass_swapcache_saved=$(sudo_cat "$ADC_DIR/bypass_swapcache")
+  sudo_write "$BYPASS_SWAPCACHE" "$ADC_DIR/bypass_swapcache"
+  [ "$(sudo_cat "$ADC_DIR/bypass_swapcache")" = "$BYPASS_SWAPCACHE" ] || \
+    rdma_die "failed to set bypass_swapcache=$BYPASS_SWAPCACHE"
+fi
+if [ -n "$REMOTE_ORDER_MASK" ]; then
+  remote_order_mask_saved=$(sudo_cat "$REMOTE_MASK_FILE")
+  sudo_write "$REMOTE_ORDER_MASK" "$REMOTE_MASK_FILE"
+  actual_remote_mask=$(sudo_cat "$REMOTE_MASK_FILE")
+  if ! (( actual_remote_mask == REMOTE_ORDER_MASK )); then
+    rdma_die "remote_order_mask read back '$actual_remote_mask', expected $REMOTE_ORDER_MASK"
+  fi
+fi
 prepare_sweep_cgroup
 
 {
   printf 'date=%s\n' "$(date --iso-8601=seconds)"
   printf 'kernel=%s\n' "$(uname -r)"
   printf 'size_gib=%s\ntrials=%s\nsegments=%s\n' "$SIZE_GIB" "$TRIALS" "$SEGMENT_PAGES"
+  printf 'interleave=%s\nmax_offset=%s\n' "$INTERLEAVE" "$MAX_OFFSET"
   printf 'page_sizes_kb=%s\npolicy_features=%s\n' "$PAGE_SIZES_KB" "$POLICY_FEATURES"
   printf 'local_ratio_pct=%s\nswapout_trigger=%s\ncost_stats=%s\n' \
     "$LOCAL_RATIO_PCT" "$SWAPOUT_TRIGGER" "$COST_STATS"
   printf 'adc_stats=%s\n' "$ADC_STATS"
+  printf 'bypass_swapcache=%s\n' "$(sudo_cat "$ADC_DIR/bypass_swapcache" 2>/dev/null || echo unknown)"
+  printf 'remote_order_mask=%s\n' "$(sudo_cat "$REMOTE_MASK_FILE" 2>/dev/null || echo unknown)"
+  printf 'effective_order_mask=%s\n' "$(sudo_cat "$ADC_DIR/effective_order_mask" 2>/dev/null || echo unknown)"
   printf 'bench_cpu=%s\n' "$BENCH_CPU"
   printf 'backend=%s\n' "$(detect_rswap_backend)"
 } > "$RESULT_DIR/environment.txt"
 
 printf 'page_kb,mode,policy_features,segment_pages,trial,start_page,bytes,sec,gib_per_sec,minflt,majflt,checksum_errors,swapped\n' > "$TRIALS_CSV"
 { printf 'page_kb,mode,policy_features'; while read -r key; do printf ',%s' "$key"; done < <(cost_keys)
-  for key in $POLICY_KEYS; do printf ',%s' "$key"; done; printf '\n'; } > "$COST_CSV"
+  for key in $POLICY_KEYS; do printf ',%s' "$key"; done
+  printf ',wr_read_wrs,wr_read_bytes,wr_write_wrs,wr_write_bytes\n'; } > "$COST_CSV"
 
 for kb in $PAGE_SIZES_KB; do
   page_order "$kb" >/dev/null || rdma_die "unsupported page size: ${kb} KiB"
@@ -334,6 +401,7 @@ for kb in $PAGE_SIZES_KB; do
       mode=policy
     fi
     run_dir="$RESULT_DIR/${kb}k/$mode${mask:+-$mask}"
+    [ ! -e "$run_dir" ] || rdma_die "duplicate cell directory $run_dir (check --policy-features for duplicates)"
     log="$run_dir/bench.log"
     mkdir -p "$run_dir"
     # Each cell starts from a stopped sampler: an "off" cell must not inherit
@@ -348,6 +416,12 @@ for kb in $PAGE_SIZES_KB; do
     fi
     sudo_write max "$CGROUP/memory.max"
     args=(--size-gib "$SIZE_GIB" --segments="${SEGMENT_PAGES// /,}" --trials "$TRIALS")
+    if [ "$INTERLEAVE" = 1 ]; then
+      args+=(--interleave)
+    fi
+    if [ "$MAX_OFFSET" -gt 0 ]; then
+      args+=(--max-offset "$MAX_OFFSET")
+    fi
     if [ "$SWAPOUT_TRIGGER" = madv-pageout ]; then
       args+=(--madv-pageout)
     fi
@@ -355,6 +429,7 @@ for kb in $PAGE_SIZES_KB; do
     # snapshots the cost table around the read phase instead.
     args+=(--no-cost)
     snapshot_adc "$run_dir/adc-start.txt"
+    # shellcheck disable=SC2016
     taskset -c "$BENCH_CPU" bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && shift && exec "$@"' \
       swapin-granularity "$CGROUP" "$bin" "${args[@]}" > "$log" 2>&1 &
     current_pid=$!
@@ -379,11 +454,13 @@ for kb in $PAGE_SIZES_KB; do
       # Counters below are sampled around the read phase only.
       snapshot_cost "$run_dir/cost-before-swapin.txt"
       snapshot_order_stats > "$run_dir/order-before-swapin.txt"
+      sudo_cat "$WR_STATS_FILE" > "$run_dir/wr-before-swapin.txt"
       snapshot_policy_stats "$run_dir/policy-before-swapin.txt"
     else
       pswpin_before=$(read_vmstat_key pswpin)
       snapshot_cost "$run_dir/cost-before-swapin.txt"
       snapshot_order_stats > "$run_dir/order-before-swapin.txt"
+      sudo_cat "$WR_STATS_FILE" > "$run_dir/wr-before-swapin.txt"
       snapshot_policy_stats "$run_dir/policy-before-swapin.txt"
     fi
     snapshot_adc "$run_dir/adc-before-read.txt"
@@ -404,6 +481,7 @@ for kb in $PAGE_SIZES_KB; do
     fi
     snapshot_cost "$run_dir/cost-after-swapin.txt"
     snapshot_order_stats > "$run_dir/order-after-swapin.txt"
+    sudo_cat "$WR_STATS_FILE" > "$run_dir/wr-after-swapin.txt"
     snapshot_policy_stats "$run_dir/policy-after-swapin.txt"
     pswpin_after=$(read_vmstat_key pswpin)
     if [ "$SWAPOUT_TRIGGER" = cgroup ]; then
@@ -419,14 +497,17 @@ for kb in $PAGE_SIZES_KB; do
     loads_total_after=$(awk 'NR > 1 { t += $4 } END { print t + 0 }' "$run_dir/order-after-swapin.txt")
     loads_delta=$((loads_total_after - loads_total_before))
     emit_trials "$log" "$kb" "$mode" "${mask:-none}" >> "$TRIALS_CSV"
-    printf '%s,%s,%s' "$kb" "$mode" "${mask:-none}" >> "$COST_CSV"
-    if [ "$COST_STATS" = 1 ]; then
-      cost_columns "$run_dir/cost-before-swapin.txt" "$run_dir/cost-after-swapin.txt" >> "$COST_CSV"
-    else
-      while read -r _key; do printf ',0'; done < <(cost_keys) >> "$COST_CSV"
-    fi
-    policy_columns "$run_dir/policy-before-swapin.txt" "$run_dir/policy-after-swapin.txt" >> "$COST_CSV"
-    printf '\n' >> "$COST_CSV"
+    {
+      printf '%s,%s,%s' "$kb" "$mode" "${mask:-none}"
+      if [ "$COST_STATS" = 1 ]; then
+        cost_columns "$run_dir/cost-before-swapin.txt" "$run_dir/cost-after-swapin.txt"
+      else
+        while read -r _key; do printf ',0'; done < <(cost_keys)
+      fi
+      policy_columns "$run_dir/policy-before-swapin.txt" "$run_dir/policy-after-swapin.txt"
+      wr_totals_delta "$run_dir/wr-before-swapin.txt" "$run_dir/wr-after-swapin.txt"
+      printf '\n'
+    } >> "$COST_CSV"
     [ "$pswpin_delta" -gt 0 ] || rdma_die "no swap-ins in ${kb}k/$mode; lower LOCAL_RATIO_PCT"
     [ "$loads_delta" -gt 0 ] || rdma_die "no backend loads recorded for ${kb}k/$mode; see $run_dir"
     for seg in $SEGMENT_PAGES; do

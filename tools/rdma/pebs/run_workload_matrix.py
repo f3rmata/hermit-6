@@ -27,7 +27,8 @@ from typing import Any
 from page_selection_metrics import table
 from matrix_metrics import (WR_FIELDS, POLICY_FIELDS, counter_delta, wr_delta,
                             policy_delta, policy_activity, policy_masks, policy_suffix, apply_policy_mask,
-                            cell_adc, read_optional, write_adc_csv, write_comparisons)
+                            cell_adc, mglru_core_enabled, read_optional, write_adc_csv, write_comparisons,
+                            split_obs_delta)
 
 RDMA = Path(__file__).resolve().parents[1]
 DEBUG = Path('/sys/kernel/debug/hermit')
@@ -60,14 +61,24 @@ SUITES['gapbs-bfs'] = ('run_gapbs_page_sweep.sh', dict(GAPBS_KERNEL='bfs', GAPBS
                                                        GAPBS_THREADS=8, BENCH_CPUS='0-7'))
 SUITES['gapbs-pr'] = ('run_gapbs_page_sweep.sh', dict(GAPBS_KERNEL='pr', GAPBS_TRIALS=4,
                                                       GAPBS_THREADS=8, BENCH_CPUS='0-7'))
+# Fault-path scalability: full scans with 4 and 16 threads, one per physical
+# core of socket 0, complementing anon-1t-full and anon-8t-full.
+for _threads in (4, 16):
+    SUITES[f'anon-{_threads}t-full'] = ('run_anon_swapout_sweep.sh', dict(
+        BENCH_THREADS=_threads, BENCH_CPUS=f'0-{_threads - 1}', ACCESS_RATIOS='100'))
 CONTROLS = '''remote_order_mask pebs_mode pebs_adaptive pebs_load_period
 pebs_store_period apt_reclaim batch_account batch_io batch_swapout batch_tlb
 bypass_swapcache lazy_poll reclaim_headroom_pages reclaim_mode speculative_io
 speculative_lock sthd_cnt vaddr_swapout exclusive_swapout swap_thread prefetch_thread'''.split()
 CONTROLS += '''effective_order_mask pebs_all pebs_window_ms pebs_history_ms
 pebs_pc_max pebs_fixed_cost_ns pebs_region_max
-policy_features policy_cold_us policy_cold_epochs policy_pages_max policy_swapin_max
-pebs_predict_regions pebs_predict_samples'''.split()
+policy_features policy_swapin_max
+pebs_predict_regions pebs_predict_samples pebs_heat_ms
+policy_medium_min_order policy_medium_max_order
+policy_split_rate policy_split_min_samples policy_split_hot_cov'''.split()
+# Observe-only skew counters; snapshotted per cell, never a control.
+SPLIT_OBS = DEBUG/'split_obs_stats'
+SWAPIN_BIT = 0x1
 
 
 def command(args, **kwargs):
@@ -83,11 +94,9 @@ def exists(path):
 
 
 def executable(path):
-    """os.access() reports False for a missing or unreadable path instead of
-    raising; keep the CLI value validation in one place.
-    """
+    """Return True only for an executable regular file (never a directory)."""
     try:
-        return os.access(path, os.X_OK)
+        return os.path.isfile(path) and os.access(path, os.X_OK)
     except (OSError, TypeError, ValueError):
         return False
 
@@ -158,6 +167,7 @@ def snapshot(path) -> dict[str, Any]:
             'cpu_stat': Path('/proc/stat').read_text(),
             'swaps': Path('/proc/swaps').read_text(), 'vmstat': Path('/proc/vmstat').read_text()}
     data['policy_stats'] = read(DEBUG/'policy_stats') if exists(DEBUG/'policy_stats') else None
+    data['split_obs_stats'] = read(SPLIT_OBS) if exists(SPLIT_OBS) else None
     save_json(path, data)
     return data
 
@@ -207,7 +217,16 @@ def check_policy_activity(row, measurement):
     decisions = sum(counts) if counts and all(v is not None for v in counts) else None
     policy = measurement.get('policy', {}).get('application')
     wrs = {r['size_kib']: r for r in application} if policy is not None else {}
-    return policy_activity(row['mode'], row['page_kb'], decisions, policy, wrs)
+    predict_calls = measurement.get('pebs_predict', {}).get('application', 0)
+    activity, issues = policy_activity(row['mode'], row['page_kb'], decisions, policy, wrs,
+                                       predict_calls=predict_calls)
+    # A mask without SWAPIN deliberately disables the base-page swap-in path
+    # (write-side or largest-folio ablations); lack of its activity is expected.
+    mask = row.get('policy_features')
+    if mask is not None and not mask & SWAPIN_BIT:
+        activity = activity | {'swapin_disabled': True, 'waived_issues': issues}
+        issues = []
+    return activity, issues
 
 
 def environment(args):
@@ -327,6 +346,7 @@ def collect_measurement(folder, row, adc_csv=None) -> dict[str, Any]:
     histogram = []
     allocation_settings = {}
     policy = {}
+    pebs_predict = {}
     swap = {}
     for phase, suffix in [('populate', ''), ('application', '-swapin')]:
         paths = list(folder.rglob(f'order-before{suffix}.txt'))
@@ -358,12 +378,16 @@ def collect_measurement(folder, row, adc_csv=None) -> dict[str, Any]:
             if setting != expected:
                 raise ValueError(f'THP allocation ceiling mismatch: {path}={setting}')
         pebs = []
+        pred = []
         for path in (before, after):
             text = Path(str(path)+'.pebs').read_text()
             pebs.append({k:int(v) for k,v in re.findall(r'^\s*(actual_order_\d+|\d+):\s*(\d+)\s*$', text, re.M)})
+            m_pred = re.search(r'^\s*predict_calls:\s*(\d+)\s*$', text, re.M)
+            pred.append(int(m_pred[1]) if m_pred else None)
         if not pebs[0] or not pebs[1]:
             raise ValueError('missing PEBS order counters')
         decisions = counter_delta(*pebs)
+        pebs_predict[phase] = pred[1] - pred[0] if None not in pred and pred[1] >= pred[0] else 0
         total_read = sum(v['read_bytes'] for v in wrs.values())
         folios_by_size = {4 << int(order): values for order, values in folios.items()}
         for size_kib in sorted(folios_by_size.keys() | wrs.keys()):
@@ -382,7 +406,7 @@ def collect_measurement(folder, row, adc_csv=None) -> dict[str, Any]:
                 pebs_decisions=decisions.get(str(order)), pebs_actual_swapins=decisions.get('actual_order_'+str(order))))
     return dict(page_policy=PAGE_POLICY, max_page_kb=row['page_kb'], performance=performance,
                 workload=record, allocation_settings=allocation_settings, granularity=histogram,
-                policy=policy, swap=swap)
+                policy=policy, pebs_predict=pebs_predict, swap=swap)
 
 
 def append_csv(path, rows):
@@ -415,7 +439,7 @@ def main():
     ap.add_argument('--gapbs-scale', type=int, default=24, help='Kronecker graph scale (2^scale vertices)')
     ap.add_argument('--policy-features', nargs='+', default=None,
                     help='policy_features ablations for policy cells: preset names (default, no-pebs, '
-                         'no-batch, medium-on), raw masks (0x1bd) or comma-separated lists; omitted '
+                         'no-batch, medium-on), raw masks (0xa1) or comma-separated lists; omitted '
                          'preserves the kernel mask and keeps the historical '
                          'off/static/policy cells')
     ap.add_argument('--adc', action='store_true', help='capture application-phase Hermit ADC deltas')
@@ -437,8 +461,8 @@ def main():
                           'environment':env, 'plan':rows, 'adc':args.adc}, indent=2))
         return
     if os.geteuid() == 0: ap.error('run as the benchmark user after sudo -v')
-    if platform.machine() != 'x86_64' or 'hermit-pebs' not in platform.release():
-        ap.error('requires x86_64 hermit-pebs kernel')
+    if platform.machine() != 'x86_64' or 'hermit' not in platform.release():
+        ap.error('requires x86_64 hermit kernel')
     if args.output.exists(): ap.error('output must be a new directory; completed results are never overwritten')
     command(['sudo','-n','true'])
     try:
@@ -468,7 +492,7 @@ def main():
         try:
             with socket.socket() as sock: sock.bind(('127.0.0.1',args.port))
         except OSError as exc:
-            ap.error(f'cannot bind 127.0.0.1:{args.port} for memcached: {exc}')
+            ap.error(f'cannot bind 127.0.0.1:{args.port} for redis: {exc}')
     if 'ycsb' in args.suites and not executable(args.ycsb): ap.error(f'missing executable {args.ycsb}')
     if any(s.startswith('gapbs-') for s in args.suites):
         for name in ('bfs.cc', 'pr.cc', 'benchmark.h'):
@@ -487,6 +511,8 @@ def main():
     # Restore controls owned by this experiment.
     saved = {str(DEBUG/k):read(DEBUG/k) for k in SAMPLING_CONTROLS}
     baseline = policy_settings()
+    if not mglru_core_enabled(baseline['mglru']['enabled']):
+        ap.error('Hermit requires MGLRU with the core bit enabled')
     saved.update({p:match[1] for p, value in baseline['thp'].items()
                   if (match := re.search(r'\[([^]]+)\]', value))})
     baseline_mask = baseline['controls'].get('policy_features')
@@ -556,7 +582,7 @@ def main():
                 while True:
                     try: rc=child.wait(timeout=30); break
                     except subprocess.TimeoutExpired:
-                        command(['sudo','-n','-v'])
+                        command(['sudo','-n','true'])
                         if time.monotonic()-start > args.timeout: raise TimeoutError(name)
             child=None
             after=snapshot(folder/'after.json')
@@ -602,6 +628,7 @@ def main():
                                  for k in POLICY_FIELDS})
                 counters.update({k: measurement['swap'].get('application', {}).get(k) for k in ('pswpin', 'pswpout')})
                 counters.update({k: measurement['workload'].get(k) for k in ('read_avg_us', 'read_p95_us', 'read_p99_us')})
+                counters.update(split_obs_delta(before.get('split_obs_stats'), after.get('split_obs_stats')))
                 append_csv(args.output/'summary.csv', [identity | measurement['performance'] | delta | activity_columns | counters])
                 append_csv(args.output/'granularity.csv', [identity | r for r in measurement['granularity']])
             if not valid: raise RuntimeError(f'{name}: {"; ".join(issues)}; see status.json and run.log')

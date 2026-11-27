@@ -5,28 +5,27 @@ from contextlib import contextmanager
 from pathlib import Path
 
 WR_FIELDS = ('write_wrs', 'read_wrs', 'write_bytes', 'read_bytes')
-POLICY_FIELDS = ('observed_4k', 'cold_observations', 'invalid_epochs', 'late_samples',
-                 'predicted_4k', 'refault_4k', 'ranked_candidates')
+POLICY_FIELDS = ('predicted_4k', 'refault_4k', 'mglru_candidates')
+LEGACY_POLICY_FIELDS = ('observed_4k', 'cold_observations', 'invalid_epochs',
+                        'late_samples', 'predicted_4k', 'refault_4k', 'ranked_candidates')
 PAGE_SIZES = (4, 16, 32, 64, 128, 256, 512, 1024, 2048)
 
-# Named policy_features ablations. Each preset only clears bits from the
-# default mask, so one matrix can compare the full policy against a single
-# disabled mechanism and still pair every policy cell with that block's
-# off/static cells. Values follow HERMIT_POLICY_* in include/linux/hermit_policy.h.
+# Named policy_features presets follow HERMIT_POLICY_* in hermit_policy.h.
 POLICY_MASKS = {
-    'default': 0x1bf,   # SWAPIN|PEBS|SORT|OBSERVE|FLUSH|BATCH|LARGE|MGLRU
-    'no-pebs': 0x1bd,   # PEBS footprint vote removed
-    'no-batch': 0x19f,  # SG writeout of cold dirty pages removed
-    'medium-on': 0x3bf,  # default + MEDIUM (fit-driven 16-64 KiB swap-in orders)
-    'fitstart-on': 0x5bf,  # default + FITSTART (fit-sized first batch of a segment)
-    'ptebatch-on': 0x9bf,  # default + PTEBATCH (map the pages a batch read ahead)
-    'fitpte': 0xdbf,  # default + FITSTART + PTEBATCH
-    'fitpte-medium': 0xfbf,  # fitpte + MEDIUM
-    'split-on': 0x11bf,  # default + SPLIT (PEBS-guided split of large folios)
+    'default': 0xa3,   # SWAPIN|PEBS|BATCH|LARGE
+    'no-pebs': 0xa1,   # PEBS footprint vote removed
+    'no-batch': 0x83,  # SG writeout of MGLRU-selected pages removed
+    'medium-on': 0x2a3,  # default + MEDIUM (fit-driven 16-64 KiB swap-in orders)
+    'fitstart-on': 0x4a3,  # default + FITSTART (fit-sized first batch of a segment)
+    'ptebatch-on': 0x8a3,  # default + PTEBATCH (map the pages a batch read ahead)
+    'fitpte': 0xca3,  # default + FITSTART + PTEBATCH
+    'fitpte-medium': 0xea3,  # fitpte + MEDIUM
+    'split-on': 0x10a3,  # default + SPLIT (PEBS-guided split of large folios)
+    'split-obs': 0x40a3,  # default + SPLIT_OBS (observe resident large folio skew only)
 }
 DEFAULT_POLICY_MASK = POLICY_MASKS['default']
-# Bit 13 enables SLOTRUN diagnostics.
-POLICY_MASK_MAX = 0x3fff
+# Bits 2–4 and 8 are retired. The remaining features retain their bit positions.
+POLICY_VALID_BITS = 0x7ee3
 
 
 def policy_mask(value):
@@ -39,9 +38,9 @@ def policy_mask(value):
     except ValueError:
         raise ValueError(f'unknown policy_features preset or mask {value!r}; '
                          f'known presets: {", ".join(POLICY_MASKS)}') from None
-    if mask < 0 or mask > POLICY_MASK_MAX:
-        raise ValueError(f'policy_features mask {value!r} is outside '
-                         f'0..{POLICY_MASK_MAX:#x}')
+    if mask < 0 or mask & ~POLICY_VALID_BITS:
+        raise ValueError(f'policy_features mask {value!r} uses bits outside '
+                         f'{POLICY_VALID_BITS:#x}')
     return 'f%x' % mask, mask
 
 
@@ -68,6 +67,18 @@ def policy_masks(values):
 def policy_suffix(label):
     """Case-label suffix; the default mask keeps the historical case names."""
     return '' if label in (None, 'default') else '-' + label
+
+
+def split_obs_delta(before, after):
+    """Per-cell split_obs_stats deltas as split_obs_<stage>_<bucket> columns.
+
+    Empty when the running kernel has no observe-only skew counters.
+    """
+    if not before or not after:
+        return {}
+    def parse(text):
+        return {k: int(v) for k, v in (line.split() for line in text.splitlines() if line.strip())}
+    return {'split_obs_' + k: v for k, v in counter_delta(parse(before), parse(after)).items()}
 
 
 def apply_policy_mask(path, requested, baseline, write, read):
@@ -195,7 +206,7 @@ def policy_counters(text):
         if len(parts) != 2 or not parts[1].isdigit() or parts[0] in result:
             raise ValueError('malformed policy_stats')
         result[parts[0]] = int(parts[1])
-    if not set(POLICY_FIELDS) <= result.keys():
+    if not any(result.keys() >= set(fields) for fields in (POLICY_FIELDS, LEGACY_POLICY_FIELDS)):
         raise ValueError('missing base-page policy counters')
     return result
 
@@ -209,7 +220,7 @@ def policy_delta(before, after):
     return counter_delta(policy_counters(before), policy_counters(after))
 
 
-def policy_activity(mode, ceiling, decisions, policy, wr):
+def policy_activity(mode, ceiling, decisions, policy, wr, predict_calls=0):
     if policy is None:
         required = mode == 1 and ceiling > 4
         activity = dict(required=required, application_decisions=decisions,
@@ -220,19 +231,26 @@ def policy_activity(mode, ceiling, decisions, policy, wr):
         elif required and decisions == 0:
             issues.append('policy selection was not exercised: zero application-phase decisions')
         return activity, issues
-    # Even a single-page batch proves the new swap-in path ran. Requiring
-    # speculative pages or multi-page WRs would reject a correct cold fallback.
+    # Even a single-page batch or direct-bypass 4 KiB fallback proves the new
+    # swap-in path ran. Requiring speculative pages or multi-page WRs would
+    # reject a correct cold fallback.
     reads = sum(r['read_wrs'] for r in wr.values())
     writes = sum(r['write_wrs'] for r in wr.values())
     batch_reads = sum(r.get('batch_read_wrs', 0) for r in wr.values())
-    evidence = batch_reads + sum(policy.get(k, 0) for k in
-                                ('observed_4k', 'predicted_4k', 'ranked_candidates',
-                                 'mglru_candidates'))
+    direct_4k = (ceiling > 4 and
+                 (wr.get(4, {}).get('pebs_actual_swapins') or 0) > 0 and
+                 all((r.get('pebs_actual_swapins') or 0) == 0
+                     for sz, r in wr.items() if sz > 4))
+    evidence = (batch_reads + (predict_calls or 0) + int(direct_4k) +
+                sum(policy.get(k, 0) for k in
+                    ('observed_4k', 'predicted_4k', 'ranked_candidates',
+                     'mglru_candidates')))
     required = mode == 1 and reads + writes > 0
     activity = dict(required=required, application_decisions=decisions,
                     path_exercised=mode == 1 and evidence > 0,
                     evidence_source='base-page-v1', policy_counters=policy,
-                    batch_read_wrs=batch_reads, read_wrs=reads, write_wrs=writes)
+                    batch_read_wrs=batch_reads, read_wrs=reads, write_wrs=writes,
+                    predict_calls=predict_calls or 0)
     issues = []
     if required and not activity['path_exercised']:
         issues.append('remote I/O without application-phase base-page policy activity')
@@ -251,6 +269,14 @@ def page_ceiling_settings(kb, saved):
         size = int(match[1]) if match else 2048
         result[path] = 'always' if 16 <= size <= kb else 'never'
     return result
+
+
+def mglru_core_enabled(value):
+    """Check the MGLRU core bit in the sysfs capability mask."""
+    try:
+        return bool(int(value, 0) & 1)
+    except (TypeError, ValueError):
+        return False
 
 
 def read_optional(path):
